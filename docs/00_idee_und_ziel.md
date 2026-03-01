@@ -1,59 +1,35 @@
-# docs/00_idee_und_ziel.md
+# Projektidee und Zielbild
 
-## Projektidee: Minecraft-Klon als Versions-Rekonstruktion
+## Ziel
 
-Ziel ist es, die Entwicklung von Minecraft **Version für Version** nachzucoden. Wir starten mit der frühesten praktikablen Spiel-Loop/3D-Rendering-Basis und arbeiten uns iterativ vor:
-- erst: Fenster + Renderloop
-- dann: Input + Kamera
-- dann: erster 3D-Drawcall
-- dann: Chunk-basierte Voxel-Welt (Meshing)
-- später: mehrere Chunks, World-Management, Block-Interaktion, Texturen/Atlas, Terrain-Gen, Save/Load, Optimierungen (Culling, Greedy Meshing, Multithreading)
+Das Projekt rekonstruiert fruehe Minecraft-Versionen schrittweise, ohne die Engine-Qualitaet zu opfern.
+Der Fokus ist:
 
-### Warum Rust?
-- **Performance** nahe C/C++ (kein GC), gut für datenorientierte Engine-Teile (Chunks, Mesh-Build)
-- **Speicher- & Thread-Sicherheit**: Chunk-Meshing/Streaming auf Worker-Threads wird stabiler
-- **Tooling**: Cargo, rustfmt, clippy, einfache Dependency-Verwaltung
-- **wgpu** als modernes Rendering-Backend (Vulkan/Metal/DX12) und stabiler Cross-Platform-Ansatz
+- historische Spielgefuehl-Naehe (Classic/Pre-Classic)
+- performante Runtime fuer grosse Sichtweiten
+- saubere Erweiterbarkeit fuer neue Inhalte
 
-## Engine-Architektur (Zielbild)
+## Warum Rust + wgpu
 
-### Kernsysteme
-1. **App/Window Loop (winit)**
-   - Event-driven, `run_app`
-   - erzeugt Window, dispatcht Events (Resize/Input/Redraw)
+- hohe Laufzeitperformance und kontrollierbares Memory-Verhalten
+- sichere Parallelisierung fuer Chunkgen/Meshing/Lighting/Storage
+- portable moderne Grafik-API ueber `wgpu`
 
-2. **Rendering (wgpu)**
-   - Initialisierung: Instance → Surface → Adapter → Device/Queue
-   - Pipeline: WGSL Shader + RenderPipeline
-   - Pro Frame: Acquire Swapchain Texture → RenderPass → Present
-   - Depth Buffer für 3D
+## Architekturprinzipien
 
-3. **Inputsystem**
-   - Tasten-States (WASD, Space, Shift)
-   - Maus-Deltas (Raw Motion) für FPS-Look
-   - Cursor capture togglen (ESC, optional Linksklick)
+1. Rendern, Simulation und Storage als getrennte Systeme mit klaren Budgets
+2. Chunk/Subchunk (16x16x16) als zentrale Daten- und Recheneinheit
+3. datengetriebene Registries statt starrer Hardcodierung in Hot Paths
+4. stabile Frametimes wichtiger als Peak-FPS
 
-4. **Kamera**
-   - Position + yaw/pitch (Euler)
-   - `view = look_at`, `proj = perspective`
-   - `view_proj = proj * view` als Uniform in den Shader
+## Ist-Stand (2026-03-01)
 
-5. **Voxel/Chunks**
-   - Chunk-Größe: 16×16×16 (Start)
-   - BlockId: Air/Dirt/Stone
-   - Meshing: “sichtbare Faces” → Quads → 2 Triangles → Vertex/Index Buffers
-   - 1 Drawcall pro Chunk (Startpunkt)
+Die Basis ist umgesetzt:
 
-## Entwicklungsstrategie / Regeln
-- Erst korrekt & sichtbar, dann optimieren.
-- Datenorientiert: flache Arrays für Blocks, kompakte Mesh-Buffers.
-- Kleine Schritte, immer lauffähig halten.
-- Später: Module/Crates aufteilen (render/input/world).
+- Chunk-Streaming mit Worker-Pipelines
+- getrennte Render-/Simulation-Distanzen
+- fixe Sim-Ticks (20 TPS) fuer Sim-Systeme
+- Save/Load mit `world.meta` + Manifest + Region-Dateien
+- Worldgen mit Presets, Carvers, Lakes/Springs
 
-## Roadmap (nah)
-1) Chunk-Mesh sichtbar (Flat World + Säule) ✅/in Arbeit
-2) Mehrere Chunks (Grid) und World-Koordinaten
-3) Block-Interaktion: Raycast + Setzen/Entfernen + Remesh
-4) Texturen + UVs + Atlas
-5) Terrain-Gen (Noise)
-6) Optimierungen: Greedy Meshing, Frustum Culling, Multithread Mesh-Build
+Details stehen in `docs/01_status_und_aktueller_stand.md`.

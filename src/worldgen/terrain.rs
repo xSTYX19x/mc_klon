@@ -30,12 +30,16 @@ pub struct WorldGenConfig {
 
 impl WorldGenConfig {
     pub fn from_preset(seed: u32, preset: WorldgenPreset) -> Self {
+        Self::from_preset_with_sea_level(seed, preset, 64)
+    }
+
+    pub fn from_preset_with_sea_level(seed: u32, preset: WorldgenPreset, sea_level: i32) -> Self {
         match preset {
             WorldgenPreset::Flatish => Self {
                 seed,
-                sea_level: 32,
-                base_height: 28,
-                height_amp: 9.0,
+                sea_level,
+                base_height: 78,
+                height_amp: 14.0,
                 freq: 0.0094,
                 octaves: 4,
                 lacunarity: 2.0,
@@ -48,10 +52,10 @@ impl WorldGenConfig {
             },
             WorldgenPreset::Rd161348Like => Self {
                 seed,
-                sea_level: 32,
+                sea_level,
                 // Mehr Headroom für aktive Cliffs ohne dauerhaftes Top-Clipping.
-                base_height: 26,
-                height_amp: 13.2,
+                base_height: 86,
+                height_amp: 26.0,
                 freq: 0.0108,
                 octaves: 4,
                 lacunarity: 2.0,
@@ -66,9 +70,9 @@ impl WorldGenConfig {
             },
             WorldgenPreset::Hilly => Self {
                 seed,
-                sea_level: 32,
-                base_height: 25,
-                height_amp: 16.8,
+                sea_level,
+                base_height: 90,
+                height_amp: 34.0,
                 freq: 0.0118,
                 octaves: 5,
                 lacunarity: 2.0,
@@ -252,7 +256,7 @@ mod tests {
         let mut grad_samples = 0usize;
 
         const SIZE: i32 = 256;
-        const MAX_Y: i32 = 64;
+        const MAX_Y: i32 = 255;
 
         for z in 0..SIZE {
             for x in 0..SIZE {
@@ -280,6 +284,16 @@ mod tests {
         let clipped_ratio = clipped_top as f32 / ((SIZE * SIZE) as f32);
         let avg_abs_grad = (sum_abs_dx + sum_abs_dz) / (grad_samples as f32);
 
+        assert!(
+            min_h >= 52,
+            "terrain dips too far below sea-level band unexpectedly: min_h={}",
+            min_h
+        );
+        assert!(
+            max_h >= 72,
+            "terrain should commonly sit above sea level (64): max_h={}",
+            max_h
+        );
         assert!(
             range >= 16,
             "height range too small for visible hills: {}",
@@ -323,7 +337,7 @@ mod tests {
     #[test]
     fn rd161348_like_is_steeper_than_flatish() {
         const SIZE: i32 = 192;
-        const MAX_Y: i32 = 64;
+        const MAX_Y: i32 = 255;
 
         let flat = TerrainSampler::new(WorldGenConfig::from_preset(
             132_211,

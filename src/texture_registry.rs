@@ -2,15 +2,16 @@ use crate::texture::load_png_rgba;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Mojang-ähnlicher Asset-Key:
 /// z.B. "minecraft:textures/block/stone.png" oder "textures/block/stone.png"
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub struct AssetId(String);
+pub struct AssetId(Arc<str>);
 
 impl AssetId {
     pub fn new(key: impl Into<String>) -> Self {
-        Self(key.into())
+        Self(key.into().into())
     }
 
     pub fn as_str(&self) -> &str {
@@ -77,12 +78,14 @@ impl TextureRegistry {
 
         let path = self.resolve_path(&key);
         let (width, height, rgba) = load_png_rgba(&path).with_context(|| {
+            // Use static string formatting to avoid allocation in hot path
             format!(
                 "failed to load texture key '{}' from '{}'",
                 key.as_str(),
                 path.display()
             )
         })?;
+        // Clone is now just cloning the Arc, much cheaper than cloning String
         self.textures.insert(
             key.clone(),
             TextureImage {

@@ -47,6 +47,78 @@ impl NoiseSampler {
         }
     }
 
+    /// 3D-fBm als Basis für moderne Density-Funktionen.
+    pub fn fbm3(
+        &self,
+        x: f32,
+        y: f32,
+        z: f32,
+        freq: f32,
+        octaves: u8,
+        lacunarity: f32,
+        gain: f32,
+    ) -> f32 {
+        let mut amplitude = 1.0_f32;
+        let mut frequency = freq.max(0.000_001);
+        let mut sum = 0.0_f32;
+        let mut norm = 0.0_f32;
+
+        for _ in 0..octaves.max(1) {
+            let n = self
+                .base
+                .get_noise_3d(x * frequency, y * frequency, z * frequency);
+            sum += n * amplitude;
+            norm += amplitude;
+            amplitude *= gain;
+            frequency *= lacunarity.max(1.0);
+        }
+
+        if norm > 0.0 {
+            (sum / norm).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn ridged3(
+        &self,
+        x: f32,
+        y: f32,
+        z: f32,
+        freq: f32,
+        octaves: u8,
+        lacunarity: f32,
+        gain: f32,
+    ) -> f32 {
+        let mut amplitude = 1.0_f32;
+        let mut frequency = freq.max(0.000_001);
+        let mut sum = 0.0_f32;
+        let mut norm = 0.0_f32;
+        let mut weight = 1.0_f32;
+
+        for _ in 0..octaves.max(1) {
+            let mut n = self
+                .base
+                .get_noise_3d(x * frequency, y * frequency, z * frequency);
+            n = 1.0 - n.abs();
+            n *= n;
+            n *= weight;
+            weight = (n * 2.0).clamp(0.0, 1.0);
+
+            sum += n * amplitude;
+            norm += amplitude;
+            amplitude *= gain;
+            frequency *= lacunarity.max(1.0);
+        }
+
+        if norm > 0.0 {
+            ((sum / norm) * 2.0 - 1.0).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
     pub fn cliff2(&self, x: f32, z: f32, freq: f32) -> f32 {
         self.cliffs
             .get_noise_2d(x * freq, z * freq)

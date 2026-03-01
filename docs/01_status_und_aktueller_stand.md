@@ -1,145 +1,133 @@
-# docs/01_status_und_aktueller_stand.md
+# Aktueller Stand (Code-Realitaet)
 
-## Aktueller Stand (Code-Realität)
+Stand: 2026-03-01
 
-### Toolchain / Setup
-- Rust (Edition 2024)
-- `winit = "0.30"`
-- `wgpu = "28"`
-- `pollster = "0.4"`
-- `glam = "0.32"`
-- `bytemuck` mit `derive`
-- `image = "0.25"`
-- `anyhow = "1"`
-- `fastnoise-lite = "1"`
+## Toolchain / Dependencies
 
-### Projektstruktur
-- `src/main.rs`: App-Loop, Input, Kamera, Movement, World, Meshing, Rendering, Save/Load
-- `src/texture.rs`: PNG Loader + `TextureArray` (`texture_2d_array`)
-- `src/texture_registry.rs`: Mojang-Key-basierter Asset-Loader (`minecraft:...`)
-- `src/worldgen/noise.rs`: deterministischer NoiseSampler
-- `src/worldgen/terrain.rs`: TerrainSampler + Presets (`WorldgenPreset`)
+- Rust Edition 2024
+- `winit = 0.30`
+- `wgpu = 28`
+- `pollster = 0.4`
+- `glam = 0.32`
+- `bytemuck = 1.16`
+- `image = 0.25`
+- `anyhow = 1`
+- `fastnoise-lite = 1`
+- `serde` / `serde_json`
+- `rayon`
+- `crossbeam-channel`
+- `flate2`
 
----
+## Projektstruktur (wichtige Module)
+
+- `src/app/mod.rs`: App-Loop, Input, Game-State (`InGame`, `Paused`, `GeneratingWorld`)
+- `src/render/state.rs`: Render-/Streaming-/Storage-Orchestrierung, Overlay, Budgets
+- `src/world/mod.rs`: World-Daten, Chunks, Lighting-Basis, Registry/Manifest-Mapping
+- `src/world/*_system.rs`: Sim-Systeme (`fluids`, `block_entities`, `random_ticks`)
+- `src/meshing/*`: Greedy/Plants/Liquids + Memory-Pooling
+- `src/worldgen/*`: Terrain, Density, Surface Rules, Carvers
+- `src/storage/*`: `world.meta`, Region-I/O, Codec, Save/Load-Worker
 
 ## Implementierte Systeme
 
-### Rendering (wgpu)
-- 3D Pipeline mit Depth Buffer
-- robuste Projektion (`OPENGL_TO_WGPU_MATRIX` + `perspective_rh`)
-- Chunk-Rendering mit `u32` Indices (`Uint32`)
-- Textur-Rendering über `texture_2d_array<f32>` + Nearest/Repeat Sampler
-- World-Fragmentshader mit Alpha-Cutout (`discard` bei `alpha < 0.5`) für Cutout-Texturen
-- 2D UI Pipeline für Crosshair + Block-Preview
-- UI-Preview mit Alpha-Blending
-- Distanz-Darkening/Fog im Fragmentshader
-- Debug-Toggles:
-  - `F3`: Culling an/aus
-  - `F4`: Depth-Test an/aus
+### Rendering / GPU
 
-### Kamera + Input
-- FPS-Kamera mit Maus-Look
-- ESC toggelt Mouse Capture
-- kontinuierlicher Render-Loop (`request_redraw`)
-- FPS-Counter im Window-Title
-- Hotbar-Selektion per `Digit1..Digit9`
-  - Slot 6 (`Digit6`) ist fest `Sapling`
+- Layered Rendering (`Opaque`, `Cutout`, `Transparent`) mit Depth Buffer
+- Frustum-Culling fuer Rendering und Meshing-Dispatch
+- Far-LOD-Pfad (aktivierbar), separate LOD-Streaming-/Upload-Budgets
+- Fog-Varianten (Default/Water/Lava), Wasser-Overlay, Textur-Animationen (`.mcmeta`)
+- UI/Overlays: Crosshair, Block-Preview, Pause-Menue, Generation-Screen, Debug-Overlay
+- Debug-Views fuer Depth/Culling/AO/Lighting
 
-### Bewegung / Modi
-- Zwei Modi: `Flight` und `Walking`
-- Double-Space (nur echte Press-Transitions, kein Repeat) toggelt Modus beim 2. Press innerhalb `DOUBLE_SPACE_WINDOW = 0.20s`
-- Walking:
-  - Gravity aktiv
-  - Jump auf erster Space-Eingabe sofort (wenn `on_ground`)
-- Flight:
-  - freie Bewegung (WASD horizontal, Space hoch, Shift runter)
-  - Gravity aus (`velocity_y = 0`)
-  - Auto-Exit zu Walking bei Bodenberührung **nur** bei Downward-Collision (`delta.y < 0 && hit_y_down`)
-  - kein Auto-Exit bei Seitenkollision (`hit_x/hit_z`) oder Deckenkollision (`hit_y_up`)
+### Gameplay / Input / UI
 
-### Voxel / World / Chunks
-- Chunkgröße: `16x16x16`
-- Weltgröße: `WORLD_XZ = 256`, `WORLD_MAX_Y = 64`
-- Blocksystem:
-  - `Air`
-  - `Grass`
-  - `Stone`
-  - `Dirt`
-  - `Sapling`
-  - `OakPlanks`
-- Harte World Border (Out-of-bounds kollidiert als solid)
-- World-Koordinaten-Mapping via `div_euclid`/`rem_euclid`
+- FPS-Kamera, Cursor-Capture, Hotbar (`1..9` + Mausrad)
+- Block abbauen/platzieren mit Repeat-Cooldown
+- Pause-Menue (`ESC`) mit Save/Generate/Exit
+- Neue Welt generieren (`N`) mit Progress-Overlay
+- Render Distance (`F`) und Simulation Distance (`G`) separat schaltbar
 
-### Blockmodelle / Meshing
-- `BlockModel::Cube` und `BlockModel::CrossPlant`
-- Greedy Meshing für Cube-Flächen (UV-Tiling/Repeat, kein Stretching)
-- Sapling als Plant-Modell:
-  - 2 gekreuzte vertikale Quads (X-Form)
-  - doppelseitige Indizes (Culling-kompatibel)
-  - kein Greedy-Merge für Pflanzen
-- Sapling ist nicht-solid
-- Oak Planks ist solid und auf allen 6 Faces gleich texturiert
+### Bewegung / Physik
 
-### Textursystem
-- Pro-Block/pro-Face Texturzuordnung
-- Grass: Top/Side/Bottom getrennt
-- Oak Planks:
-  - `minecraft:textures/block/oak_planks.png`
-- Sapling:
-  - `minecraft:textures/block/oak_sapling.png`
-- Pflicht-Keys werden beim Start geprüft (kein silent Fallback)
-- Missing-Texture-Layer als defensiver GPU-Fallback vorhanden
+- Walking + Flight (Double-Space Toggle)
+- Sprint inkl. Double-Tap-Forward-Latch
+- Kollision + Step-Up
+- Swim/Wading mit fluid-abh. Verhalten
 
-### Interaktion
-- DDA-Raycast aus Kamerarichtung
-- LMB platzieren, RMB abbauen
-- Source-of-Truth für Auswahl: `selected_block()` (Hotbar)
-  - Placement nutzt `selected_block()`
-  - Preview nutzt `selected_block()`
-  - Place-Particles nutzen `selected_block()`
-  - Break-Particles nutzen den tatsächlich abgebauten Block
-- Chunk-Remesh nach Blockänderung inkl. Nachbar-Chunks an Grenzen
-- Blinkendes Face-Highlight
+### Simulation
 
-### UI
-- Crosshair als zwei dicke Balken (kein 1px-Linienkreuz)
-- Block-Preview oben rechts
-- Preview UV horizontal gespiegelt (`u -> 1-u`)
+- Fester Sim-Tick (20 TPS) mit Catchup-Limit pro Frame
+- Sim-System-Framework (`SimSystem`) mit aktiven Sim-Spalten
+- Systeme:
+  - FluidsSystem
+  - BlockEntitiesSystem
+  - RandomTicksSystem
+- Aktive Sim-Spalten aus Simulation Distance plus aktivierten Ticking Areas
 
-### Save/Load
-- Binärformat `save/world.bin` mit Magic + Version + Dimensionsheader + Blockarray
-- Enter speichert, `CloseRequested` speichert
-- Startup-Policy via Enum:
-  - `StartupWorldMode::LoadIfPresentElseGenerate` (Default)
-  - `StartupWorldMode::AlwaysRegenerate`
-- Bei inkompatiblem Save (Magic/Version/Dimensionen): klare Fehlermeldung + Fallback auf Generate
+### Blocks / Meshing
 
----
+- Erweiterte Blockpalette inkl. Bedrock, Wasser/Lava (still/flowing), Sand, Obsidian
+- Blockmodelle: Cube, CrossPlant, Liquid
+- Greedy Meshing fuer Solid-Layer
+- Spezifischer Liquid-Mesh-Pfad
+- Thread-local MeshingPool inkl. Liquid-Caches
 
-## Worldgen-Stand
+### Fluids
 
-- Preset-System vorhanden:
-  - `Flatish`
-  - `Rd161348Like`
-  - `Hilly`
-- Default-Preset: `Rd161348Like`
-- 2D Heightmap-Worldgen mit Layering pro Säule:
-  - Oberfläche `Grass`
-  - darunter `Dirt`
-  - darunter `Stone`
-  - darüber `Air`
-- Noise-Mischung in `src/worldgen/terrain.rs`:
-  - Macro/Local/Ridge/Detail
-  - Domain Warp
-  - selektive Cliff-Maske
-- Cliff-Effekt im rd161348-ähnlichen Preset aktiv (nicht global überall)
-- Zusätzliche Kanten-Glättung:
-  - `smooth_heightmap(..., 1)` in `World::generate_noise_world`
-- Terrain-Tests in `src/worldgen/terrain.rs` bleiben grün
+- Wasser- und Lava-Scheduler mit separaten Tickraten
+- Rebuild aus Weltbloecken beim Load/Reset
+- Mixing-Regeln (Obsidian/Cobblestone/Stone)
+- Umfangreiche Unit-Tests in `src/world/fluids.rs`
 
----
+### World / Chunks / Lighting
 
-## Aktueller Fokus / Offene Punkte
-1. Optionales weiteres Tuning der rd161348-Parameter für gewünschte Cliff-Dichte pro Seed.
-2. Optionales UI-Feedback für aktiven Movement-Mode (`Flight`/`Walking`).
-3. Optionales Preset-Toggling zur Laufzeit (derzeit Fokus auf stabilen Default).
+- Chunk-Groesse: `16x16x16`
+- Vertikaler Bereich aktuell `0..255` (`min_y=0`, `max_y=255`)
+- Skylight/Blocklight-Rebuild und asynchrone Lighting-Worker
+- Remesh/Relight-Trigger bei Block- und Fluid-Aenderungen
+
+### Worldgen
+
+- Presets: `Flatish`, `Rd161348Like`, `Hilly`
+- Seeded Terrain ueber Terrain/Density/Pipeline-Bausteine
+- Surface Rules, Caves, Ravines
+- Water/Lava Lakes + Water Springs im Chunkgen-Worker
+- Sea-Level in `WorldConfig`/`world.meta` (Default 64)
+
+### Save / Load
+
+- Aktives Save-Layout:
+  - `save/world.meta`
+  - `save/manifest.json`
+  - `save/region/*.mca`
+- Atomare Writes fuer Meta + Manifest
+- Region-Storage mit Zlib-komprimierten Spaltenpayloads
+- Async Save-Writer + Async Load-Worker
+- Autosave-Sweep mit Budget pro Frame
+- Legacy `save/world.bin` weiterhin im Code, aber nicht als Primaerpfad
+
+## Performance / Architektur-Status
+
+- Worker-Pools: Chunkgen, Meshing, Lighting, Storage
+- Budgetierte Stage-Loops im Streaming (Dispatch, Upload, Chunkgen-Apply, Saved-Load)
+- Backpressure-Mechanismen und Coalescing fuer Save/Fluid/Mesh
+- Perf-Trace/CSV/Overlay-Instrumentierung vorhanden
+
+## Offene Punkte (bereinigt)
+
+### Hoch
+
+1. Boundary-Ocean-Visualisierung ausserhalb der harten Weltgrenze
+2. Legacy-Worldgen-Pfade in `world/mod.rs` gegen aktive Worker-Pipeline weiter konsolidieren
+3. Save-/Manifest-Doku auf Migrationsfaelle (groessere Block-Registries) erweitern
+
+### Mittel
+
+1. Biome-/Material-Layering ueber aktuelle Surface Rules hinaus
+2. Worldgen-Tuning pro Preset mit reproduzierbaren Snapshot-Tests
+3. Ticking-Areas auch ueber persistente/benutzerseitige Konfiguration steuerbar machen
+
+### Niedrig
+
+1. Historische Paritaetsfeatures (z.B. Humans/Mob-Stub)
+2. Weitere Profiling-Repro-Szenen und Benchmark-Protokolle

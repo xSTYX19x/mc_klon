@@ -1,19 +1,32 @@
 # Worldgen TODOs
 
-Leitmotiv: Minecraft-ähnliche Welten nutzen typischerweise Noise (Perlin/fBm) als Basis statt rein deterministischer Stufenfunktionen.
+Stand: 2026-03-01
 
-## Erledigt (aktuell)
+## Bereits vorhanden
 
-1. 2D-Heightmap-Worldgen mit mehrstufiger Noise-Mischung umgesetzt (Macro/Local/Ridge/Detail).
-2. Domain-Warping gegen lineare Rampen/Bänder integriert.
-3. Interne FastNoise-Frequenz auf `1.0` fixiert (Vermeidung doppelter Frequenzskalierung).
-4. Smootheres Terrain-Tuning inkl. leichtem Heightmap-Smoothing-Pass (`smooth_heightmap(..., 1)`).
-5. Worldgen-Regressionstest für Höhenbereich, Top-Clipping und Mindestgradient ergänzt.
+- Presets (`Flatish`, `Rd161348Like`, `Hilly`)
+- Seeded Terrain + Density/Surface Rules
+- Carvers (Caves/Ravines)
+- Lakes/Springs im Chunkgen-Worker
+- Sea-Level in `WorldConfig` und `world.meta`
+- Lava-Lake-Hoehenbegrenzung unterhalb Waterline
 
-## Offene Punkte
+## High Priority
 
-1. Presets einführen (`flatish`, `rd161348_like`, `hilly`) statt Single-Tuning.
-2. Seeded World vollständig reproduzierbar machen (Seed in Save/Config persistieren).
-3. Optionales Cliff-Shaping/leichte Erosion als separaten Pass einführen.
-4. Biome- und Material-Layering erweitern (z.B. grass/dirt/stone abhängig von Höhe/Biome).
-5. Optional: größere XZ-Welt oder Chunk-Streaming für besser sichtbare Terrainformationen.
+- [ ] Legacy-/Altpfade in `src/world/mod.rs` gegen aktive Worker-Pipeline weiter konsolidieren
+- [ ] Sea-Level/Waterline Source-of-Truth durchgaengig absichern (keine Drift zwischen alten Konstanten und Config)
+- [ ] Boundary-Ocean-Visualisierung fuer harte Weltgrenzen umsetzen
+- [ ] Worldgen-Phasen und Preset-Unterschiede klarer dokumentieren (welcher Pfad produziert was)
+
+## Medium Priority
+
+- [ ] Biome-/Material-Layering ueber aktuelle Surface Rules hinaus
+- [ ] Preset-spezifisches Tuning fuer Caves/Ravines/Lakes/Springs
+- [ ] Reproduzierbare Worldgen-Regression-Suite mit Snapshot-Vergleichen erweitern
+- [ ] Mehr Worldgen-Metriken im Debug-Overlay sichtbar machen
+
+## Low Priority
+
+- [ ] Explizite Entscheidung und Doku zu langfristiger Weltgroesse (hart begrenzt vs. unendlich)
+- [ ] Historische Paritaetsfeatures (Humans/Mob-Stub) vorbereiten
+- [ ] Vergleichsscreenshots pro Preset in die Doku aufnehmen
