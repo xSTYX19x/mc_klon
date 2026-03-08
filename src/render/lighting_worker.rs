@@ -23,7 +23,12 @@ pub(crate) struct LightingWorkerPool {
 
 impl LightingWorkerPool {
     pub(crate) fn new(job_rx: Receiver<LightingJob>, result_tx: Sender<LightingResult>) -> Self {
-        let worker_count = 1;
+        // Bulk snapshot rebuilds are now a fallback path, but keep the worker pool
+        // scalable so future bounded-region async lighting jobs can fan out cleanly.
+        let worker_count = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1);
         let (shutdown_tx, shutdown_rx) = crossbeam_channel::unbounded();
         let mut workers = Vec::with_capacity(worker_count);
 

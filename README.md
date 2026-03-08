@@ -1,64 +1,93 @@
 # mc_klon
 
-Rust/WGPU-Minecraft-Klon mit Fokus auf fruehe Classic-/Pre-Classic-Rekonstruktion und sauberer, performanter Architektur.
+Rust/WGPU Minecraft-like voxel engine with a Classic/Pre-Classic feature order and a modern implementation strategy.
 
-## Aktueller Stand
+## Direction
 
-- Rendering mit `wgpu` inkl. Layern (`Opaque`, `Cutout`, `Transparent`), Depth Buffer, Fog und Overlays
-- Chunk-basiertes Voxel-Rendering mit Greedy Meshing, Plant- und Liquid-Meshing
-- Fluids: Water/Lava-Simulation, Mixing (Stone/Cobblestone/Obsidian), Fluid-Mesh-Coalescing
-- Bewegung: Walking/Flight/Swim/Wading, Sprint-Logik, Kollisionen, Step-Up
-- Worldgen: Seed + Presets, Terrain-Noise, Surface Rules, Carvers (Caves/Ravines), Lakes/Springs
-- Streaming ueber Worker-Pipelines (Chunkgen, Meshing, Lighting, Save/Load)
-- Save/Load mit `save/world.meta`, `save/manifest.json`, `save/region/*.mca`
-- Simulation mit fixer Tickrate (20 TPS) und separater Simulation Distance
+The project does not treat early-era features as permission for throwaway code.
+Gameplay and content are still introduced in a roughly historical order, but rendering, UI, worldgen, storage, and settings are built toward modern contracts so they can scale without a later rewrite.
+
+## Current State
+
+- Rendering with `wgpu`, layered world passes, fog, overlays, sky cycle, and debug views
+- Deterministic terrain shading contract with explicit render/collision/raycast/occlusion shapes
+- Startup loading screen that prepares the first playable area before entering gameplay
+- Persistent settings in `save/settings.json` with gameplay, graphics, and control bindings
+- Main menu, pause menu, and options screens using textured Minecraft-style widget buttons
+- 3D cached hotbar/inventory block previews for cubes, slabs, and cross-plants
+- Smaller plant selection boxes for flowers, mushrooms, saplings, and similar decorative cross-plants
+- Chunk streaming through worker pipelines for chunkgen, meshing, lighting, and save/load
+- Worldgen with presets, terrain, carvers, lakes/springs, foliage, and a dedicated ore feature pass
+- Save/load with `save/world.meta`, `save/manifest.json`, `save/ticking_areas.bin`, `save/region/*.mca`
+- Simulation with fixed tick rate (20 TPS), random ticks, fluids, and separate simulation distance
 
 ## Build / Run
 
 - `cargo run`
+- `cargo run -- --migrate-save-v1-to-v2`
 - `cargo test`
 - `cargo fmt`
 - `cargo clippy`
 
-## Wichtige Controls
+## Important Controls
 
-- `WASD`: Bewegen
-- Maus: Look
-- `LMB` / `RMB`: Block abbauen / platzieren
-- `1`..`9` oder Mausrad: Block-Auswahl
-- `Space`: Springen / aufsteigen (je nach Modus)
-- `Shift`: Absteigen (im Flug) / kontextabhaengig Bewegung
-- Doppelt `Space`: Walking <-> Flight
-- `ESC`: Pause-Menue oeffnen/schliessen
-- `N`: Neue Welt generieren (mit Generation-Overlay)
-- `Enter`: Welt speichern
-- `F`: Render Distance zyklisch (`Short`, `Normal`, `Far`, `Extreme`)
-- `G`: Simulation Distance zyklisch (`Short`, `Normal`, `Far`, `Extreme`)
-- `F3`: Debug-Overlay
-- `F4`: Depth-Test Debug-Toggle
-- `F5`: Frustum-Culling Debug-Toggle
-- `F6`: Far-LOD an/aus
-- `F7`: Ambient-Occlusion Debug-Toggle
-- `F8`: Lighting-Debug-View zyklisch
+- `WASD`: move
+- Mouse: look
+- first mouse click in the window: enable mouse capture
+- `LMB` / `RMB`: break / place block
+- `Mouse Wheel`: hotbar selection
+- `E`: inventory
+- `T`: chat
+- `Space`: jump / move upward (depending on mode)
+- `Shift`: descend (while flying) / context-dependent movement
+- `Ctrl`: hold sprint (in addition to double-tap `W`)
+- Double `Space`: walking <-> flight
+- `ESC`: pause / close menus
+- `N`: generate a new world
+- `Enter`: save world
+- `K`: toggle hand-tweak debug mode
+- Hand-tweak mode: mouse wheel=`scale`, arrows=`side/down`, `PageUp/PageDown`=`forward`, `[`/`]`=`roll`
+- `F`: cycle render distance
+- `G`: cycle simulation distance
+- `F3`: debug overlay
+- `F4`: depth-test debug toggle
+- `F5`: frustum-culling debug toggle
+- `F6`: far LOD on/off
+- `F7`: ambient occlusion debug toggle
+- `F8`: cycle lighting debug view
+- `Ctrl+T`: create a ticking area at the current chunk position
+- `Ctrl+Shift+T`: remove the nearest ticking area
 
-## Save-System (aktuell)
+Note: hotbar selection through number keys `1..9` is still not wired.
 
-- Metadaten: `save/world.meta` (JSON, atomarer Write)
-- Content-Manifest: `save/manifest.json` (atomarer Write)
-- Chunk-Spalten: `save/region/r.<rx>.<rz>.mca`
-- Persistiert u.a.:
-  - Blockdaten pro Sektion (`blocks`, `block_data`)
-  - World Seed, Preset, Hoehenparameter, Sea-Level
-  - Block-ID-Mapping-Version + Manifest-Signatur-Kontext
-- Laufzeitdaten wie Lighting werden nach Load neu aufgebaut
+## Runtime Defaults
 
-Hinweis: Legacy-`save/world.bin` existiert noch als Altpfad im Code, ist aber nicht der aktive Runtime-Storage-Pfad.
+- Player start mode: `Flight` (toggle via double-space)
+- Double-tap windows: `Space=0.24s`, `W=0.30s`
+- Default worldgen preset: `Rd161348Like`
+- Random tick speed: `3` samples per active chunk and sim tick
+- Settings file: `save/settings.json`
 
-## Relevante Doku
+## Save System
 
-- `docs/01_status_und_aktueller_stand.md`: technischer Ist-Stand
-- `docs/todos_worldgen.md`: offene Worldgen-Aufgaben
-- `docs/performance_optimizations.md`: umgesetzte und offene Performance-Themen
-- `docs/save_region_format_v1.md`: Storage-Format-Spezifikation
-- `docs/03_java_bedrock_takeaways.md`: Architekturentscheidungen (North Star)
-- `docs/04_content_foundation.md`: datengetriebene Content-Foundation
+- Metadata: `save/world.meta`
+- Content manifest: `save/manifest.json`
+- Ticking areas: `save/ticking_areas.bin`
+- Chunk columns: `save/region/r.<rx>.<rz>.mca`
+- Persists world seed, preset, height parameters, sea level, block data, and registry context
+- Client settings are stored separately in `save/settings.json`
+- Runtime lighting is rebuilt after load
+
+Note: legacy `save/world.bin` still exists in code as an older path, but it is not the active runtime storage path.
+
+## Relevant Documentation
+
+- `docs/00_idee_und_ziel.md`: target vision and principles
+- `docs/01_status_und_aktueller_stand.md`: current technical status and open work
+- `docs/05_gameplay_feature_backlog_1_21_11_alignment.md`: prioritized backlog grouped by subsystem
+- `docs/06_runtime_contracts_and_pipelines.md`: current shading, loading, settings, and ore-generation contracts
+- `docs/todos_worldgen.md`: worldgen-specific next steps
+- `docs/performance_optimizations.md`: implemented and open performance work
+- `docs/save_region_format_v1.md`: storage format notes
+- `docs/03_java_bedrock_takeaways.md`: architecture north star
+- `docs/04_content_foundation.md`: content/data foundation

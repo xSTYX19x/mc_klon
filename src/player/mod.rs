@@ -26,12 +26,19 @@ pub(crate) enum MoveMode {
     Swim { kind: FluidKind },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlayerMode {
+    Survival,
+    Creative,
+}
+
 /// Player-Transform in Weltkoordinaten.
 /// `feet_position` beschreibt die Unterkante des Players.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Player {
     pub(crate) feet_position: Vec3,
     pub(crate) mode: MoveMode,
+    pub(crate) player_mode: PlayerMode,
     pub(crate) _velocity_y: f32,
     pub(crate) walk_velocity: Vec3,
     pub(crate) swim_velocity: Vec3,
@@ -52,6 +59,7 @@ impl Player {
         Self {
             feet_position: eye_position - Vec3::Y * EYE_HEIGHT,
             mode: MoveMode::Flight,
+            player_mode: PlayerMode::Creative,
             _velocity_y: 0.0,
             walk_velocity: Vec3::ZERO,
             swim_velocity: Vec3::ZERO,
@@ -118,6 +126,16 @@ pub(crate) fn player_aabb(feet_pos: Vec3) -> (Vec3, Vec3) {
     player_aabb_with_height(feet_pos, PLAYER_HEIGHT)
 }
 
+#[inline(always)]
+fn aabb_overlaps(min_a: Vec3, max_a: Vec3, min_b: Vec3, max_b: Vec3) -> bool {
+    min_a.x < max_b.x
+        && max_a.x > min_b.x
+        && min_a.y < max_b.y
+        && max_a.y > min_b.y
+        && min_a.z < max_b.z
+        && max_a.z > min_b.z
+}
+
 /// Prüft, ob eine AABB irgendeine solide Voxelzelle überlappt.
 pub(crate) fn aabb_collides(world: &World, aabb_min: Vec3, aabb_max: Vec3) -> bool {
     let min_x = aabb_min.x.floor() as i32;
@@ -130,7 +148,17 @@ pub(crate) fn aabb_collides(world: &World, aabb_min: Vec3, aabb_max: Vec3) -> bo
     for y in min_y..=max_y {
         for z in min_z..=max_z {
             for x in min_x..=max_x {
-                if world.is_solid_block_at(x, y, z) {
+                let block_pos = IVec3::new(x, y, z);
+                if !World::in_bounds(block_pos) {
+                    return true;
+                }
+
+                let block = world.get_block(block_pos);
+                let shape = block.collision_shape();
+                let Some((block_min, block_max)) = shape.world_bounds(block_pos) else {
+                    continue;
+                };
+                if aabb_overlaps(aabb_min, aabb_max, block_min, block_max) {
                     return true;
                 }
             }
@@ -693,6 +721,12 @@ pub(crate) fn update_walk_movement(
     );
 
     let mut delta_h = Vec3::new(player.walk_velocity.x, 0.0, player.walk_velocity.z) * dt.max(0.0);
+    if fluid_state.depth_for_kind(FluidKind::Water) > 0.0 {
+        let flow_probe =
+            player.feet_position + Vec3::new(0.0, player.collision_height() * 0.35, 0.0);
+        let flow = flow_velocity_at_point(world, FluidKind::Water, flow_probe);
+        delta_h += Vec3::new(flow.x, 0.0, flow.z) * dt.max(0.0);
+    }
     let sneak_edge_guard = PLAYER_TUNING_MINECRAFT.sneak_enabled
         && controller.move_down
         && player.on_ground
@@ -1166,13 +1200,6 @@ pub(crate) fn update_swim_movement(
             player.was_at_surface = false;
         }
 
-        let flow_probe =
-            player.feet_position + Vec3::new(0.0, player.collision_height() * 0.35, 0.0);
-        let flow_tick = flow_velocity_at_point(world, kind, flow_probe)
-            / PLAYER_TUNING_MINECRAFT.mc_ticks_per_second;
-        vel_tick.x += flow_tick.x * sub_tick;
-        vel_tick.z += flow_tick.z * sub_tick;
-
         let drag = params.drag_per_tick.powf(sub_tick);
         vel_tick *= drag;
 
@@ -1308,6 +1335,30 @@ mod tests {
         (world, block)
     }
 
+    fn make_current_test_water_world() -> (World, Vec3) {
+        let mut world = World::new();
+        let origin = IVec3::new(80, 20, 80);
+
+        for z in (origin.z - 1)..=(origin.z + 1) {
+            for x in (origin.x - 1)..=(origin.x + 2) {
+                let _ = world.set_block(IVec3::new(x, origin.y - 1, z), BlockId::Stone);
+            }
+        }
+
+        let _ = world.set_block_and_data(origin, BlockId::WaterStill, 0);
+        let _ = world.set_block(origin + IVec3::Y, BlockId::WaterStill);
+        let east = origin + IVec3::X;
+        let _ = world.set_block_and_data(east, BlockId::WaterStill, 0);
+        let _ = world.set_block(east + IVec3::Y, BlockId::WaterStill);
+
+        let eye = Vec3::new(
+            origin.x as f32 + 0.5,
+            origin.y as f32 + EYE_HEIGHT,
+            origin.z as f32 + 0.5,
+        );
+        (world, eye)
+    }
+
     #[test]
     fn mc_jump_velocity_constant_matches() {
         let vy_tick = jump_velocity() / PLAYER_TUNING_MINECRAFT.mc_ticks_per_second;
@@ -1370,6 +1421,38 @@ mod tests {
     }
 
     #[test]
+    fn slab_collision_only_blocks_lower_half() {
+        let mut world = World::new();
+        let slab = IVec3::new(20, 20, 20);
+        let _ = world.set_block(slab, BlockId::StoneSlab);
+
+        let upper_min = Vec3::new(20.1, 20.60, 20.1);
+        let upper_max = Vec3::new(20.9, 20.95, 20.9);
+        assert!(!aabb_collides(&world, upper_min, upper_max));
+
+        let lower_min = Vec3::new(20.1, 20.10, 20.1);
+        let lower_max = Vec3::new(20.9, 20.40, 20.9);
+        assert!(aabb_collides(&world, lower_min, lower_max));
+    }
+
+    #[test]
+    fn step_up_can_climb_onto_bottom_slab() {
+        let mut world = World::new();
+        let _ = world.set_block(IVec3::new(0, 0, 0), BlockId::Stone);
+        let _ = world.set_block(IVec3::new(1, 0, 0), BlockId::Stone);
+        let _ = world.set_block(IVec3::new(1, 1, 0), BlockId::StoneSlab);
+
+        let start_feet = Vec3::new(0.5, 1.0, 0.5);
+        let moved = move_character_with_step_up(&world, start_feet, Vec3::new(1.0, 0.0, 0.0));
+
+        assert!(
+            moved.feet_pos.y > 1.45 && moved.feet_pos.y < 1.55,
+            "expected slab top y~=1.5, got {}",
+            moved.feet_pos.y
+        );
+    }
+
+    #[test]
     fn fluid_state_detects_aabb_body_intersection() {
         let mut world = World::new();
         let fluid_cell = IVec3::new(24, 20, 24);
@@ -1429,6 +1512,68 @@ mod tests {
         );
         let can_pop = can_fluid_ledge_pop(&world, feet, Vec3::new(0.7, 0.0, 0.0), PLAYER_HEIGHT);
         assert!(can_pop);
+    }
+
+    #[test]
+    fn flowing_water_does_not_push_player_in_flight_mode() {
+        let (world, eye) = make_current_test_water_world();
+        let mut player = Player::from_eye_position(eye);
+        player.mode = MoveMode::Flight;
+        let start = player.feet_position;
+        let mut controller = CameraController::new();
+        let camera = Camera::default();
+        let mut last_space_tap = None;
+
+        for _ in 0..60 {
+            update_flight_movement(
+                &world,
+                &camera,
+                &mut controller,
+                &mut player,
+                &mut last_space_tap,
+                1.0 / 60.0,
+            );
+        }
+
+        let moved = Vec3::new(
+            player.feet_position.x - start.x,
+            0.0,
+            player.feet_position.z - start.z,
+        );
+        assert!(
+            moved.length_squared() <= 1e-6,
+            "player drifted in flight from water current: delta={:?}",
+            moved
+        );
+    }
+
+    #[test]
+    fn flowing_water_pushes_player_in_walk_mode() {
+        let (world, eye) = make_current_test_water_world();
+        let mut player = Player::from_eye_position(eye);
+        player.mode = MoveMode::Walk;
+        player.on_ground = true;
+        let start_x = player.feet_position.x;
+        let mut controller = CameraController::new();
+        let camera = Camera::default();
+
+        for _ in 0..60 {
+            let fluid_state = PlayerFluidState::sample(&world, &player);
+            update_walk_movement(
+                &world,
+                &camera,
+                &mut controller,
+                &mut player,
+                &fluid_state,
+                1.0 / 60.0,
+            );
+        }
+
+        assert!(
+            player.feet_position.x < start_x - 0.05,
+            "expected walk mode to be pushed by flowing water: start_x={start_x} end_x={}",
+            player.feet_position.x
+        );
     }
 
     #[test]

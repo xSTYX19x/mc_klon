@@ -12,8 +12,8 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 
 use crate::perf::trace as perf_trace;
 use crate::storage::chunk_codec::{
-    ColumnBlob, ColumnSaveCompletion, ColumnSaveSnapshot, apply_column, decode_column, encode_column,
-    encode_column_snapshot,
+    ColumnBlob, ColumnSaveCompletion, ColumnSaveSnapshot, apply_column, decode_column,
+    encode_column, encode_column_snapshot,
 };
 use crate::storage::format::{
     REGION_CHUNK_SIDE, REGION_DIR_NAME, WORLD_MANIFEST_FILE_NAME, WORLD_META_FILE_NAME,
@@ -165,12 +165,7 @@ fn parse_region_name(file_name: &str) -> Option<(i32, i32)> {
     Some((rx, rz))
 }
 
-fn verify_column_equivalent(
-    source: &World,
-    restored: &World,
-    cx: i32,
-    cz: i32,
-) -> io::Result<()> {
+fn verify_column_equivalent(source: &World, restored: &World, cx: i32, cz: i32) -> io::Result<()> {
     for y in source.min_y()..=source.max_y() {
         for lz in 0..CHUNK_SIZE {
             for lx in 0..CHUNK_SIZE {
@@ -941,7 +936,7 @@ fn process_encode_and_store_task(
 }
 
 fn record_worker_error(last_error: &Arc<Mutex<Option<String>>>, msg: String) {
-    eprintln!("[storage][error] {msg}");
+    crate::console_error!("[storage][error] {msg}");
     if let Ok(mut guard) = last_error.lock() {
         *guard = Some(msg);
     }

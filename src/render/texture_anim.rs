@@ -195,9 +195,11 @@ pub(crate) fn parse_anim_meta_for_texture(key: &str, sheet_frames: u32) -> AnimM
                             if (idx as u32) < sheet_frames {
                                 parsed_sequence.push(idx);
                             } else {
-                                eprintln!(
+                                crate::console_error!(
                                     "[warn] animation frame {} out of range for '{}' (sheet_frames={})",
-                                    idx, key, sheet_frames
+                                    idx,
+                                    key,
+                                    sheet_frames
                                 );
                             }
                         }
@@ -208,9 +210,10 @@ pub(crate) fn parse_anim_meta_for_texture(key: &str, sheet_frames: u32) -> AnimM
                 }
             }
             Err(err) => {
-                eprintln!(
+                crate::console_error!(
                     "[warn] failed to parse animation mcmeta for '{}': {}",
-                    key, err
+                    key,
+                    err
                 );
             }
         }

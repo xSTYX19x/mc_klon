@@ -128,15 +128,31 @@ pub(crate) mod player {
     pub(crate) const JUMP_HOLD_REPEAT_TICKS: f32 = 10.0;
     pub(crate) const JUMP_HOLD_COOLDOWN_SECONDS: f32 =
         JUMP_HOLD_REPEAT_TICKS / PLAYER_TUNING_MINECRAFT.mc_ticks_per_second;
+    pub(crate) const VIEW_BOB_STRIDE_LENGTH_BLOCKS: f32 = 0.62;
+    pub(crate) const VIEW_BOB_SPEED_MULTIPLIER: f32 = 0.80;
+    pub(crate) const VIEW_BOB_VERTICAL_AMPLITUDE: f32 = 0.0;
+    pub(crate) const VIEW_BOB_HORIZONTAL_AMPLITUDE: f32 = 0.012;
+    pub(crate) const VIEW_BOB_PITCH_AMPLITUDE_RAD: f32 = 0.0;
+    pub(crate) const VIEW_BOB_ROLL_AMPLITUDE_RAD: f32 = 0.0;
+    pub(crate) const VIEW_BOB_MAX_SPEED_MULTIPLIER: f32 = 1.30;
+    pub(crate) const VIEW_BOB_MIN_SPEED: f32 = 0.10;
+    pub(crate) const VIEW_BOB_INTENSITY_RESPONSE: f32 = 12.0;
+    pub(crate) const VIEW_BOB_OFFSET_RESPONSE: f32 = 16.0;
+    pub(crate) const VIEW_BOB_ROLL_RESPONSE: f32 = 14.0;
 }
 
 pub(crate) mod render {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
     pub(crate) enum RenderDistance {
         Short,
         Normal,
         Far,
         Extreme,
+        Ultra,
+        Insane,
     }
 
     impl Default for RenderDistance {
@@ -146,12 +162,23 @@ pub(crate) mod render {
     }
 
     impl RenderDistance {
+        pub(crate) const ALL: [Self; 6] = [
+            Self::Short,
+            Self::Normal,
+            Self::Far,
+            Self::Extreme,
+            Self::Ultra,
+            Self::Insane,
+        ];
+
         pub(crate) fn next(self) -> Self {
             match self {
                 Self::Short => Self::Normal,
                 Self::Normal => Self::Far,
                 Self::Far => Self::Extreme,
-                Self::Extreme => Self::Short,
+                Self::Extreme => Self::Ultra,
+                Self::Ultra => Self::Insane,
+                Self::Insane => Self::Short,
             }
         }
 
@@ -161,6 +188,8 @@ pub(crate) mod render {
                 Self::Normal => "Normal",
                 Self::Far => "Far",
                 Self::Extreme => "Extreme",
+                Self::Ultra => "Ultra",
+                Self::Insane => "Insane",
             }
         }
 
@@ -170,6 +199,30 @@ pub(crate) mod render {
                 Self::Normal => 8,
                 Self::Far => 12,
                 Self::Extreme => 16,
+                Self::Ultra => 24,
+                Self::Insane => 32,
+            }
+        }
+
+        pub(crate) fn far_lod_requests_per_frame(self) -> usize {
+            match self {
+                Self::Short => 0,
+                Self::Normal => 0,
+                Self::Far => 1,
+                Self::Extreme => 3,
+                Self::Ultra => 5,
+                Self::Insane => 8,
+            }
+        }
+
+        pub(crate) fn far_lod_gpu_uploads_per_frame(self) -> usize {
+            match self {
+                Self::Short => 0,
+                Self::Normal => 0,
+                Self::Far => 1,
+                Self::Extreme => 1,
+                Self::Ultra => 2,
+                Self::Insane => 4,
             }
         }
     }
@@ -278,9 +331,35 @@ pub(crate) mod render {
     pub(crate) const UI_MODE_SOLID: u32 = 0;
     pub(crate) const UI_MODE_TEXTURED: u32 = 1;
     pub(crate) const UI_MODE_WATER_OVERLAY: u32 = 2;
+    pub(crate) const UI_MODE_SOLID_ALPHA: u32 = 3;
     pub(crate) const MINECRAFT_TICK_SECONDS: f32 = 1.0 / 20.0;
 }
 
 pub(crate) mod sim {
     pub(crate) const RANDOM_TICK_SPEED_DEFAULT: u32 = 3;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render::RenderDistance;
+
+    #[test]
+    fn render_distance_extends_to_thirty_two_chunks() {
+        assert_eq!(RenderDistance::Insane.view_distance_chunks(), 32);
+        assert_eq!(RenderDistance::Ultra.view_distance_chunks(), 24);
+    }
+
+    #[test]
+    fn far_lod_budgets_scale_with_render_distance() {
+        assert_eq!(RenderDistance::Normal.far_lod_requests_per_frame(), 0);
+        assert!(RenderDistance::Extreme.far_lod_requests_per_frame() > 0);
+        assert!(
+            RenderDistance::Insane.far_lod_requests_per_frame()
+                > RenderDistance::Ultra.far_lod_requests_per_frame()
+        );
+        assert!(
+            RenderDistance::Insane.far_lod_gpu_uploads_per_frame()
+                >= RenderDistance::Ultra.far_lod_gpu_uploads_per_frame()
+        );
+    }
 }

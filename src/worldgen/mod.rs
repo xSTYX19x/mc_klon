@@ -2,6 +2,7 @@ pub mod carvers;
 pub mod density;
 pub mod java_random;
 pub mod noise;
+pub mod ores;
 pub mod pipeline;
 pub mod surface_rules;
 pub mod terrain;
@@ -71,13 +72,7 @@ impl GenContext {
 }
 
 pub(crate) trait WorldGenerator: Send + Sync {
-    fn generate_column(
-        &self,
-        cx: i32,
-        cz: i32,
-        out: &mut ColumnBuffer,
-        ctx: &mut GenContext,
-    );
+    fn generate_column(&self, cx: i32, cz: i32, out: &mut ColumnBuffer, ctx: &mut GenContext);
 }
 
 pub use density::{DensityFn, EvalContext};

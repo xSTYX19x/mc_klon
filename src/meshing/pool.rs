@@ -20,6 +20,17 @@ pub(crate) struct MeshingPool {
     /// Temporary position arrays for liquid/plant mesh generation
     pub(crate) temp_positions: Vec<[f32; 3]>,
     pub(crate) temp_uvs: Vec<[f32; 2]>,
+    layered_hints: LayeredCapacityHints,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LayeredCapacityHints {
+    opaque_vertices: usize,
+    opaque_indices: usize,
+    cutout_vertices: usize,
+    cutout_indices: usize,
+    transparent_vertices: usize,
+    transparent_indices: usize,
 }
 
 impl MeshingPool {
@@ -32,6 +43,7 @@ impl MeshingPool {
             liquid_pool: super::liquids::LiquidMeshingPool::with_capacity(128),
             temp_positions: Vec::with_capacity(256),
             temp_uvs: Vec::with_capacity(256),
+            layered_hints: LayeredCapacityHints::default(),
         }
     }
 
@@ -67,6 +79,96 @@ impl MeshingPool {
             liquid_stats: self.liquid_pool.allocation_stats(),
             temp_capacity: self.temp_positions.capacity() + self.temp_uvs.capacity(),
         }
+    }
+
+    pub(crate) fn scratch_buffers_reused(&self) -> u32 {
+        u32::from(!self.greedy_mask.is_empty() || self.greedy_mask.capacity() > 0)
+            + u32::from(self.liquid_pool.allocation_stats().total_capacity() > 0)
+            + u32::from(!self.temp_positions.is_empty() || self.temp_positions.capacity() > 0)
+            + u32::from(!self.temp_uvs.is_empty() || self.temp_uvs.capacity() > 0)
+    }
+
+    pub(crate) fn prepare_layered_geometry(
+        &self,
+        layered: &mut super::LayeredChunkGeometry,
+    ) -> u32 {
+        let mut reused = 0u32;
+        reused += reserve_if_hint(
+            &mut layered.opaque.vertices,
+            self.layered_hints.opaque_vertices,
+        );
+        reused += reserve_if_hint(
+            &mut layered.opaque.indices,
+            self.layered_hints.opaque_indices,
+        );
+        reused += reserve_if_hint(
+            &mut layered.cutout.vertices,
+            self.layered_hints.cutout_vertices,
+        );
+        reused += reserve_if_hint(
+            &mut layered.cutout.indices,
+            self.layered_hints.cutout_indices,
+        );
+        reused += reserve_if_hint(
+            &mut layered.transparent.vertices,
+            self.layered_hints.transparent_vertices,
+        );
+        reused += reserve_if_hint(
+            &mut layered.transparent.indices,
+            self.layered_hints.transparent_indices,
+        );
+        reused
+    }
+
+    pub(crate) fn record_layered_geometry_usage(
+        &mut self,
+        layered: &super::LayeredChunkGeometry,
+    ) -> u32 {
+        let mut growths = 0u32;
+        growths += update_hint(
+            &mut self.layered_hints.opaque_vertices,
+            layered.opaque.vertices.capacity(),
+        );
+        growths += update_hint(
+            &mut self.layered_hints.opaque_indices,
+            layered.opaque.indices.capacity(),
+        );
+        growths += update_hint(
+            &mut self.layered_hints.cutout_vertices,
+            layered.cutout.vertices.capacity(),
+        );
+        growths += update_hint(
+            &mut self.layered_hints.cutout_indices,
+            layered.cutout.indices.capacity(),
+        );
+        growths += update_hint(
+            &mut self.layered_hints.transparent_vertices,
+            layered.transparent.vertices.capacity(),
+        );
+        growths += update_hint(
+            &mut self.layered_hints.transparent_indices,
+            layered.transparent.indices.capacity(),
+        );
+        growths
+    }
+}
+
+#[inline(always)]
+fn reserve_if_hint<T>(buffer: &mut Vec<T>, hint: usize) -> u32 {
+    if hint == 0 {
+        return 0;
+    }
+    buffer.reserve(hint);
+    1
+}
+
+#[inline(always)]
+fn update_hint(current: &mut usize, capacity: usize) -> u32 {
+    if capacity > *current {
+        *current = capacity;
+        1
+    } else {
+        0
     }
 }
 

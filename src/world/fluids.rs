@@ -24,6 +24,7 @@ pub(crate) struct FluidState {
     pub(crate) level: u8,
     pub(crate) falling: bool,
     pub(crate) source_origin: bool,
+    pub(crate) worldgen_static: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,11 +106,39 @@ pub(crate) fn fluid_data_set_source_origin(data: u8, on: bool) -> u8 {
     }
 }
 
+pub(crate) fn fluid_data_is_worldgen_static(data: u8) -> bool {
+    (data & FLUID_FLAG_WORLDGEN_STATIC) != 0
+}
+
+pub(crate) fn fluid_data_set_worldgen_static(data: u8, on: bool) -> u8 {
+    if on {
+        data | FLUID_FLAG_WORLDGEN_STATIC
+    } else {
+        data & !FLUID_FLAG_WORLDGEN_STATIC
+    }
+}
+
 pub(crate) fn fluid_data_make(level: u8, falling: bool, source_origin: bool) -> u8 {
-    fluid_data_set_source_origin(
-        fluid_data_set_falling(fluid_data_set_level(0, level), falling),
-        source_origin,
+    fluid_data_make_worldgen_static(level, falling, source_origin, false)
+}
+
+pub(crate) fn fluid_data_make_worldgen_static(
+    level: u8,
+    falling: bool,
+    source_origin: bool,
+    worldgen_static: bool,
+) -> u8 {
+    fluid_data_set_worldgen_static(
+        fluid_data_set_source_origin(
+            fluid_data_set_falling(fluid_data_set_level(0, level), falling),
+            source_origin,
+        ),
+        worldgen_static,
     )
+}
+
+pub(crate) fn fluid_data_make_static(level: u8, source_origin: bool) -> u8 {
+    fluid_data_make_worldgen_static(level, false, source_origin, true)
 }
 
 pub(crate) fn is_water_source(block_id: BlockId, data: u8) -> bool {
@@ -145,6 +174,7 @@ pub(crate) const LAVA_SPREAD_INTERVAL_TICKS_NETHER: u64 = 10;
 const FLUID_LEVEL_MASK: u8 = 0x0F;
 const FLUID_FLAG_FALLING: u8 = 0x80;
 const FLUID_FLAG_SOURCE_ORIGIN: u8 = 0x40;
+const FLUID_FLAG_WORLDGEN_STATIC: u8 = 0x20;
 
 const WATER_MAX_LEVEL: u8 = 7;
 const LAVA_MAX_LEVEL_OVERWORLD: u8 = 6;
@@ -571,7 +601,8 @@ impl FluidSystem {
         let mut level = fluid_data_level(data).min(7);
         let mut falling = fluid_data_is_falling(data);
         let source_origin = fluid_data_is_source_origin(data);
-        if source_origin {
+        let worldgen_static = fluid_data_is_worldgen_static(data);
+        if source_origin || worldgen_static {
             level = 0;
             falling = false;
         }
@@ -581,6 +612,7 @@ impl FluidSystem {
             level,
             falling,
             source_origin,
+            worldgen_static,
         })
     }
 
@@ -624,18 +656,23 @@ impl FluidSystem {
             return false;
         }
 
-        let block = if state.source_origin {
+        let block = if state.source_origin || state.worldgen_static {
             make_still(state.kind)
         } else {
             make_flowing(state.kind)
         };
         let mut level = state.level;
         let mut falling = state.falling;
-        if state.source_origin {
+        if state.source_origin || state.worldgen_static {
             level = 0;
             falling = false;
         }
-        let data = fluid_data_make(level, falling, state.source_origin);
+        let data = fluid_data_make_worldgen_static(
+            level,
+            falling,
+            state.source_origin,
+            state.worldgen_static,
+        );
 
         if world.get_block(pos) == block && world.get_block_data(pos) == data {
             return false;
@@ -996,6 +1033,17 @@ impl FluidSystem {
                 level: 0,
                 falling: false,
                 source_origin: true,
+                worldgen_static: false,
+            });
+        }
+
+        if current_state.worldgen_static {
+            return Some(FluidState {
+                kind,
+                level: 0,
+                falling: false,
+                source_origin: false,
+                worldgen_static: true,
             });
         }
 
@@ -1005,6 +1053,7 @@ impl FluidSystem {
                 level: 0,
                 falling: false,
                 source_origin: true,
+                worldgen_static: false,
             });
         }
 
@@ -1028,6 +1077,7 @@ impl FluidSystem {
                 level: current_state.level.min(params.max_distance),
                 falling: true,
                 source_origin: false,
+                worldgen_static: false,
             });
         }
 
@@ -1040,6 +1090,7 @@ impl FluidSystem {
                 level: 0,
                 falling: true,
                 source_origin: false,
+                worldgen_static: false,
             });
         }
 
@@ -1052,6 +1103,7 @@ impl FluidSystem {
                 level: 0,
                 falling: true,
                 source_origin: false,
+                worldgen_static: false,
             });
         }
 
@@ -1064,6 +1116,7 @@ impl FluidSystem {
                 level: 0,
                 falling: false,
                 source_origin: false,
+                worldgen_static: false,
             });
         }
 
@@ -1075,6 +1128,7 @@ impl FluidSystem {
                 level: best_level,
                 falling: false,
                 source_origin: false,
+                worldgen_static: false,
             });
         }
 
@@ -1128,6 +1182,7 @@ impl FluidSystem {
                 level: 0,
                 falling: true,
                 source_origin: false,
+                worldgen_static: false,
             },
             changed_positions,
         );
@@ -1162,6 +1217,7 @@ impl FluidSystem {
                 level,
                 falling,
                 source_origin: false,
+                worldgen_static: false,
             },
             changed_positions,
         );
@@ -1337,13 +1393,27 @@ impl FluidSystem {
         changed_positions: &mut HashSet<IVec3>,
     ) {
         let params = self.params_for_kind(kind);
-        let old_state = Self::get_fluid_state(world, pos);
+        let mut old_state = Self::get_fluid_state(world, pos);
         if old_state.is_some_and(|state| state.kind != kind) {
             self.remove_stream_lock_if_kind(pos, kind);
             return;
         }
 
         let mut local_changed = false;
+        if old_state.is_some_and(|state| state.worldgen_static) {
+            let thawed = FluidState {
+                kind,
+                level: 0,
+                falling: false,
+                source_origin: false,
+                worldgen_static: false,
+            };
+            if self.set_fluid_state(world, pos, thawed, changed_positions) {
+                local_changed = true;
+            }
+            old_state = Some(thawed);
+        }
+
         let next_state = self.compute_next_state_for_pos(world, pos, kind, params);
         let current_state = match next_state {
             Some(state) => {
@@ -1369,6 +1439,14 @@ impl FluidSystem {
             }
             return;
         };
+
+        if state.worldgen_static {
+            self.remove_stream_lock_if_kind(pos, kind);
+            if local_changed {
+                self.schedule_ring_for_kind(world, pos, kind, params.tick_rate);
+            }
+            return;
+        }
 
         if self.try_flow_down_from(world, pos, state, params, changed_positions) {
             local_changed = true;
@@ -1502,18 +1580,32 @@ impl FluidSystem {
             state.level = 0;
             state.falling = false;
         }
+        if state.worldgen_static {
+            state.level = 0;
+            state.falling = false;
+            state.source_origin = false;
+        }
 
         if !self.set_block_loaded_only(
             world,
             pos,
-            if state.source_origin {
+            if state.source_origin || state.worldgen_static {
                 make_still(state.kind)
             } else {
                 make_flowing(state.kind)
             },
-            fluid_data_make(state.level, state.falling, state.source_origin),
+            fluid_data_make_worldgen_static(
+                state.level,
+                state.falling,
+                state.source_origin,
+                state.worldgen_static,
+            ),
             state.kind,
         ) {
+            return;
+        }
+
+        if state.worldgen_static {
             return;
         }
 
@@ -1604,6 +1696,10 @@ mod tests {
         let _ = world.set_block_and_data(pos, make_still(kind), fluid_data_make(0, false, true));
     }
 
+    fn set_worldgen_static(world: &mut World, pos: IVec3, kind: FluidKind) {
+        let _ = world.set_block_and_data(pos, make_still(kind), fluid_data_make_static(0, false));
+    }
+
     fn fluid_state(world: &World, pos: IVec3) -> Option<FluidState> {
         FluidSystem::get_fluid_state(world, pos)
     }
@@ -1685,6 +1781,60 @@ mod tests {
             assert_eq!(fluid_state(&world, pos).map(|s| s.level), Some(d as u8));
         }
         assert_eq!(fluid_state(&world, source + IVec3::new(8, 0, 0)), None);
+    }
+
+    #[test]
+    fn worldgen_static_fluid_stays_dormant_without_explicit_update() {
+        let mut world = World::new();
+        world.chunks.clear();
+        set_floor(&mut world, 10, 40, 10, 40, 0, BlockId::Stone);
+
+        let cell = IVec3::new(20, 1, 20);
+        set_worldgen_static(&mut world, cell, FluidKind::Water);
+
+        let mut fluids = FluidSystem::new();
+        run_ticks(&mut fluids, &mut world, 120);
+
+        let center = fluid_state(&world, cell).expect("static water missing");
+        assert_eq!(center.kind, FluidKind::Water);
+        assert!(
+            center.worldgen_static,
+            "static flag was cleared unexpectedly"
+        );
+        assert!(
+            !center.source_origin,
+            "worldgen static water should not be source-origin"
+        );
+
+        for dir in HORIZONTAL_DIRS {
+            assert_eq!(
+                fluid_state(&world, cell + dir),
+                None,
+                "static water spread into {:?}",
+                cell + dir
+            );
+        }
+        assert_eq!(fluid_state(&world, cell + IVec3::new(0, -1, 0)), None);
+    }
+
+    #[test]
+    fn worldgen_static_fluid_thaws_when_scheduled() {
+        let mut world = World::new();
+        world.chunks.clear();
+        set_floor(&mut world, 10, 40, 10, 40, 0, BlockId::Stone);
+
+        let cell = IVec3::new(20, 1, 20);
+        set_worldgen_static(&mut world, cell, FluidKind::Water);
+
+        let mut fluids = FluidSystem::new();
+        fluids.enqueue_with_neighbors(&world, cell);
+        run_ticks(&mut fluids, &mut world, 40);
+
+        let center = fluid_state(&world, cell);
+        assert!(
+            !center.is_some_and(|s| s.worldgen_static),
+            "scheduled worldgen-static fluid should thaw into simulated fluid"
+        );
     }
 
     #[test]

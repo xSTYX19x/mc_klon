@@ -6,6 +6,7 @@ use crate::world::{CHUNK_SIZE, ChunkCoord};
 
 pub(crate) mod greedy;
 pub(crate) mod liquids;
+pub(crate) mod neighborhood;
 pub(crate) mod plants;
 pub(crate) mod pool;
 
@@ -20,6 +21,7 @@ pub(crate) use liquids::{
     liquid_fill_height_at_point, surface_height, wall_height,
 };
 pub(crate) use liquids::{fluid_kind_at_point, liquid_height_at_point};
+pub(crate) use neighborhood::{ChunkSnapshot, MeshingNeighborhoodScratch, NeighborhoodSnapshot};
 
 // Export the new pooled meshing functions
 pub(crate) use greedy::{build_chunk_mesh_greedy_layered, build_chunk_mesh_layered_naive};
@@ -30,6 +32,7 @@ pub(crate) struct Vertex {
     pub(crate) position: [f32; 3],
     pub(crate) uv: [f32; 2],
     pub(crate) tex_layer: u32,
+    // Baked terrain shading from meshing: directional face darkening * validated AO.
     pub(crate) color: [f32; 3],
     pub(crate) tint_kind: u32,
     pub(crate) light_packed: u32, // high nibble sky, low nibble block

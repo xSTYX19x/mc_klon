@@ -275,6 +275,7 @@ fn tmp_path_for(path: &Path) -> io::Result<PathBuf> {
 fn preset_to_str(preset: WorldgenPreset) -> &'static str {
     match preset {
         WorldgenPreset::Flatish => "flatish",
+        WorldgenPreset::ClassicFlatter => "classic_flatter",
         WorldgenPreset::Rd161348Like => "rd161348_like",
         WorldgenPreset::Hilly => "hilly",
     }
@@ -283,6 +284,7 @@ fn preset_to_str(preset: WorldgenPreset) -> &'static str {
 fn preset_from_str(value: &str) -> Option<WorldgenPreset> {
     match value {
         "flatish" => Some(WorldgenPreset::Flatish),
+        "classic_flatter" => Some(WorldgenPreset::ClassicFlatter),
         "rd161348_like" => Some(WorldgenPreset::Rd161348Like),
         "hilly" => Some(WorldgenPreset::Hilly),
         _ => None,

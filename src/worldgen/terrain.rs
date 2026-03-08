@@ -1,9 +1,10 @@
 use super::noise::NoiseSampler;
 
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WorldgenPreset {
     Flatish,
+    ClassicFlatter,
     Rd161348Like,
     Hilly,
 }
@@ -26,6 +27,10 @@ pub struct WorldGenConfig {
     pub warp_strength: f32,
     pub cliff_freq: f32,
     pub cliff_amp: f32,
+    pub local_hill_freq_mul: f32,
+    pub local_hill_weight: f32,
+    pub ridge_weight: f32,
+    pub valley_floor_offset: i32,
 }
 
 impl WorldGenConfig {
@@ -49,6 +54,31 @@ impl WorldGenConfig {
                 warp_strength: 5.2,
                 cliff_freq: 0.028,
                 cliff_amp: 0.0,
+                local_hill_freq_mul: 2.9,
+                local_hill_weight: 0.46,
+                ridge_weight: 0.20,
+                valley_floor_offset: 12,
+            },
+            WorldgenPreset::ClassicFlatter => Self {
+                seed,
+                sea_level,
+                // Etwas flacher als rd161348_like, aber weiterhin mit klarer Silhouette.
+                base_height: 84,
+                height_amp: 20.0,
+                freq: 0.0104,
+                octaves: 4,
+                lacunarity: 2.0,
+                gain: 0.52,
+                dirt_depth: 3,
+                warp_freq: 0.0078,
+                warp_strength: 6.6,
+                cliff_freq: 0.034,
+                // Deutlich weniger steile Cliffs.
+                cliff_amp: 2.8,
+                local_hill_freq_mul: 2.35,
+                local_hill_weight: 0.35,
+                ridge_weight: 0.14,
+                valley_floor_offset: 10,
             },
             WorldgenPreset::Rd161348Like => Self {
                 seed,
@@ -67,6 +97,10 @@ impl WorldGenConfig {
                 cliff_freq: 0.034,
                 // Aktiv: selektiv häufigere Steilhänge.
                 cliff_amp: 9.8,
+                local_hill_freq_mul: 2.9,
+                local_hill_weight: 0.46,
+                ridge_weight: 0.20,
+                valley_floor_offset: 12,
             },
             WorldgenPreset::Hilly => Self {
                 seed,
@@ -82,6 +116,10 @@ impl WorldGenConfig {
                 warp_strength: 8.0,
                 cliff_freq: 0.038,
                 cliff_amp: 13.0,
+                local_hill_freq_mul: 2.9,
+                local_hill_weight: 0.46,
+                ridge_weight: 0.20,
+                valley_floor_offset: 12,
             },
         }
     }
@@ -151,7 +189,7 @@ impl TerrainSampler {
         let local_hills = self.noise.fbm2(
             wx + 4096.0,
             wz - 2048.0,
-            self.cfg.freq * 2.9,
+            self.cfg.freq * self.cfg.local_hill_freq_mul,
             4,
             self.cfg.lacunarity,
             0.55,
@@ -178,14 +216,16 @@ impl TerrainSampler {
 
         // Mischfeld + nichtlineare Schärfung:
         // ergibt erkennbare Kuppen statt nur weicher Schrägen.
-        let hill_field = macro_hills * 0.70 + local_hills * 0.46 + (ridges * 2.0 - 1.0) * 0.20;
+        let hill_field = macro_hills * 0.70
+            + local_hills * self.cfg.local_hill_weight
+            + (ridges * 2.0 - 1.0) * self.cfg.ridge_weight;
         let hill_shaped = hill_field * 0.78 + hill_field.powi(3) * 0.16;
 
         let mut height =
             base_height + hill_shaped * self.cfg.height_amp + detail * (self.cfg.height_amp * 0.07);
 
         // Sea-level bleibt Referenzwert gegen zu tiefe Täler.
-        height = height.max((self.cfg.sea_level - 12) as f32);
+        height = height.max((self.cfg.sea_level - self.cfg.valley_floor_offset) as f32);
 
         if self.cfg.cliff_amp > 0.0 {
             // Optionaler Cliff-Effekt; standardmäßig deaktiviert.
@@ -361,6 +401,75 @@ mod tests {
             "rd161348_like not producing more steep edges (flat={:.3}, rd={:.3})",
             flat_steep,
             rd_steep
+        );
+    }
+
+    #[test]
+    fn classic_flatter_is_less_steep_than_rd161348_like() {
+        const SIZE: i32 = 192;
+        const MAX_Y: i32 = 255;
+
+        let flatter = TerrainSampler::new(WorldGenConfig::from_preset(
+            132_211,
+            WorldgenPreset::ClassicFlatter,
+        ));
+        let rd = TerrainSampler::new(WorldGenConfig::from_preset(
+            132_211,
+            WorldgenPreset::Rd161348Like,
+        ));
+        let (flatter_grad, flatter_steep) = gradient_stats(&flatter, SIZE, MAX_Y);
+        let (rd_grad, rd_steep) = gradient_stats(&rd, SIZE, MAX_Y);
+
+        assert!(
+            rd_grad >= flatter_grad + 0.04,
+            "classic_flatter not flatter enough (avg grad flatter={:.3}, rd={:.3})",
+            flatter_grad,
+            rd_grad
+        );
+        assert!(
+            rd_steep > flatter_steep,
+            "classic_flatter did not reduce steep edges (flatter={:.3}, rd={:.3})",
+            flatter_steep,
+            rd_steep
+        );
+    }
+
+    #[test]
+    fn classic_flatter_has_relief_without_top_clipping() {
+        const SIZE: i32 = 192;
+        const MAX_Y: i32 = 255;
+
+        let sampler = TerrainSampler::new(WorldGenConfig::from_preset(
+            132_211,
+            WorldgenPreset::ClassicFlatter,
+        ));
+        let mut min_h = i32::MAX;
+        let mut max_h = i32::MIN;
+        let mut clipped_top = 0usize;
+
+        for z in 0..SIZE {
+            for x in 0..SIZE {
+                let h = sampler.height_at(x, z, MAX_Y);
+                min_h = min_h.min(h);
+                max_h = max_h.max(h);
+                if h == MAX_Y {
+                    clipped_top += 1;
+                }
+            }
+        }
+
+        let range = max_h - min_h;
+        let clipped_ratio = clipped_top as f32 / ((SIZE * SIZE) as f32);
+
+        assert!(
+            range >= 14,
+            "classic_flatter lost too much macro variation: range={}",
+            range
+        );
+        assert!(
+            clipped_ratio <= 0.01,
+            "classic_flatter has too much top clipping: {:.3}",
+            clipped_ratio
         );
     }
 }

@@ -1,39 +1,39 @@
 # Memory Pool Implementation (Meshing)
 
-Stand: 2026-03-01
+Status: 2026-03-04
 
-## Ziel
+## Goal
 
-Meshing-Allokationen pro Job reduzieren, um Frametimes bei vielen Remeshes zu stabilisieren.
+Reduce meshing allocations per job in order to stabilize frame times during heavy remeshing.
 
-## Umgesetzter Ansatz
+## Implemented Approach
 
 - Thread-local `MeshingPool` (`src/meshing/pool.rs`)
-- Reuse von:
-  - Vertex-/Index-Buffern
-  - Greedy-Mask-Scratch
-  - LiquidMeshingPool (Corner-Cache)
-  - temporaeren Arrays
-- `with_meshing_pool(...)` resetet nur Inhalte, behaelt Kapazitaeten
+- Reuse of:
+  - vertex/index buffers
+  - greedy mask scratch
+  - `LiquidMeshingPool` (corner cache)
+  - temporary arrays
+- `with_meshing_pool(...)` resets contents only and keeps capacities
 
-## Liquid-Meshing
+## Liquid Meshing
 
 - `LiquidMeshingPool` in `src/meshing/liquids.rs`
-- `append_liquids_in_chunk_pooled(...)` nutzt den Pool-Pfad
-- Fallback ohne externen Pool nutzt ebenfalls thread-local Reuse
+- `append_liquids_in_chunk_pooled(...)` uses the pooled path
+- fallback without an external pool also uses thread-local reuse
 
-## Instrumentierung
+## Instrumentation
 
-- `src/perf/allocation_tracker.rs` bietet optionales Allocation-Tracking
-- In `liquids.rs` ueber Feature-Gate `allocation_tracking` einhaengbar
+- `src/perf/allocation_tracker.rs` provides optional allocation tracking
+- can be hooked into `liquids.rs` via the `allocation_tracking` feature gate
 
-## Erwarteter Effekt
+## Expected Effect
 
-- Weniger kurzlebige Allokationen im Meshing-Hot-Path
-- Weniger Heap-Churn bei Fluid-/Greedy-lastigen Szenen
-- stabilere Framezeiten unter Streaming-Last
+- fewer short-lived allocations in the meshing hot path
+- less heap churn in fluid-/greedy-heavy scenes
+- more stable frame times under streaming load
 
-## Relevante Dateien
+## Relevant Files
 
 - `src/meshing/pool.rs`
 - `src/meshing/greedy.rs`

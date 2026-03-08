@@ -1,23 +1,23 @@
-# Historische Roadmap bis c0.0.13a_03
+# Historical Roadmap up to c0.0.13a_03
 
-Diese Datei ist eine historische Referenz. Sie dient als Kontext fuer Classic-Paritaet,
-aber nicht als aktive TODO-Liste.
+This file is a historical reference. It serves as context for Classic parity,
+but not as an active TODO list.
 
-## Bereits umgesetzt (gegenueber dem historischen Backlog)
+## Already Implemented (Compared to the Historical Backlog)
 
-- Fluids (Water/Lava) inkl. Mixing
-- Pause-Menue (`ESC`), Generate-New-Level (`N`), Save (`Enter`)
-- Render Distance in 4 Stufen (`F`)
-- Lakes/Springs + Lava-Lake-Hoehenbegrenzung
-- Bedrock/Classic-nahe Blockbasis
+- fluids (water/lava) including mixing
+- pause menu (`ESC`), generate new level (`N`), save (`Enter`)
+- render distance in 4 stages (`F`)
+- lakes/springs + lava lake height restriction
+- bedrock / Classic-like block foundation
+- boundary-ocean visualization outside the world border
 
-## Teilweise/offen im historischen Sinne
+## Partially/Open in the Historical Sense
 
-1. Boundary-Ocean-Visualisierung ausserhalb der Weltgrenze
-2. Humans-/Mob-Stub fuer fruehe Classic-Anmutung
-3. Feinschliff einzelner UI-/Gameplay-Paritaetsdetails
+1. Humans/mob stub for early Classic feel
+2. fine-tuning of individual UI/gameplay parity details
 
-## Aktive Referenzen
+## Active References
 
 - `docs/01_status_und_aktueller_stand.md`
 - `docs/todos_worldgen.md`

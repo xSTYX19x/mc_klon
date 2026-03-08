@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::blocks::BlockId;
 
@@ -91,6 +91,24 @@ impl Chunk {
             revision,
             filled_voxel_count: 0,
             solid_voxel_count: 0,
+        }
+    }
+
+    pub(crate) fn from_generated_parts(
+        blocks: Arc<Vec<BlockId>>,
+        block_data: Arc<Vec<u8>>,
+        filled_voxel_count: u16,
+        solid_voxel_count: u16,
+    ) -> Self {
+        debug_assert_eq!(blocks.len(), Self::BLOCK_COUNT);
+        debug_assert_eq!(block_data.len(), Self::BLOCK_COUNT);
+        Self {
+            blocks,
+            block_data,
+            light: generated_zero_light().clone(),
+            revision: 0,
+            filled_voxel_count,
+            solid_voxel_count,
         }
     }
 
@@ -214,6 +232,11 @@ impl Chunk {
         self.filled_voxel_count = filled;
         self.solid_voxel_count = solid;
     }
+}
+
+fn generated_zero_light() -> &'static Arc<Vec<u8>> {
+    static ZERO_LIGHT: OnceLock<Arc<Vec<u8>>> = OnceLock::new();
+    ZERO_LIGHT.get_or_init(|| Arc::new(vec![0; Chunk::BLOCK_COUNT]))
 }
 
 #[derive(Hash, Eq, PartialEq, Copy, Clone, Debug)]

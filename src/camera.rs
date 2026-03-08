@@ -1,5 +1,12 @@
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3, Vec4};
+use glam::{Mat3, Mat4, Vec3, Vec4};
+
+use crate::config::player::{
+    PLAYER_TUNING_MINECRAFT, VIEW_BOB_HORIZONTAL_AMPLITUDE, VIEW_BOB_INTENSITY_RESPONSE,
+    VIEW_BOB_MAX_SPEED_MULTIPLIER, VIEW_BOB_MIN_SPEED, VIEW_BOB_OFFSET_RESPONSE,
+    VIEW_BOB_PITCH_AMPLITUDE_RAD, VIEW_BOB_ROLL_AMPLITUDE_RAD, VIEW_BOB_ROLL_RESPONSE,
+    VIEW_BOB_SPEED_MULTIPLIER, VIEW_BOB_STRIDE_LENGTH_BLOCKS, VIEW_BOB_VERTICAL_AMPLITUDE,
+};
 
 use crate::config::render::{
     FOG_COLOR_BLEND_DEFAULT, FOG_COLOR_DEFAULT, FOG_DARKEN_STRENGTH, FOG_END_DISTANCE,
@@ -105,13 +112,122 @@ pub(crate) fn chunk_in_frustum(frustum: &Frustum, chunk_coord: crate::world::Chu
     aabb_in_frustum(&frustum.planes, min, max)
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ViewBobbingSample {
+    pub(crate) local_offset: Vec3,
+    pub(crate) pitch_radians: f32,
+    pub(crate) roll_radians: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ViewBobbing {
+    stride_phase_radians: f32,
+    intensity: f32,
+    local_offset: Vec3,
+    pitch_radians: f32,
+    roll_radians: f32,
+}
+
+impl ViewBobbing {
+    pub(crate) fn reset(&mut self) {
+        self.stride_phase_radians = 0.0;
+        self.intensity = 0.0;
+        self.local_offset = Vec3::ZERO;
+        self.pitch_radians = 0.0;
+        self.roll_radians = 0.0;
+    }
+
+    pub(crate) fn update(
+        &mut self,
+        dt_seconds: f32,
+        horizontal_distance: f32,
+        horizontal_speed: f32,
+        active: bool,
+    ) {
+        let dt_seconds = dt_seconds.max(0.0);
+        let stride_length = VIEW_BOB_STRIDE_LENGTH_BLOCKS.max(0.001);
+        if active && horizontal_distance > f32::EPSILON {
+            self.stride_phase_radians = (self.stride_phase_radians
+                + horizontal_distance / stride_length
+                    * std::f32::consts::PI
+                    * VIEW_BOB_SPEED_MULTIPLIER.max(0.0))
+            .rem_euclid(std::f32::consts::TAU);
+        }
+
+        let walk_speed = PLAYER_TUNING_MINECRAFT.walk_speed.max(0.001);
+        let target_intensity = if active && horizontal_speed >= VIEW_BOB_MIN_SPEED {
+            (horizontal_speed / walk_speed).clamp(0.0, VIEW_BOB_MAX_SPEED_MULTIPLIER)
+        } else {
+            0.0
+        };
+        self.intensity = exp_approach(
+            self.intensity,
+            target_intensity,
+            VIEW_BOB_INTENSITY_RESPONSE,
+            dt_seconds,
+        );
+
+        let stride_sin = self.stride_phase_radians.sin();
+        let stride_cos_abs = self.stride_phase_radians.cos().abs();
+        let target_local_offset = Vec3::new(
+            stride_sin * VIEW_BOB_HORIZONTAL_AMPLITUDE * self.intensity,
+            -stride_cos_abs * VIEW_BOB_VERTICAL_AMPLITUDE * self.intensity,
+            0.0,
+        );
+        self.local_offset = exp_approach_vec3(
+            self.local_offset,
+            target_local_offset,
+            VIEW_BOB_OFFSET_RESPONSE,
+            dt_seconds,
+        );
+        self.pitch_radians = exp_approach(
+            self.pitch_radians,
+            self.stride_phase_radians.cos() * VIEW_BOB_PITCH_AMPLITUDE_RAD * self.intensity,
+            VIEW_BOB_ROLL_RESPONSE,
+            dt_seconds,
+        );
+        self.roll_radians = exp_approach(
+            self.roll_radians,
+            stride_sin * VIEW_BOB_ROLL_AMPLITUDE_RAD * self.intensity,
+            VIEW_BOB_ROLL_RESPONSE,
+            dt_seconds,
+        );
+    }
+
+    pub(crate) fn sample(self) -> ViewBobbingSample {
+        ViewBobbingSample {
+            local_offset: self.local_offset,
+            pitch_radians: self.pitch_radians,
+            roll_radians: self.roll_radians,
+        }
+    }
+}
+
+fn exp_approach(current: f32, target: f32, response: f32, dt_seconds: f32) -> f32 {
+    if dt_seconds <= f32::EPSILON {
+        return current;
+    }
+    let alpha = 1.0 - (-response.max(0.0) * dt_seconds).exp();
+    current + (target - current) * alpha
+}
+
+fn exp_approach_vec3(current: Vec3, target: Vec3, response: f32, dt_seconds: f32) -> Vec3 {
+    if dt_seconds <= f32::EPSILON {
+        return current;
+    }
+    let alpha = 1.0 - (-response.max(0.0) * dt_seconds).exp();
+    current.lerp(target, alpha)
+}
+
 /// Welt-Konvention:
 /// - +Y = oben
 /// - Startvorwaertsrichtung in -Z (typisch fuer RH setups)
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct Camera {
     pub(crate) position: Vec3,
     pub(crate) yaw: f32,
     pub(crate) pitch: f32,
+    pub(crate) roll: f32,
 
     pub(crate) fov_y_radians: f32,
     pub(crate) z_near: f32,
@@ -124,6 +240,7 @@ impl Camera {
             position,
             yaw: (-90.0_f32).to_radians(),
             pitch: 0.0,
+            roll: 0.0,
             fov_y_radians: 70.0_f32.to_radians(),
             z_near: 0.1,
             z_far: 500.0,
@@ -136,8 +253,16 @@ impl Camera {
         Vec3::new(cy * cp, sp, sy * cp).normalize()
     }
 
-    pub(crate) fn right(&self) -> Vec3 {
+    fn right_no_roll(&self) -> Vec3 {
         self.forward().cross(Vec3::Y).normalize()
+    }
+
+    fn up_no_roll(&self) -> Vec3 {
+        self.right_no_roll().cross(self.forward()).normalize()
+    }
+
+    pub(crate) fn right(&self) -> Vec3 {
+        Mat3::from_axis_angle(self.forward(), self.roll) * self.right_no_roll()
     }
 
     pub(crate) fn forward_flat(&self) -> Vec3 {
@@ -150,8 +275,20 @@ impl Camera {
         Vec3::new(-sy, 0.0, cy).normalize()
     }
 
+    pub(crate) fn with_view_bobbing(self, bobbing: ViewBobbingSample) -> Self {
+        Self {
+            position: self.position
+                + self.right_no_roll() * bobbing.local_offset.x
+                + Vec3::Y * bobbing.local_offset.y,
+            pitch: self.pitch + bobbing.pitch_radians,
+            roll: self.roll + bobbing.roll_radians,
+            ..self
+        }
+    }
+
     pub(crate) fn view_matrix(&self) -> Mat4 {
-        Mat4::look_at_rh(self.position, self.position + self.forward(), Vec3::Y)
+        let up = Mat3::from_axis_angle(self.forward(), self.roll) * self.up_no_roll();
+        Mat4::look_at_rh(self.position, self.position + self.forward(), up)
     }
 
     pub(crate) fn proj_matrix(&self, aspect: f32) -> Mat4 {

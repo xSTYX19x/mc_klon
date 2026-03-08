@@ -1,45 +1,47 @@
-# Content Foundation (datengetrieben, migrationsfaehig)
+# Content Foundation (Data-Driven, Migration-Friendly)
 
-Stand: 2026-03-01
+Status: 2026-03-04
 
-## Bereits vorhanden
+## Already Present
 
-- Runtime BlockRegistry
-- Save-Manifest (`save/manifest.json`) mit stabilen IDs und Content-Signatur
-- Mapper zwischen Manifest-IDs und Runtime-Blocks
-- Save-Codec pro Sektion mit kanonischem Encoding (`Single` / `PaletteBitpacked`)
+- Runtime `BlockRegistry`
+- Save manifest (`save/manifest.json`) with stable IDs and content signature
+- Mapper between manifest IDs and runtime blocks (relevant especially for legacy v1 columns)
+- Save codec per section with canonical encoding (`Single` / `PaletteBitpacked`)
+- Active column write path with v2 name-palette encoding for `blocks`
+- CLI migration from legacy v1 to v2 (`--migrate-save-v1-to-v2`)
 
-## Aktuelle Grenzen
+## Current Limits
 
-- On-disk Block-IDs sind aktuell `u8` (Manifest-ID muss in `0..=255` bleiben)
-- In-Memory-Chunk nutzt weiterhin `BlockId` + `block_data`
-- Kein vollstaendiger datengetriebener BlockState-Stack (Properties/State-Explosion)
+- V2 stores block names per section palette (robust, but potentially more storage/IO than numeric IDs)
+- The in-memory chunk still uses `BlockId` + `block_data`
+- No complete data-driven block-state stack yet (properties/state explosion)
 
-## Zielbild
+## Target Picture
 
-1. Authoring ueber Keys (`namespace:name`), Runtime ueber kompakte IDs
-2. BlockState-zentrierte Runtime-Entscheidungen (Render, Collision, Light)
-3. versionierte Content-/Worldgen-Vertraege fuer reproduzierbare Welten
+1. Authoring via keys (`namespace:name`), runtime via compact IDs
+2. BlockState-centered runtime decisions (render, collision, light)
+3. Versioned content/worldgen contracts for reproducible worlds
 
-## Migrationspfad
+## Migration Path
 
-### Schritt 1
+### Step 1
 
-- Manifest- und Registry-Vertrag stabil halten
-- Save/Load-Tests fuer Signature-Drift, Unknown-Blocks, Remap-Faelle ausbauen
+- Keep V1/V2 compatibility explicit (read compatibility + migration tests)
+- Expand save/load tests for signature drift, unknown blocks, and remap cases
 
-### Schritt 2
+### Step 2
 
-- Storage-ID auf `u16` vorbereiten (oder duales Format) fuer groessere Content-Sets
-- Format-Version entsprechend erhoehen
+- If measurements justify it: design a more compact v2.1/v3 storage layout
+- Goal: less string overhead while preserving forward compatibility
 
-### Schritt 3
+### Step 3
 
-- In-Memory auf BlockStateId + getrennte Dirty-Flags migrieren
-- Danach optional Palette/Bitpacking auch zur Runtime nutzen
+- Migrate in-memory to `BlockStateId` + separate dirty flags
+- After that, optionally use palette/bitpacking at runtime as well
 
 ## Definition of Done
 
-- Neue Content-Pakete koennen ohne Hot-Path-Umbau integriert werden
-- Save bleibt lesbar oder klar migrierbar
-- Debug-Ausgaben zeigen Manifest-/Versionierungsstatus eindeutig
+- New content packs can be integrated without hot-path rewrites
+- Saves remain readable or clearly migratable
+- Debug output shows manifest/versioning status clearly

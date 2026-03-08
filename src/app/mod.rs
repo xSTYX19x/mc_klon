@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -5,14 +6,15 @@ use glam::{IVec3, Vec3};
 use wgpu::SurfaceError;
 use winit::{
     application::ApplicationHandler,
-    event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent},
+    event::{DeviceEvent, ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
 };
 
-use crate::blocks::BlockId;
-use crate::camera::Camera;
+use crate::blocks::{BlockId, CLASSIC_PALETTE};
+use crate::camera::{Camera, ViewBobbing};
+use crate::commands::{self, Command};
 use crate::config::app::DOUBLE_SPACE_WINDOW;
 use crate::config::player::PLAYER_TUNING_MINECRAFT;
 use crate::config::render::{HIGHLIGHT_BLINK_MS, RenderDistance, SimulationDistance};
@@ -22,62 +24,131 @@ use crate::perf::{PerfCat, PerfStats};
 use crate::player::*;
 use crate::render::State;
 use crate::render::state::{
-    DebugOverlay, GenerationOverlay, PauseOverlay, WorldGenParams, WorldGenRequest,
-    pause_menu_item_at_pos_px,
+    ChatOverlay, ChatOverlayLine, DebugOverlay, GenerationOverlay, HitchCounters, InventoryOverlay,
+    MenuOverlay, WorldGenParams, WorldGenRequest, WorldLoadStageStats, pause_menu_item_at_pos_px,
 };
+use crate::settings::{AppSettings, InputAction, keycode_label};
 use crate::world::{FluidKind, World};
 
 const BLOCK_ACTION_REPEAT_COOLDOWN_TICKS: f32 = 4.0;
 const DOUBLE_FORWARD_TAP_WINDOW: f32 = 0.25;
+const DOUBLE_TAP_WINDOW_MULTIPLIER: f32 = 1.20;
 const FOV_EFFECT_SCALE: f32 = 1.0;
 const FOV_EFFECT_SCALE_FLIGHT: f32 = 0.18;
 const FOV_FLIGHT_MAX_MULTIPLIER: f32 = 1.05;
 const FOV_RESPONSE_RATE: f32 = 10.0;
 const FOV_MIN_DEG: f32 = 30.0;
 const FOV_MAX_DEG: f32 = 150.0;
-const BLOCK_CYCLE: [BlockId; 10] = [
-    BlockId::Stone,
-    BlockId::Cobblestone,
-    BlockId::Dirt,
-    BlockId::Grass,
-    BlockId::Sand,
-    BlockId::OakPlanks,
-    BlockId::Obsidian,
-    BlockId::WaterStill,
-    BlockId::Sapling,
-    BlockId::LavaStill,
-];
+const HOTBAR_SLOT_COUNT: usize = 9;
+const SPAWN_SEARCH_RADIUS_BLOCKS: i32 = 8;
 const MOUSE_WHEEL_PIXEL_STEP: f32 = 40.0;
-const PAUSE_MENU_ITEMS: [&str; 4] = [
+const CHAT_MAX_LINES: usize = 64;
+const CHAT_VISIBLE_LINES: usize = 16;
+const CHAT_SENT_HISTORY_MAX: usize = 64;
+const CHAT_PLAYER_NAME: &str = "Player";
+const HITCH_LOG_THRESHOLD_MS: f32 = 25.0;
+const MAIN_MENU_ITEMS: [&str; 3] = ["Play", "Options", "Exit game"];
+const PAUSE_MENU_ITEMS: [&str; 5] = [
     "Return to game",
+    "Options",
     "Generate new level",
     "Save level",
-    "Exit game",
+    "Exit to main menu",
 ];
+const OPTIONS_ROOT_ITEMS: [&str; 4] =
+    ["General / Gameplay", "Video / Graphics", "Controls", "Back"];
 
-enum GameState {
-    InGame,
-    GeneratingWorld { progress: f32, phase: String },
-    Paused { selected: usize },
+struct ChatLine {
+    text: String,
+    time: Instant,
 }
 
-struct App {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChatTextInputSource {
+    Keyboard,
+    Ime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingChatTextDedup {
+    source: ChatTextInputSource,
+    text: String,
+}
+
+enum GameState {
+    MainMenu {
+        selected: usize,
+    },
+    InGame,
+    GeneratingWorld {
+        title: String,
+        progress: f32,
+        phase: String,
+        stats: WorldLoadStageStats,
+    },
+    Paused {
+        selected: usize,
+    },
+    Options(OptionsMenuState),
+    Inventory {
+        selected_palette: usize,
+        selected_hotbar_slot: usize,
+        scroll: i32,
+        dragged_block: Option<BlockId>,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum MenuOrigin {
+    MainMenu,
+    PauseMenu,
+}
+
+#[derive(Clone, Copy)]
+enum OptionsScreen {
+    Root,
+    Gameplay,
+    Graphics,
+    Controls,
+}
+
+struct OptionsMenuState {
+    origin: MenuOrigin,
+    screen: OptionsScreen,
+    selected: usize,
+    awaiting_rebind: Option<InputAction>,
+    status_line: Option<String>,
+}
+
+pub(crate) struct App {
     state: Option<State>,
     window: Option<Arc<Window>>,
 
     player: Player,
     camera: Camera,
     controller: CameraController,
+    settings: AppSettings,
     selected_slot: usize,
-    render_distance: RenderDistance,
+    hotbar: [Option<BlockId>; HOTBAR_SLOT_COUNT],
     simulation_distance: SimulationDistance,
+    world_session_started: bool,
+    view_bobbing: ViewBobbing,
     game_state: GameState,
     last_space_tap: Option<Instant>,
     last_forward_tap: Option<Instant>,
     base_fov_y_radians: f32,
     cursor_pos: (f32, f32),
+    menu_pressed_index: Option<usize>,
     mouse_wheel_accum_y: f32,
     show_debug_overlay: bool,
+    chat_lines: VecDeque<ChatLine>,
+    chat_open: bool,
+    chat_input: String,
+    chat_input_cursor: usize,
+    chat_sent_history: VecDeque<String>,
+    chat_history_cursor: Option<usize>,
+    suppress_next_chat_commit: bool,
+    pending_chat_text_dedup: Option<PendingChatTextDedup>,
 
     last_frame: Option<Instant>,
     app_start: Option<Instant>,
@@ -93,6 +164,10 @@ struct App {
 
 impl Default for App {
     fn default() -> Self {
+        let settings = AppSettings::load().unwrap_or_else(|err| {
+            crate::console_error!("failed to load settings: {err}");
+            AppSettings::default()
+        });
         let camera = Camera::default();
         let base_fov_y_radians = camera.fov_y_radians;
         let player = Player::from_eye_position(camera.position);
@@ -102,16 +177,28 @@ impl Default for App {
             player,
             camera,
             controller: CameraController::new(),
+            settings,
             selected_slot: 0,
-            render_distance: RenderDistance::default(),
+            hotbar: [None; HOTBAR_SLOT_COUNT],
             simulation_distance: SimulationDistance::default(),
-            game_state: GameState::InGame,
+            world_session_started: false,
+            view_bobbing: ViewBobbing::default(),
+            game_state: GameState::MainMenu { selected: 0 },
             last_space_tap: None,
             last_forward_tap: None,
             base_fov_y_radians,
             cursor_pos: (0.0, 0.0),
+            menu_pressed_index: None,
             mouse_wheel_accum_y: 0.0,
             show_debug_overlay: false,
+            chat_lines: VecDeque::with_capacity(CHAT_MAX_LINES),
+            chat_open: false,
+            chat_input: String::new(),
+            chat_input_cursor: 0,
+            chat_sent_history: VecDeque::with_capacity(CHAT_SENT_HISTORY_MAX),
+            chat_history_cursor: None,
+            suppress_next_chat_commit: false,
+            pending_chat_text_dedup: None,
             last_frame: None,
             app_start: None,
             fps_last_instant: None,
@@ -132,35 +219,48 @@ impl App {
     }
 
     fn double_space_window() -> Duration {
-        Duration::from_secs_f32(DOUBLE_SPACE_WINDOW)
+        Duration::from_secs_f32(DOUBLE_SPACE_WINDOW * DOUBLE_TAP_WINDOW_MULTIPLIER)
     }
 
     fn double_forward_window() -> Duration {
-        Duration::from_secs_f32(DOUBLE_FORWARD_TAP_WINDOW)
+        Duration::from_secs_f32(DOUBLE_FORWARD_TAP_WINDOW * DOUBLE_TAP_WINDOW_MULTIPLIER)
     }
 
-    fn selected_block(&self) -> BlockId {
-        BLOCK_CYCLE[self.selected_slot]
+    fn selected_block(&self) -> Option<BlockId> {
+        self.hotbar[self.selected_slot]
+    }
+
+    fn clear_menu_press(&mut self) {
+        self.menu_pressed_index = None;
     }
 
     fn set_selected_slot(&mut self, selected_slot: usize) -> bool {
-        if selected_slot >= BLOCK_CYCLE.len() || self.selected_slot == selected_slot {
+        if selected_slot >= HOTBAR_SLOT_COUNT || self.selected_slot == selected_slot {
             return false;
         }
         self.selected_slot = selected_slot;
         true
     }
 
-    fn cycle_selected_block(&mut self, steps: i32) {
-        let count = BLOCK_CYCLE.len();
+    fn cycle_selected_slot(&mut self, steps: i32) {
+        let count = HOTBAR_SLOT_COUNT;
         if count == 0 || steps == 0 {
             return;
         }
         let next = (self.selected_slot as i32 + steps).rem_euclid(count as i32) as usize;
         if self.set_selected_slot(next) {
-            let selected = self.selected_block();
-            println!("Selected block: {}", selected.display_name());
-            if let Some(state) = self.state.as_mut() {
+            let held = self
+                .selected_block()
+                .map(BlockId::display_name)
+                .unwrap_or("Empty");
+            crate::console_info!(
+                "Selected slot: {}/{} ({held})",
+                self.selected_slot + 1,
+                HOTBAR_SLOT_COUNT
+            );
+            if let Some(selected) = self.selected_block()
+                && let Some(state) = self.state.as_mut()
+            {
                 state.rebuild_preview_mesh(selected);
             }
         }
@@ -168,7 +268,7 @@ impl App {
 
     fn toggle_debug_overlay(&mut self) {
         self.show_debug_overlay = !self.show_debug_overlay;
-        println!(
+        crate::console_info!(
             "debug overlay: {}",
             if self.show_debug_overlay { "on" } else { "off" }
         );
@@ -182,12 +282,307 @@ impl App {
         matches!(self.game_state, GameState::GeneratingWorld { .. })
     }
 
+    fn is_main_menu(&self) -> bool {
+        matches!(self.game_state, GameState::MainMenu { .. })
+    }
+
     fn is_paused(&self) -> bool {
         matches!(self.game_state, GameState::Paused { .. })
     }
 
+    fn is_options_open(&self) -> bool {
+        matches!(self.game_state, GameState::Options(_))
+    }
+
+    fn is_menu_open(&self) -> bool {
+        self.is_main_menu() || self.is_paused() || self.is_options_open()
+    }
+
     fn is_in_game(&self) -> bool {
         matches!(self.game_state, GameState::InGame)
+    }
+
+    fn is_inventory_open(&self) -> bool {
+        matches!(self.game_state, GameState::Inventory { .. })
+    }
+
+    fn chat_prev_boundary(text: &str, cursor: usize) -> usize {
+        let cursor = cursor.min(text.len());
+        if cursor == 0 {
+            return 0;
+        }
+        text[..cursor]
+            .char_indices()
+            .next_back()
+            .map(|(idx, _)| idx)
+            .unwrap_or(0)
+    }
+
+    fn chat_next_boundary(text: &str, cursor: usize) -> usize {
+        let cursor = cursor.min(text.len());
+        if cursor >= text.len() {
+            return text.len();
+        }
+        let mut chars = text[cursor..].chars();
+        if let Some(ch) = chars.next() {
+            cursor + ch.len_utf8()
+        } else {
+            text.len()
+        }
+    }
+
+    fn open_chat(&mut self) {
+        if self.chat_open || !self.is_in_game() {
+            return;
+        }
+        self.chat_open = true;
+        self.chat_input.clear();
+        self.chat_input_cursor = 0;
+        self.chat_history_cursor = None;
+        self.suppress_next_chat_commit = true;
+        self.pending_chat_text_dedup = None;
+        self.clear_action_state();
+        if let Some(window) = self.window.as_ref() {
+            self.controller.set_mouse_capture(window, false);
+            window.set_ime_allowed(true);
+        }
+    }
+
+    fn suppressed_chat_commit_char(&self) -> Option<char> {
+        match self.settings.controls.key_for(InputAction::OpenChat) {
+            KeyCode::KeyA => Some('a'),
+            KeyCode::KeyB => Some('b'),
+            KeyCode::KeyC => Some('c'),
+            KeyCode::KeyD => Some('d'),
+            KeyCode::KeyE => Some('e'),
+            KeyCode::KeyF => Some('f'),
+            KeyCode::KeyG => Some('g'),
+            KeyCode::KeyH => Some('h'),
+            KeyCode::KeyI => Some('i'),
+            KeyCode::KeyJ => Some('j'),
+            KeyCode::KeyK => Some('k'),
+            KeyCode::KeyL => Some('l'),
+            KeyCode::KeyM => Some('m'),
+            KeyCode::KeyN => Some('n'),
+            KeyCode::KeyO => Some('o'),
+            KeyCode::KeyP => Some('p'),
+            KeyCode::KeyQ => Some('q'),
+            KeyCode::KeyR => Some('r'),
+            KeyCode::KeyS => Some('s'),
+            KeyCode::KeyT => Some('t'),
+            KeyCode::KeyU => Some('u'),
+            KeyCode::KeyV => Some('v'),
+            KeyCode::KeyW => Some('w'),
+            KeyCode::KeyX => Some('x'),
+            KeyCode::KeyY => Some('y'),
+            KeyCode::KeyZ => Some('z'),
+            KeyCode::Digit0 => Some('0'),
+            KeyCode::Digit1 => Some('1'),
+            KeyCode::Digit2 => Some('2'),
+            KeyCode::Digit3 => Some('3'),
+            KeyCode::Digit4 => Some('4'),
+            KeyCode::Digit5 => Some('5'),
+            KeyCode::Digit6 => Some('6'),
+            KeyCode::Digit7 => Some('7'),
+            KeyCode::Digit8 => Some('8'),
+            KeyCode::Digit9 => Some('9'),
+            _ => None,
+        }
+    }
+
+    fn reset_chat_state(&mut self) {
+        self.chat_open = false;
+        self.chat_input.clear();
+        self.chat_input_cursor = 0;
+        self.chat_history_cursor = None;
+        self.suppress_next_chat_commit = false;
+        self.pending_chat_text_dedup = None;
+        if let Some(window) = self.window.as_ref() {
+            window.set_ime_allowed(false);
+        }
+    }
+
+    fn close_chat(&mut self) {
+        if !self.chat_open {
+            return;
+        }
+        self.reset_chat_state();
+        self.clear_action_state();
+        if self.is_in_game()
+            && let Some(window) = self.window.as_ref()
+        {
+            self.controller.set_mouse_capture(window, true);
+        }
+    }
+
+    fn push_chat_line(&mut self, text: impl Into<String>) {
+        if self.chat_lines.len() >= CHAT_MAX_LINES {
+            self.chat_lines.pop_front();
+        }
+        self.chat_lines.push_back(ChatLine {
+            text: text.into(),
+            time: Instant::now(),
+        });
+    }
+
+    fn push_chat_history(&mut self, entry: String) {
+        if entry.is_empty() {
+            return;
+        }
+        if self.chat_sent_history.len() >= CHAT_SENT_HISTORY_MAX {
+            self.chat_sent_history.pop_front();
+        }
+        self.chat_sent_history.push_back(entry);
+    }
+
+    fn chat_insert_char(&mut self, ch: char) {
+        if !self.chat_open || ch.is_control() {
+            return;
+        }
+        self.chat_input.insert(self.chat_input_cursor, ch);
+        self.chat_input_cursor += ch.len_utf8();
+        self.chat_history_cursor = None;
+    }
+
+    fn should_skip_chat_text_duplicate(&mut self, text: &str, source: ChatTextInputSource) -> bool {
+        matches!(
+            self.pending_chat_text_dedup.take(),
+            Some(previous) if previous.source != source && previous.text == text
+        )
+    }
+
+    fn try_consume_suppressed_chat_text(&mut self, text: &str) -> bool {
+        if !self.suppress_next_chat_commit {
+            return false;
+        }
+        self.suppress_next_chat_commit = false;
+        self.suppressed_chat_commit_char()
+            .is_some_and(|expected| text.eq_ignore_ascii_case(&expected.to_string()))
+    }
+
+    fn chat_insert_text(&mut self, text: &str, source: ChatTextInputSource) {
+        if !self.chat_open || text.is_empty() {
+            return;
+        }
+        if self.try_consume_suppressed_chat_text(text)
+            || self.should_skip_chat_text_duplicate(text, source)
+        {
+            return;
+        }
+
+        let mut inserted = false;
+        for ch in text.chars() {
+            if ch.is_control() {
+                continue;
+            }
+            self.chat_insert_char(ch);
+            inserted = true;
+        }
+
+        if inserted {
+            self.pending_chat_text_dedup = Some(PendingChatTextDedup {
+                source,
+                text: text.to_owned(),
+            });
+        }
+    }
+
+    fn chat_move_cursor_left(&mut self) {
+        self.chat_input_cursor = Self::chat_prev_boundary(&self.chat_input, self.chat_input_cursor);
+    }
+
+    fn chat_move_cursor_right(&mut self) {
+        self.chat_input_cursor = Self::chat_next_boundary(&self.chat_input, self.chat_input_cursor);
+    }
+
+    fn chat_backspace(&mut self) {
+        if !self.chat_open || self.chat_input_cursor == 0 {
+            return;
+        }
+        let prev = Self::chat_prev_boundary(&self.chat_input, self.chat_input_cursor);
+        self.chat_input.drain(prev..self.chat_input_cursor);
+        self.chat_input_cursor = prev;
+        self.chat_history_cursor = None;
+    }
+
+    fn chat_delete(&mut self) {
+        if !self.chat_open || self.chat_input_cursor >= self.chat_input.len() {
+            return;
+        }
+        let next = Self::chat_next_boundary(&self.chat_input, self.chat_input_cursor);
+        self.chat_input.drain(self.chat_input_cursor..next);
+        self.chat_history_cursor = None;
+    }
+
+    fn chat_history_up(&mut self) {
+        if self.chat_sent_history.is_empty() {
+            return;
+        }
+        let next = match self.chat_history_cursor {
+            None => self.chat_sent_history.len().saturating_sub(1),
+            Some(current) => current.saturating_sub(1),
+        };
+        self.chat_history_cursor = Some(next);
+        if let Some(entry) = self.chat_sent_history.get(next) {
+            self.chat_input = entry.clone();
+            self.chat_input_cursor = self.chat_input.len();
+        }
+    }
+
+    fn chat_history_down(&mut self) {
+        let Some(current) = self.chat_history_cursor else {
+            return;
+        };
+        let next = current + 1;
+        if next < self.chat_sent_history.len() {
+            self.chat_history_cursor = Some(next);
+            if let Some(entry) = self.chat_sent_history.get(next) {
+                self.chat_input = entry.clone();
+                self.chat_input_cursor = self.chat_input.len();
+            }
+            return;
+        }
+
+        self.chat_history_cursor = None;
+        self.chat_input.clear();
+        self.chat_input_cursor = 0;
+    }
+
+    fn execute_chat_command(&mut self, line: &str) -> Result<String, String> {
+        let command = commands::parse_command(line)?;
+        self.execute_parsed_command(command)
+    }
+
+    fn execute_parsed_command(&mut self, command: Command) -> Result<String, String> {
+        let Some(mut state) = self.state.take() else {
+            return Err("world is not ready".to_string());
+        };
+        let result = commands::execute_command(self, &mut state, command);
+        self.state = Some(state);
+        result
+    }
+
+    fn submit_chat_input(&mut self) {
+        if !self.chat_open {
+            return;
+        }
+        let submitted = self.chat_input.trim().to_string();
+        self.close_chat();
+        if submitted.is_empty() {
+            return;
+        }
+        self.push_chat_history(submitted.clone());
+
+        if submitted.starts_with('/') {
+            match self.execute_chat_command(&submitted) {
+                Ok(feedback) if !feedback.trim().is_empty() => self.push_chat_line(feedback),
+                Ok(_) => {}
+                Err(err) => self.push_chat_line(format!("Error: {}", err)),
+            }
+            return;
+        }
+
+        self.push_chat_line(format!("<{}> {}", CHAT_PLAYER_NAME, submitted));
     }
 
     fn clear_action_state(&mut self) {
@@ -199,7 +594,97 @@ impl App {
         self.controller.clear_inputs();
     }
 
+    fn persist_settings(&self) {
+        if let Err(err) = self.settings.save() {
+            crate::console_error!("failed to save settings: {err}");
+        }
+    }
+
+    fn apply_settings_to_state(&mut self) {
+        if let Some(state) = self.state.as_mut() {
+            state.set_render_distance(self.settings.graphics.render_distance, &self.camera);
+            state.set_vsync_enabled(self.settings.graphics.vsync);
+            state.set_backface_culling_enabled(self.settings.graphics.backface_culling);
+        }
+    }
+
+    fn reset_view_bobbing(&mut self) {
+        self.view_bobbing.reset();
+        self.camera.roll = 0.0;
+    }
+
+    fn sync_camera_to_player_eye(&mut self, reset_view_bobbing: bool) {
+        self.camera.position = self.player.eye_position();
+        self.camera.roll = 0.0;
+        if reset_view_bobbing {
+            self.reset_view_bobbing();
+        }
+    }
+
+    fn update_view_bobbing_state(
+        camera: &mut Camera,
+        view_bobbing: &mut ViewBobbing,
+        player: &Player,
+        bobbing_enabled: bool,
+        dt_seconds: f32,
+        allow_bobbing: bool,
+    ) {
+        let raw_eye = player.eye_position();
+        let horizontal_distance = Vec3::new(
+            raw_eye.x - camera.position.x,
+            0.0,
+            raw_eye.z - camera.position.z,
+        )
+        .length();
+        camera.position = raw_eye;
+        camera.roll = 0.0;
+        let horizontal_speed =
+            Vec3::new(player.walk_velocity.x, 0.0, player.walk_velocity.z).length();
+        let bobbing_active = allow_bobbing
+            && bobbing_enabled
+            && matches!(player.mode, MoveMode::Walk)
+            && player.on_ground;
+        view_bobbing.update(
+            dt_seconds,
+            horizontal_distance,
+            horizontal_speed,
+            bobbing_active,
+        );
+    }
+
+    fn compose_view_camera(
+        base_camera: Camera,
+        bobbing_enabled: bool,
+        view_bobbing: ViewBobbing,
+    ) -> Camera {
+        if bobbing_enabled {
+            base_camera.with_view_bobbing(view_bobbing.sample())
+        } else {
+            base_camera
+        }
+    }
+
+    fn current_view_camera(&self) -> Camera {
+        Self::compose_view_camera(
+            self.camera,
+            self.settings.gameplay.view_bobbing,
+            self.view_bobbing,
+        )
+    }
+
+    fn enter_main_menu(&mut self) {
+        self.reset_chat_state();
+        self.clear_menu_press();
+        self.game_state = GameState::MainMenu { selected: 0 };
+        self.clear_action_state();
+        if let Some(window) = self.window.as_ref() {
+            self.controller.set_mouse_capture(window, false);
+        }
+    }
+
     fn enter_pause(&mut self) {
+        self.reset_chat_state();
+        self.clear_menu_press();
         self.game_state = GameState::Paused { selected: 0 };
         self.clear_action_state();
         if let Some(window) = self.window.as_ref() {
@@ -208,6 +693,7 @@ impl App {
     }
 
     fn leave_pause(&mut self) {
+        self.clear_menu_press();
         self.game_state = GameState::InGame;
         self.clear_action_state();
         if let Some(window) = self.window.as_ref() {
@@ -215,40 +701,263 @@ impl App {
         }
     }
 
-    fn move_pause_selection(&mut self, delta: i32) {
-        let count = PAUSE_MENU_ITEMS.len();
-        if count == 0 {
-            return;
-        }
-        if let GameState::Paused { selected } = &mut self.game_state {
-            let next = (*selected as i32 + delta).rem_euclid(count as i32) as usize;
-            *selected = next;
+    fn enter_inventory(&mut self) {
+        self.reset_chat_state();
+        self.clear_menu_press();
+        let selected_palette = self
+            .selected_block()
+            .and_then(|block| {
+                CLASSIC_PALETTE
+                    .iter()
+                    .position(|candidate| *candidate == block)
+            })
+            .unwrap_or(0);
+        self.game_state = GameState::Inventory {
+            selected_palette,
+            selected_hotbar_slot: self.selected_slot.min(HOTBAR_SLOT_COUNT.saturating_sub(1)),
+            scroll: 0,
+            dragged_block: None,
+        };
+        self.clear_action_state();
+        if let Some(window) = self.window.as_ref() {
+            self.controller.set_mouse_capture(window, false);
         }
     }
 
-    fn start_new_level_generation(&mut self, request: WorldGenRequest) -> bool {
+    fn leave_inventory(&mut self) {
+        self.clear_menu_press();
+        self.game_state = GameState::InGame;
+        self.clear_action_state();
+        if let Some(window) = self.window.as_ref() {
+            self.controller.set_mouse_capture(window, true);
+        }
+    }
+
+    fn open_options_menu(&mut self, origin: MenuOrigin) {
+        self.reset_chat_state();
+        self.clear_menu_press();
+        self.game_state = GameState::Options(OptionsMenuState {
+            origin,
+            screen: OptionsScreen::Root,
+            selected: 0,
+            awaiting_rebind: None,
+            status_line: None,
+        });
+        self.clear_action_state();
+        if let Some(window) = self.window.as_ref() {
+            self.controller.set_mouse_capture(window, false);
+        }
+    }
+
+    fn close_options_menu(&mut self, options: OptionsMenuState) {
+        self.clear_menu_press();
+        match options.origin {
+            MenuOrigin::MainMenu => self.enter_main_menu(),
+            MenuOrigin::PauseMenu => self.enter_pause(),
+        }
+    }
+
+    fn menu_item_count(&self) -> usize {
+        match &self.game_state {
+            GameState::MainMenu { .. } => MAIN_MENU_ITEMS.len(),
+            GameState::Paused { .. } => PAUSE_MENU_ITEMS.len(),
+            GameState::Options(options) => match options.screen {
+                OptionsScreen::Root => OPTIONS_ROOT_ITEMS.len(),
+                OptionsScreen::Gameplay => 2,
+                OptionsScreen::Graphics => 4,
+                OptionsScreen::Controls => InputAction::ALL.len() + 1,
+            },
+            _ => 0,
+        }
+    }
+
+    fn selected_menu_index(&self) -> Option<usize> {
+        match &self.game_state {
+            GameState::MainMenu { selected } => Some(*selected),
+            GameState::Paused { selected } => Some(*selected),
+            GameState::Options(options) => Some(options.selected),
+            _ => None,
+        }
+    }
+
+    fn set_selected_menu_index(&mut self, selected: usize) {
+        match &mut self.game_state {
+            GameState::MainMenu { selected: current } => *current = selected,
+            GameState::Paused { selected: current } => *current = selected,
+            GameState::Options(options) => options.selected = selected,
+            _ => {}
+        }
+    }
+
+    fn move_menu_selection(&mut self, delta: i32) {
+        let count = self.menu_item_count();
+        if count == 0 {
+            return;
+        }
+        self.clear_menu_press();
+        if let Some(current) = self.selected_menu_index() {
+            let next = (current as i32 + delta).rem_euclid(count as i32) as usize;
+            self.set_selected_menu_index(next);
+        }
+    }
+
+    fn enter_world_loading_screen(&mut self, title: &str, phase: &str) {
+        self.reset_chat_state();
+        self.clear_menu_press();
+        self.game_state = GameState::GeneratingWorld {
+            title: title.to_string(),
+            progress: 0.0,
+            phase: phase.to_string(),
+            stats: WorldLoadStageStats::default(),
+        };
+        self.clear_action_state();
+        if let Some(window) = self.window.as_ref() {
+            self.controller.set_mouse_capture(window, false);
+        }
+    }
+
+    fn start_startup_loading(&mut self) -> bool {
         let started = if let Some(state) = self.state.as_mut() {
-            state.begin_new_world(request.seed, request.params.preset);
-            state.is_generating_new_level()
+            state.begin_startup_loading();
+            state.is_world_startup_loading()
         } else {
             false
         };
 
         if started {
-            self.game_state = GameState::GeneratingWorld {
-                progress: 0.0,
-                phase: "Clearing".to_string(),
-            };
-            self.clear_action_state();
-            if let Some(window) = self.window.as_ref() {
-                self.controller.set_mouse_capture(window, false);
-            }
+            self.enter_world_loading_screen("Loading world", "Preparing spawn area");
         }
 
         started
     }
 
-    fn activate_pause_menu_selected(&mut self, event_loop: &ActiveEventLoop) {
+    fn start_new_level_generation(&mut self, request: WorldGenRequest) -> bool {
+        let started = if let Some(state) = self.state.as_mut() {
+            state.begin_new_world(request.seed, request.params.preset);
+            state.is_world_startup_loading()
+        } else {
+            false
+        };
+
+        if started {
+            self.enter_world_loading_screen("Generating level", "Clearing world state");
+        }
+
+        started
+    }
+
+    fn play_or_resume_world(&mut self) {
+        self.clear_menu_press();
+        if self.world_session_started {
+            self.game_state = GameState::InGame;
+            if let Some(window) = self.window.as_ref() {
+                self.controller.set_mouse_capture(window, true);
+            }
+            return;
+        }
+        let _ = self.start_startup_loading();
+    }
+
+    fn menu_item_at_cursor(&self) -> Option<usize> {
+        let window = self.window.as_ref()?;
+        let size = window.inner_size();
+        pause_menu_item_at_pos_px(
+            size.width,
+            size.height,
+            self.menu_item_count(),
+            self.cursor_pos.0,
+            self.cursor_pos.1,
+        )
+    }
+
+    fn apply_selected_option_step(&mut self, delta: i32) -> bool {
+        let mut changed = false;
+        if let GameState::Options(options) = &mut self.game_state {
+            if options.awaiting_rebind.is_some() {
+                return false;
+            }
+            match options.screen {
+                OptionsScreen::Gameplay if options.selected == 0 => {
+                    self.settings.gameplay.view_bobbing = !self.settings.gameplay.view_bobbing;
+                    options.status_line = Some(format!(
+                        "View bobbing {}",
+                        if self.settings.gameplay.view_bobbing {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    ));
+                    changed = true;
+                }
+                OptionsScreen::Graphics if options.selected == 0 => {
+                    let all = RenderDistance::ALL;
+                    let current = self.settings.graphics.render_distance;
+                    if let Some(index) = all.iter().position(|candidate| *candidate == current) {
+                        let next = (index as i32 + delta).rem_euclid(all.len() as i32) as usize;
+                        self.settings.graphics.render_distance = all[next];
+                        options.status_line = Some(format!(
+                            "Render distance: {} ({} chunks)",
+                            self.settings.graphics.render_distance.label(),
+                            self.settings
+                                .graphics
+                                .render_distance
+                                .view_distance_chunks()
+                        ));
+                        changed = true;
+                    }
+                }
+                OptionsScreen::Graphics if options.selected == 1 => {
+                    self.settings.graphics.backface_culling =
+                        !self.settings.graphics.backface_culling;
+                    options.status_line = Some(format!(
+                        "Backface culling {}",
+                        if self.settings.graphics.backface_culling {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    ));
+                    changed = true;
+                }
+                OptionsScreen::Graphics if options.selected == 2 => {
+                    self.settings.graphics.vsync = !self.settings.graphics.vsync;
+                    options.status_line = Some(format!(
+                        "VSync {}",
+                        if self.settings.graphics.vsync {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    ));
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+        if changed {
+            if !self.settings.gameplay.view_bobbing {
+                self.reset_view_bobbing();
+            }
+            self.persist_settings();
+            self.apply_settings_to_state();
+        }
+        changed
+    }
+
+    fn activate_main_menu_selected(&mut self, event_loop: &ActiveEventLoop) {
+        let selected = match self.game_state {
+            GameState::MainMenu { selected } => selected,
+            _ => return,
+        };
+        match selected {
+            0 => self.play_or_resume_world(),
+            1 => self.open_options_menu(MenuOrigin::MainMenu),
+            2 => event_loop.exit(),
+            _ => {}
+        }
+    }
+
+    fn activate_pause_menu_selected(&mut self, _event_loop: &ActiveEventLoop) {
         let selected = match &self.game_state {
             GameState::Paused { selected } => *selected,
             _ => return,
@@ -256,38 +965,158 @@ impl App {
 
         match selected {
             0 => self.leave_pause(),
-            1 => {
+            1 => self.open_options_menu(MenuOrigin::PauseMenu),
+            2 => {
                 let request = self.make_worldgen_request();
                 if !self.start_new_level_generation(request) {
-                    println!("new level generation is already running");
-                }
-            }
-            2 => {
-                if let Some(state) = self.state.as_mut() {
-                    state.save_world();
-                    println!("Saved.");
+                    crate::console_info!("new level generation is already running");
                 }
             }
             3 => {
                 if let Some(state) = self.state.as_mut() {
                     state.save_world();
+                    crate::console_info!("Saved.");
                 }
-                event_loop.exit();
+            }
+            4 => {
+                if let Some(state) = self.state.as_mut() {
+                    state.save_world();
+                }
+                self.enter_main_menu();
             }
             _ => {}
         }
     }
 
-    fn pause_menu_item_at_cursor(&self) -> Option<usize> {
-        let window = self.window.as_ref()?;
-        let size = window.inner_size();
-        pause_menu_item_at_pos_px(
-            size.width,
-            size.height,
-            PAUSE_MENU_ITEMS.len(),
-            self.cursor_pos.0,
-            self.cursor_pos.1,
-        )
+    fn activate_options_selected(&mut self) {
+        let mut options = match self.game_state {
+            GameState::Options(ref mut options) => Some(OptionsMenuState {
+                origin: options.origin,
+                screen: options.screen,
+                selected: options.selected,
+                awaiting_rebind: options.awaiting_rebind,
+                status_line: options.status_line.clone(),
+            }),
+            _ => None,
+        };
+        let Some(mut options) = options.take() else {
+            return;
+        };
+
+        if options.awaiting_rebind.is_some() {
+            return;
+        }
+
+        match options.screen {
+            OptionsScreen::Root => match options.selected {
+                0 => options.screen = OptionsScreen::Gameplay,
+                1 => options.screen = OptionsScreen::Graphics,
+                2 => options.screen = OptionsScreen::Controls,
+                _ => {
+                    self.close_options_menu(options);
+                    return;
+                }
+            },
+            OptionsScreen::Gameplay => {
+                if options.selected == 0 {
+                    self.apply_selected_option_step(1);
+                    return;
+                }
+                self.close_options_menu(options);
+                return;
+            }
+            OptionsScreen::Graphics => {
+                if options.selected <= 2 {
+                    self.apply_selected_option_step(1);
+                    return;
+                }
+                self.close_options_menu(options);
+                return;
+            }
+            OptionsScreen::Controls => {
+                if options.selected < InputAction::ALL.len() {
+                    let action = InputAction::ALL[options.selected];
+                    if let GameState::Options(state) = &mut self.game_state {
+                        state.awaiting_rebind = Some(action);
+                        state.status_line = Some(format!(
+                            "Press a key for {}. Escape cancels.",
+                            action.label()
+                        ));
+                    }
+                    return;
+                }
+                self.close_options_menu(options);
+                return;
+            }
+        }
+
+        options.selected = 0;
+        options.awaiting_rebind = None;
+        options.status_line = None;
+        self.game_state = GameState::Options(options);
+    }
+
+    fn handle_options_back(&mut self) -> bool {
+        let mut options = match &self.game_state {
+            GameState::Options(options) => Some(OptionsMenuState {
+                origin: options.origin,
+                screen: options.screen,
+                selected: options.selected,
+                awaiting_rebind: options.awaiting_rebind,
+                status_line: options.status_line.clone(),
+            }),
+            _ => None,
+        };
+        let Some(mut options) = options.take() else {
+            return false;
+        };
+
+        if options.awaiting_rebind.is_some() {
+            if let GameState::Options(state) = &mut self.game_state {
+                state.awaiting_rebind = None;
+                state.status_line = Some("Rebind cancelled.".to_string());
+            }
+            return true;
+        }
+
+        match options.screen {
+            OptionsScreen::Root => self.close_options_menu(options),
+            _ => {
+                options.screen = OptionsScreen::Root;
+                options.selected = 0;
+                options.status_line = None;
+                self.game_state = GameState::Options(options);
+            }
+        }
+        true
+    }
+
+    fn handle_rebind_input(&mut self, code: KeyCode) -> bool {
+        let action = match &self.game_state {
+            GameState::Options(options) => options.awaiting_rebind,
+            _ => None,
+        };
+        let Some(action) = action else {
+            return false;
+        };
+
+        let conflict = self.settings.controls.set_key_swapping(action, code);
+        self.persist_settings();
+        let status = if let Some(other) = conflict {
+            format!(
+                "{} bound to {}. Swapped with {}.",
+                action.label(),
+                keycode_label(code),
+                other.label()
+            )
+        } else {
+            format!("{} bound to {}.", action.label(), keycode_label(code))
+        };
+        if let GameState::Options(options) = &mut self.game_state {
+            options.awaiting_rebind = None;
+            options.status_line = Some(status);
+        }
+        true
     }
 
     fn build_debug_overlay_lines(&self) -> Vec<String> {
@@ -310,24 +1139,36 @@ impl App {
         lines.push(format!("Chunk {} {} {}", chunk.x, chunk.y, chunk.z));
         lines.push(format!(
             "Render distance: {} ({} chunks)",
-            self.render_distance.label(),
-            self.render_distance.view_distance_chunks()
+            self.settings.graphics.render_distance.label(),
+            self.settings
+                .graphics
+                .render_distance
+                .view_distance_chunks()
         ));
         lines.push(format!(
             "Simulation distance: {} ({} chunks)",
             self.simulation_distance.label(),
-            self.simulation_distance
-                .distance_chunks()
-                .min(self.render_distance.view_distance_chunks())
+            self.simulation_distance.distance_chunks().min(
+                self.settings
+                    .graphics
+                    .render_distance
+                    .view_distance_chunks()
+            )
         ));
         lines.push(format!(
-            "Selected block: {} ({}/{})",
-            self.selected_block().display_name(),
+            "Selected slot: {}/{}",
             self.selected_slot + 1,
-            BLOCK_CYCLE.len()
+            HOTBAR_SLOT_COUNT
+        ));
+        lines.push(format!(
+            "Held block: {}",
+            self.selected_block()
+                .map(BlockId::display_name)
+                .unwrap_or("Empty")
         ));
         if let Some(state) = self.state.as_ref() {
             lines.push(state.simulation_debug_line());
+            lines.push(state.worldgen_features_debug_line());
             lines.push(state.ticking_areas_debug_line());
             lines.push(state.sim_systems_debug_line());
             lines.push(state.block_entities_debug_line());
@@ -338,23 +1179,194 @@ impl App {
                 state.lighting_step_last_ms()
             ));
             lines.push(state.lighting_pending_debug_line());
+            if let Some(line) = state.deferred_edit_waiting_debug_line() {
+                lines.push(line);
+            }
         }
 
         lines
     }
 
-    fn world_spawn_settled_feet(state: &mut State) -> (Vec3, bool) {
-        let spawn_x = 0;
-        let spawn_z = 0;
-        state.ensure_column_loaded_or_generated(spawn_x, spawn_z);
-        let terrain_y = state.world.terrain_height_at(spawn_x, spawn_z) as f32;
-        let spawn_feet = Vec3::new(spawn_x as f32 + 0.5, terrain_y + 2.0, spawn_z as f32 + 0.5);
-        Self::settle_spawn_feet(&state.world, spawn_feet)
+    fn menu_overlay_content(&self) -> Option<(String, Vec<String>, Option<String>, usize)> {
+        match &self.game_state {
+            GameState::MainMenu { selected } => Some((
+                "Minecraft Klon".to_string(),
+                MAIN_MENU_ITEMS
+                    .iter()
+                    .map(|item| (*item).to_string())
+                    .collect(),
+                Some("Enter starts. Escape closes rebinding screens.".to_string()),
+                *selected,
+            )),
+            GameState::Paused { selected } => Some((
+                "Game menu".to_string(),
+                PAUSE_MENU_ITEMS
+                    .iter()
+                    .map(|item| (*item).to_string())
+                    .collect(),
+                None,
+                *selected,
+            )),
+            GameState::Options(options) => {
+                let (title, items) = match options.screen {
+                    OptionsScreen::Root => (
+                        "Options".to_string(),
+                        OPTIONS_ROOT_ITEMS
+                            .iter()
+                            .map(|item| (*item).to_string())
+                            .collect(),
+                    ),
+                    OptionsScreen::Gameplay => (
+                        "General / Gameplay".to_string(),
+                        vec![
+                            format!(
+                                "View bobbing: {}",
+                                if self.settings.gameplay.view_bobbing {
+                                    "On"
+                                } else {
+                                    "Off"
+                                }
+                            ),
+                            "Back".to_string(),
+                        ],
+                    ),
+                    OptionsScreen::Graphics => (
+                        "Video / Graphics".to_string(),
+                        vec![
+                            format!(
+                                "Render distance: {} ({} chunks)",
+                                self.settings.graphics.render_distance.label(),
+                                self.settings
+                                    .graphics
+                                    .render_distance
+                                    .view_distance_chunks()
+                            ),
+                            format!(
+                                "Backface culling: {}",
+                                if self.settings.graphics.backface_culling {
+                                    "On"
+                                } else {
+                                    "Off"
+                                }
+                            ),
+                            format!(
+                                "VSync: {}",
+                                if self.settings.graphics.vsync {
+                                    "On"
+                                } else {
+                                    "Off"
+                                }
+                            ),
+                            "Back".to_string(),
+                        ],
+                    ),
+                    OptionsScreen::Controls => {
+                        let mut items = Vec::with_capacity(InputAction::ALL.len() + 1);
+                        for action in InputAction::ALL {
+                            items.push(format!(
+                                "{}: {}",
+                                action.label(),
+                                keycode_label(self.settings.controls.key_for(action))
+                            ));
+                        }
+                        items.push("Back".to_string());
+                        ("Controls".to_string(), items)
+                    }
+                };
+                let footer = if let Some(action) = options.awaiting_rebind {
+                    Some(format!(
+                        "Press a key for {}. Escape cancels.",
+                        action.label()
+                    ))
+                } else {
+                    options.status_line.clone()
+                };
+                Some((title, items, footer, options.selected))
+            }
+            _ => None,
+        }
+    }
+
+    fn spawn_probe_feet_for_column(world: &World, world_x: i32, world_z: i32) -> Vec3 {
+        let min_y = world.min_y();
+        let max_start_y = (world.max_y() - 2).max(min_y + 2);
+        let terrain_y = world.terrain_height_at(world_x, world_z);
+        let estimated_y = world.estimated_surface_height_at(world_x, world_z);
+        let start_y = (terrain_y.max(estimated_y) + 8).clamp(min_y + 2, max_start_y);
+        Vec3::new(world_x as f32 + 0.5, start_y as f32, world_z as f32 + 0.5)
+    }
+
+    fn try_surface_spawn_in_column(
+        world: &World,
+        world_x: i32,
+        world_z: i32,
+    ) -> Option<(Vec3, bool)> {
+        let (settled_feet, on_ground) = Self::settle_spawn_feet(
+            world,
+            Self::spawn_probe_feet_for_column(world, world_x, world_z),
+        );
+        if !on_ground {
+            return None;
+        }
+
+        let min_y = world.min_y();
+        let feet_y = settled_feet.y.floor() as i32;
+        let ground_y = feet_y - 1;
+        if ground_y <= min_y {
+            return None;
+        }
+
+        let ground_block = world.get_block(IVec3::new(world_x, ground_y, world_z));
+        if !ground_block.is_solid() || ground_block == BlockId::Bedrock {
+            return None;
+        }
+
+        Some((settled_feet, true))
+    }
+
+    fn world_spawn_settled_feet_near(
+        state: &mut State,
+        center_x: i32,
+        center_z: i32,
+    ) -> (Vec3, bool) {
+        let mut fallback: Option<(Vec3, bool)> = None;
+
+        for radius in 0..=SPAWN_SEARCH_RADIUS_BLOCKS {
+            for dz in -radius..=radius {
+                for dx in -radius..=radius {
+                    if radius != 0 && dx.abs() != radius && dz.abs() != radius {
+                        continue;
+                    }
+                    let world_x = center_x + dx;
+                    let world_z = center_z + dz;
+                    state.ensure_column_loaded_or_generated(world_x, world_z);
+
+                    if let Some(candidate) =
+                        Self::try_surface_spawn_in_column(&state.world, world_x, world_z)
+                    {
+                        return candidate;
+                    }
+
+                    if fallback.is_none() {
+                        fallback = Some(Self::settle_spawn_feet(
+                            &state.world,
+                            Self::spawn_probe_feet_for_column(&state.world, world_x, world_z),
+                        ));
+                    }
+                }
+            }
+        }
+
+        fallback.unwrap_or_else(|| {
+            let probe = Self::spawn_probe_feet_for_column(&state.world, center_x, center_z);
+            Self::settle_spawn_feet(&state.world, probe)
+        })
     }
 
     fn settle_spawn_feet(world: &World, spawn_feet: Vec3) -> (Vec3, bool) {
+        let settle_distance = (world.max_y() - world.min_y() + 4).max(8) as f32;
         let (settled_feet, settle_flags) =
-            move_with_collisions(world, spawn_feet, Vec3::new(0.0, -4.0, 0.0));
+            move_with_collisions(world, spawn_feet, Vec3::new(0.0, -settle_distance, 0.0));
         (settled_feet, settle_flags.hit_y_down)
     }
 
@@ -378,12 +1390,7 @@ impl App {
         };
         self.controller.clear_jump_requested();
         self.clear_double_space_state();
-        self.camera.position = self.player.eye_position();
-    }
-
-    fn place_player_at_world_spawn(&mut self, state: &mut State) {
-        let (settled_feet, on_ground) = Self::world_spawn_settled_feet(state);
-        self.apply_settled_spawn(settled_feet, on_ground);
+        self.sync_camera_to_player_eye(true);
     }
 
     fn make_worldgen_request(&self) -> WorldGenRequest {
@@ -438,7 +1445,7 @@ impl App {
             }
         };
         self.clear_double_space_state();
-        println!(
+        crate::console_info!(
             "Move mode: {}",
             match self.player.mode {
                 MoveMode::Flight => "Flight",
@@ -451,7 +1458,71 @@ impl App {
                 } => "Swim (Lava)",
             }
         );
-        self.camera.position = self.player.eye_position();
+        self.sync_camera_to_player_eye(true);
+    }
+
+    pub(crate) fn command_set_creative_mode(&mut self) {
+        self.player.player_mode = PlayerMode::Creative;
+        self.player.mode = MoveMode::Flight;
+        self.player._velocity_y = 0.0;
+        self.player.walk_velocity = Vec3::ZERO;
+        self.player.swim_velocity = Vec3::ZERO;
+        self.player.bob_phase = 0.0;
+        self.player.was_at_surface = false;
+        self.player.sprint_swim_active = false;
+        self.player.is_swim_prone = false;
+        self.player.jump_hold_cooldown_seconds = 0.0;
+        self.player.on_ground = false;
+        self.player.time_since_grounded = f32::INFINITY;
+        self.controller.clear_jump_requested();
+        self.clear_action_state();
+        self.clear_double_space_state();
+        self.sync_camera_to_player_eye(true);
+    }
+
+    pub(crate) fn command_set_survival_mode(&mut self, state: &State) {
+        self.player.player_mode = PlayerMode::Survival;
+        self.player.mode = MoveMode::Walk;
+        self.player._velocity_y = 0.0;
+        self.player.walk_velocity = Vec3::ZERO;
+        self.player.swim_velocity = Vec3::ZERO;
+        self.player.bob_phase = 0.0;
+        self.player.was_at_surface = false;
+        self.player.sprint_swim_active = false;
+        self.player.is_swim_prone = false;
+        self.player.jump_hold_cooldown_seconds = 0.0;
+        let (snapped, grounded) = snap_to_ground_with_height(
+            &state.world,
+            self.player.feet_position,
+            self.player.collision_height(),
+        );
+        self.player.feet_position = snapped;
+        self.player.on_ground = grounded;
+        self.player.time_since_grounded = if grounded { 0.0 } else { f32::INFINITY };
+        self.controller.clear_jump_requested();
+        self.clear_action_state();
+        self.clear_double_space_state();
+        self.sync_camera_to_player_eye(true);
+    }
+
+    pub(crate) fn command_teleport_feet(&mut self, x: f32, y: Option<f32>, z: f32) {
+        let target_y = y.unwrap_or(self.player.feet_position.y);
+        self.player.feet_position = Vec3::new(x, target_y, z);
+        self.player._velocity_y = 0.0;
+        self.player.walk_velocity = Vec3::ZERO;
+        self.player.swim_velocity = Vec3::ZERO;
+        self.player.bob_phase = 0.0;
+        self.player.bob_anchor_y = target_y;
+        self.player.jump_hold_cooldown_seconds = 0.0;
+        self.player.on_ground = false;
+        self.player.time_since_grounded = f32::INFINITY;
+        self.controller.clear_jump_requested();
+        self.clear_action_state();
+        self.sync_camera_to_player_eye(true);
+    }
+
+    pub(crate) fn player_feet_position(&self) -> Vec3 {
+        self.player.feet_position
     }
 
     /// Returns true if this key press was consumed by a double-space toggle.
@@ -498,20 +1569,24 @@ impl ApplicationHandler for App {
         window.set_cursor_visible(true);
 
         let mut state = pollster::block_on(State::new(window.clone()));
-        state.rebuild_preview_mesh(self.selected_block());
+        if let Some(block) = self.selected_block() {
+            state.rebuild_preview_mesh(block);
+        }
 
-        self.place_player_at_world_spawn(&mut state);
-        state.set_render_distance(self.render_distance, &self.camera);
         state.set_simulation_distance(self.simulation_distance, &self.camera);
-        self.game_state = GameState::InGame;
+        state.set_render_distance(self.settings.graphics.render_distance, &self.camera);
+        state.set_vsync_enabled(self.settings.graphics.vsync);
+        state.set_backface_culling_enabled(self.settings.graphics.backface_culling);
 
         self.window = Some(window);
         self.state = Some(state);
+        self.enter_main_menu();
         self.last_frame = Some(Instant::now());
         self.app_start = Some(Instant::now());
         self.fps_last_instant = Some(Instant::now());
         self.fps_frame_count = 0;
         self.fps_value = 0;
+        self.reset_chat_state();
     }
 
     /// Raw device events: ideal für FPS-look (MouseMotion liefert deltas)
@@ -554,36 +1629,149 @@ impl ApplicationHandler for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x as f32, position.y as f32);
-                if self.is_paused() {
-                    if let Some(index) = self.pause_menu_item_at_cursor() {
-                        if let GameState::Paused { selected } = &mut self.game_state {
-                            *selected = index;
-                        }
-                    }
+                if self.is_menu_open()
+                    && let Some(index) = self.menu_item_at_cursor()
+                {
+                    self.set_selected_menu_index(index);
+                } else if self.is_menu_open() {
+                    self.clear_menu_press();
                 }
+            }
+
+            WindowEvent::Ime(Ime::Commit(text)) => {
+                if !self.is_in_game() || text.is_empty() || !self.chat_open {
+                    return;
+                }
+                self.chat_insert_text(&text, ChatTextInputSource::Ime);
             }
 
             // Tastatur: WASD/Space/Shift, Double-Space toggelt Flight/Walking, ESC öffnet/schließt Menü
             WindowEvent::KeyboardInput { event, .. } => {
-                if matches!(event.physical_key, PhysicalKey::Code(KeyCode::Escape))
-                    && event.state == ElementState::Pressed
-                {
-                    if self.is_generating_world() {
-                        return;
+                if self.chat_open {
+                    let mut handled_chat_key = false;
+                    if event.state == ElementState::Pressed
+                        && let PhysicalKey::Code(code) = event.physical_key
+                    {
+                        match code {
+                            KeyCode::Escape => {
+                                self.close_chat();
+                                handled_chat_key = true;
+                            }
+                            KeyCode::Enter | KeyCode::NumpadEnter => {
+                                self.submit_chat_input();
+                                handled_chat_key = true;
+                            }
+                            KeyCode::Backspace => {
+                                self.chat_backspace();
+                                handled_chat_key = true;
+                            }
+                            KeyCode::Delete => {
+                                self.chat_delete();
+                                handled_chat_key = true;
+                            }
+                            KeyCode::ArrowLeft => {
+                                self.chat_move_cursor_left();
+                                handled_chat_key = true;
+                            }
+                            KeyCode::ArrowRight => {
+                                self.chat_move_cursor_right();
+                                handled_chat_key = true;
+                            }
+                            KeyCode::ArrowUp => {
+                                self.chat_history_up();
+                                handled_chat_key = true;
+                            }
+                            KeyCode::ArrowDown => {
+                                self.chat_history_down();
+                                handled_chat_key = true;
+                            }
+                            KeyCode::Home => {
+                                self.chat_input_cursor = 0;
+                                handled_chat_key = true;
+                            }
+                            KeyCode::End => {
+                                self.chat_input_cursor = self.chat_input.len();
+                                handled_chat_key = true;
+                            }
+                            _ => {}
+                        }
                     }
-                    if self.is_paused() {
-                        self.leave_pause();
-                    } else {
-                        self.enter_pause();
+                    if !handled_chat_key && event.state == ElementState::Pressed {
+                        if let Some(text) = event.text.as_deref() {
+                            self.chat_insert_text(text, ChatTextInputSource::Keyboard);
+                        }
                     }
                     return;
                 }
 
+                let code = match event.physical_key {
+                    PhysicalKey::Code(code) => Some(code),
+                    _ => None,
+                };
                 let generating = self.is_generating_world();
                 let paused = self.is_paused();
-                if paused {
+                let inventory_open = self.is_inventory_open();
+                let options_open = self.is_options_open();
+                let menu_open = self.is_menu_open();
+                let pause_key = self.settings.controls.key_for(InputAction::PauseMenu);
+                let inventory_key = self.settings.controls.key_for(InputAction::OpenInventory);
+                let chat_key = self.settings.controls.key_for(InputAction::OpenChat);
+                let jump_key = self.settings.controls.key_for(InputAction::Jump);
+                let forward_key = self.settings.controls.key_for(InputAction::MoveForward);
+                let backward_key = self.settings.controls.key_for(InputAction::MoveBackward);
+                let sneak_key = self.settings.controls.key_for(InputAction::Sneak);
+
+                if options_open
+                    && event.state == ElementState::Pressed
+                    && !event.repeat
+                    && let Some(code) = code
+                    && let GameState::Options(options) = &self.game_state
+                    && options.awaiting_rebind.is_some()
+                {
+                    if code == KeyCode::Escape {
+                        self.handle_options_back();
+                    } else {
+                        self.handle_rebind_input(code);
+                    }
+                    return;
+                }
+
+                if event.state == ElementState::Pressed
+                    && let Some(code) = code
+                {
+                    let pause_pressed = code == pause_key || code == KeyCode::Escape;
+                    if pause_pressed {
+                        if generating {
+                            return;
+                        }
+                        if inventory_open {
+                            self.leave_inventory();
+                        } else if options_open {
+                            self.handle_options_back();
+                        } else if paused {
+                            self.leave_pause();
+                        } else if self.is_in_game() {
+                            self.enter_pause();
+                        }
+                        return;
+                    }
+
+                    if code == inventory_key && !event.repeat {
+                        if generating || paused || options_open || self.is_main_menu() {
+                            return;
+                        }
+                        if inventory_open {
+                            self.leave_inventory();
+                        } else if self.is_in_game() {
+                            self.enter_inventory();
+                        }
+                        return;
+                    }
+                }
+
+                if menu_open {
                     if event.state == ElementState::Pressed {
-                        if let PhysicalKey::Code(code) = event.physical_key {
+                        if let Some(code) = code {
                             if code == KeyCode::F3 && !event.repeat {
                                 self.toggle_debug_overlay();
                                 return;
@@ -592,10 +1780,22 @@ impl ApplicationHandler for App {
                                 return;
                             }
                             match code {
-                                KeyCode::ArrowUp | KeyCode::KeyW => self.move_pause_selection(-1),
-                                KeyCode::ArrowDown | KeyCode::KeyS => self.move_pause_selection(1),
+                                KeyCode::ArrowUp | KeyCode::KeyW => self.move_menu_selection(-1),
+                                KeyCode::ArrowDown | KeyCode::KeyS => self.move_menu_selection(1),
+                                KeyCode::ArrowLeft | KeyCode::KeyA => {
+                                    self.apply_selected_option_step(-1);
+                                }
+                                KeyCode::ArrowRight | KeyCode::KeyD => {
+                                    self.apply_selected_option_step(1);
+                                }
                                 KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space => {
-                                    self.activate_pause_menu_selected(event_loop)
+                                    if self.is_main_menu() {
+                                        self.activate_main_menu_selected(event_loop);
+                                    } else if self.is_paused() {
+                                        self.activate_pause_menu_selected(event_loop);
+                                    } else {
+                                        self.activate_options_selected();
+                                    }
                                 }
                                 _ => {}
                             }
@@ -604,18 +1804,30 @@ impl ApplicationHandler for App {
                     return;
                 }
 
+                if inventory_open {
+                    if event.state == ElementState::Pressed
+                        && let PhysicalKey::Code(KeyCode::F3) = event.physical_key
+                        && !event.repeat
+                    {
+                        self.toggle_debug_overlay();
+                    }
+                    return;
+                }
+
                 if !generating {
-                    if let PhysicalKey::Code(code) = event.physical_key {
+                    if let Some(code) = code {
                         match (code, event.state) {
-                            (KeyCode::KeyW, ElementState::Pressed) if !event.repeat => {
+                            (code, ElementState::Pressed)
+                                if code == forward_key && !event.repeat =>
+                            {
                                 self.handle_forward_pressed(Instant::now());
                             }
-                            (KeyCode::KeyW, ElementState::Released) => {
+                            (code, ElementState::Released) if code == forward_key => {
                                 self.controller.set_sprint_latched(false);
                             }
-                            (KeyCode::KeyS, ElementState::Pressed)
-                            | (KeyCode::ShiftLeft, ElementState::Pressed)
-                            | (KeyCode::ShiftRight, ElementState::Pressed) => {
+                            (code, ElementState::Pressed)
+                                if code == backward_key || code == sneak_key =>
+                            {
                                 self.controller.set_sprint_latched(false);
                             }
                             _ => {}
@@ -623,59 +1835,60 @@ impl ApplicationHandler for App {
                     }
                 }
                 if event.state == ElementState::Pressed {
-                    if let PhysicalKey::Code(code) = event.physical_key {
-                        if !generating
-                            && code == KeyCode::KeyT
-                            && !event.repeat
-                            && self.controller.sprint_held
-                        {
-                            if let Some(state) = self.state.as_mut() {
-                                let chunk = World::world_to_chunk_coord(IVec3::new(
-                                    self.camera.position.x.floor() as i32,
-                                    self.camera.position.y.floor() as i32,
-                                    self.camera.position.z.floor() as i32,
-                                ));
-                                if self.controller.move_down {
-                                    match state.delete_nearest_ticking_area(chunk.x, chunk.z) {
-                                        Some(id) => println!(
-                                            "Ticking area removed: id={} near chunk ({}, {})",
-                                            id, chunk.x, chunk.z
-                                        ),
-                                        None => println!("No ticking area to remove."),
+                    if let Some(code) = code {
+                        if !generating && code == chat_key && !event.repeat {
+                            if self.controller.sprint_held {
+                                if let Some(state) = self.state.as_mut() {
+                                    let chunk = World::world_to_chunk_coord(IVec3::new(
+                                        self.camera.position.x.floor() as i32,
+                                        self.camera.position.y.floor() as i32,
+                                        self.camera.position.z.floor() as i32,
+                                    ));
+                                    if self.controller.move_down {
+                                        match state.delete_nearest_ticking_area(chunk.x, chunk.z) {
+                                            Some(id) => crate::console_info!(
+                                                "Ticking area removed: id={} near chunk ({}, {})",
+                                                id,
+                                                chunk.x,
+                                                chunk.z
+                                            ),
+                                            None => {
+                                                crate::console_info!("No ticking area to remove.")
+                                            }
+                                        }
+                                    } else {
+                                        let id =
+                                            state.create_ticking_area_radius(chunk.x, chunk.z, 4);
+                                        crate::console_info!(
+                                            "Ticking area created: id={} center=({}, {}) radius=4",
+                                            id,
+                                            chunk.x,
+                                            chunk.z
+                                        );
                                     }
-                                } else {
-                                    let id = state.create_ticking_area_radius(chunk.x, chunk.z, 4);
-                                    println!(
-                                        "Ticking area created: id={} center=({}, {}) radius=4",
-                                        id, chunk.x, chunk.z
-                                    );
+                                    state.update_simulation_activation(&self.camera);
                                 }
-                                state.update_simulation_activation(&self.camera);
+                            } else {
+                                self.open_chat();
                             }
                             return;
                         }
 
                         if code == KeyCode::KeyN && !event.repeat {
                             if generating {
-                                println!("new level generation is already running");
+                                crate::console_info!("new level generation is already running");
                             } else {
                                 let request = self.make_worldgen_request();
                                 self.start_new_level_generation(request);
                             }
                         }
 
-                        if !generating && code == KeyCode::Space && !event.repeat {
+                        if !generating && code == jump_key && !event.repeat {
                             self.handle_space_pressed(Instant::now());
                         }
 
                         if code == KeyCode::F3 && !event.repeat {
                             self.toggle_debug_overlay();
-                        }
-
-                        if !generating && code == KeyCode::F5 && !event.repeat {
-                            if let Some(state) = self.state.as_mut() {
-                                state.toggle_debug_culling();
-                            }
                         }
 
                         if !generating && code == KeyCode::F4 && !event.repeat {
@@ -702,15 +1915,39 @@ impl ApplicationHandler for App {
                             }
                         }
 
-                        if !generating && code == KeyCode::KeyF && !event.repeat {
-                            self.render_distance = self.render_distance.next();
-                            if let Some(state) = self.state.as_mut() {
-                                state.set_render_distance(self.render_distance, &self.camera);
+                        if !generating && code == KeyCode::F9 && !event.repeat {
+                            if let Some(state) = self.state.as_ref() {
+                                let view_camera = self.current_view_camera();
+                                crate::console_info!(
+                                    "{}",
+                                    state.fluid_debug_under_crosshair_line(&view_camera)
+                                );
                             }
-                            println!(
+                        }
+
+                        if !generating && code == KeyCode::F10 && !event.repeat {
+                            if let Some(state) = self.state.as_mut() {
+                                state.toggle_debug_perf_summary();
+                            }
+                        }
+
+                        if !generating && code == KeyCode::KeyF && !event.repeat {
+                            let all = RenderDistance::ALL;
+                            if let Some(index) = all.iter().position(|candidate| {
+                                *candidate == self.settings.graphics.render_distance
+                            }) {
+                                self.settings.graphics.render_distance =
+                                    all[(index + 1) % all.len()];
+                            }
+                            self.persist_settings();
+                            self.apply_settings_to_state();
+                            crate::console_info!(
                                 "Render distance: {} ({} chunks)",
-                                self.render_distance.label(),
-                                self.render_distance.view_distance_chunks()
+                                self.settings.graphics.render_distance.label(),
+                                self.settings
+                                    .graphics
+                                    .render_distance
+                                    .view_distance_chunks()
                             );
                         }
 
@@ -722,12 +1959,15 @@ impl ApplicationHandler for App {
                                     &self.camera,
                                 );
                             }
-                            println!(
+                            crate::console_info!(
                                 "Simulation distance: {} ({} chunks)",
                                 self.simulation_distance.label(),
-                                self.simulation_distance
-                                    .distance_chunks()
-                                    .min(self.render_distance.view_distance_chunks())
+                                self.simulation_distance.distance_chunks().min(
+                                    self.settings
+                                        .graphics
+                                        .render_distance
+                                        .view_distance_chunks()
+                                )
                             );
                         }
 
@@ -740,12 +1980,12 @@ impl ApplicationHandler for App {
                 }
 
                 if !generating {
-                    self.controller.process_key(&event);
+                    self.controller.process_key(&event, &self.settings.controls);
                 }
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                if self.is_generating_world() || self.is_paused() {
+                if self.is_generating_world() || self.is_menu_open() || self.chat_open {
                     return;
                 }
 
@@ -772,7 +2012,19 @@ impl ApplicationHandler for App {
                 }
 
                 if steps != 0 {
-                    self.cycle_selected_block(steps);
+                    if self.is_inventory_open() {
+                        let page_count = self
+                            .state
+                            .as_ref()
+                            .map(|state| state.inventory_palette_page_count(CLASSIC_PALETTE.len()))
+                            .unwrap_or(1);
+                        let max_page = page_count.saturating_sub(1) as i32;
+                        if let GameState::Inventory { scroll, .. } = &mut self.game_state {
+                            *scroll = (*scroll + steps).clamp(0, max_page);
+                        }
+                    } else {
+                        self.cycle_selected_slot(steps);
+                    }
                 }
             }
 
@@ -783,17 +2035,94 @@ impl ApplicationHandler for App {
                 button,
                 ..
             } => {
-                if self.is_generating_world() {
+                if self.is_generating_world() || self.chat_open {
                     return;
                 }
 
-                if self.is_paused() {
-                    if button_state == ElementState::Pressed && button == MouseButton::Left {
-                        if let Some(index) = self.pause_menu_item_at_cursor() {
-                            if let GameState::Paused { selected } = &mut self.game_state {
-                                *selected = index;
+                if self.is_menu_open() {
+                    if button == MouseButton::Left {
+                        match button_state {
+                            ElementState::Pressed => {
+                                self.menu_pressed_index = self.menu_item_at_cursor();
+                                if let Some(index) = self.menu_pressed_index {
+                                    self.set_selected_menu_index(index);
+                                }
                             }
-                            self.activate_pause_menu_selected(event_loop);
+                            ElementState::Released => {
+                                let pressed_index = self.menu_pressed_index.take();
+                                let released_index = self.menu_item_at_cursor();
+                                if let Some(index) = released_index {
+                                    self.set_selected_menu_index(index);
+                                }
+                                if let Some(index) = pressed_index
+                                    && released_index == Some(index)
+                                {
+                                    if self.is_main_menu() {
+                                        self.activate_main_menu_selected(event_loop);
+                                    } else if self.is_paused() {
+                                        self.activate_pause_menu_selected(event_loop);
+                                    } else {
+                                        self.activate_options_selected();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                if self.is_inventory_open() {
+                    let Some(state) = self.state.as_ref() else {
+                        return;
+                    };
+                    let page = if let GameState::Inventory { scroll, .. } = &self.game_state {
+                        state.inventory_clamp_palette_page(*scroll, CLASSIC_PALETTE.len())
+                    } else {
+                        0
+                    };
+                    let hotbar_hit =
+                        state.inventory_hotbar_slot_at_pos_px(self.cursor_pos.0, self.cursor_pos.1);
+                    let palette_hit = state.inventory_palette_item_at_pos_px(
+                        CLASSIC_PALETTE.len(),
+                        page,
+                        self.cursor_pos.0,
+                        self.cursor_pos.1,
+                    );
+                    let page_count = state.inventory_palette_page_count(CLASSIC_PALETTE.len());
+                    if let GameState::Inventory {
+                        selected_palette,
+                        selected_hotbar_slot,
+                        scroll,
+                        dragged_block,
+                    } = &mut self.game_state
+                    {
+                        *scroll = (*scroll).clamp(0, page_count.saturating_sub(1) as i32);
+                        match (button, button_state) {
+                            (MouseButton::Left, ElementState::Pressed) => {
+                                if let Some(slot) = hotbar_hit {
+                                    *selected_hotbar_slot = slot;
+                                    self.selected_slot = slot;
+                                }
+                                if let Some(index) = palette_hit {
+                                    *selected_palette = index;
+                                    *dragged_block = CLASSIC_PALETTE.get(index).copied();
+                                }
+                            }
+                            (MouseButton::Left, ElementState::Released) => {
+                                if let Some(block) = dragged_block.take()
+                                    && let Some(slot) = hotbar_hit
+                                {
+                                    self.hotbar[slot] = Some(block);
+                                    *selected_hotbar_slot = slot;
+                                    self.selected_slot = slot;
+                                }
+                            }
+                            (MouseButton::Right, ElementState::Pressed) => {
+                                if let Some(slot) = hotbar_hit {
+                                    self.hotbar[slot] = None;
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     return;
@@ -808,23 +2137,47 @@ impl ApplicationHandler for App {
                     }
 
                     let selected_block = self.selected_block();
+                    let view_camera = Self::compose_view_camera(
+                        self.camera,
+                        self.settings.gameplay.view_bobbing,
+                        self.view_bobbing,
+                    );
                     if let Some(state) = self.state.as_mut() {
                         match button {
                             MouseButton::Left => {
                                 self.break_held = true;
-                                state.destroy_block_at_camera_ray(&self.camera);
+                                state.destroy_block_at_camera_ray(
+                                    &view_camera,
+                                    self.player.player_mode,
+                                );
                                 self.break_cooldown_seconds =
                                     Self::block_action_repeat_cooldown_seconds();
                             }
                             MouseButton::Right => {
-                                self.place_held = true;
-                                state.place_block_at_camera_ray(
-                                    &self.camera,
-                                    selected_block,
-                                    self.player.feet_position,
-                                );
-                                self.place_cooldown_seconds =
-                                    Self::block_action_repeat_cooldown_seconds();
+                                if let Some(selected_block) = selected_block {
+                                    self.place_held = true;
+                                    state.place_block_at_camera_ray(
+                                        &view_camera,
+                                        selected_block,
+                                        self.player.feet_position,
+                                    );
+                                    self.place_cooldown_seconds =
+                                        Self::block_action_repeat_cooldown_seconds();
+                                }
+                            }
+                            MouseButton::Middle => {
+                                if let Some(picked_block) =
+                                    state.pick_block_at_camera_ray(&view_camera)
+                                    && picked_block != BlockId::Air
+                                {
+                                    self.hotbar[self.selected_slot] = Some(picked_block);
+                                    crate::console_info!(
+                                        "Picked block: {} into slot {}/{}",
+                                        picked_block.display_name(),
+                                        self.selected_slot + 1,
+                                        HOTBAR_SLOT_COUNT
+                                    );
+                                }
                             }
                             _ => {}
                         }
@@ -845,6 +2198,14 @@ impl ApplicationHandler for App {
             // Redraw -> Update (dt, camera), Uniform schreiben, Render
             WindowEvent::RedrawRequested => {
                 let _frame_trace = perf_trace::scope("app.frame");
+                let _frame_total_trace = perf_trace::scope("frame.total").with_counts(format!(
+                    "in_game={} paused={} inv={} chat_open={} mouse_captured={}",
+                    self.is_in_game() as u8,
+                    self.is_paused() as u8,
+                    self.is_inventory_open() as u8,
+                    self.chat_open as u8,
+                    self.controller.mouse_captured as u8
+                ));
                 // dt in Sekunden (Zeit seit letztem Frame)
                 let now = Instant::now();
                 let dt = self
@@ -862,44 +2223,71 @@ impl ApplicationHandler for App {
                 let mut completed_spawn: Option<Vec3> = None;
 
                 if let Some(state) = self.state.as_mut() {
-                    if let GameState::GeneratingWorld { progress, phase } = &mut self.game_state {
+                    if let GameState::GeneratingWorld {
+                        title,
+                        progress,
+                        phase,
+                        stats,
+                    } = &mut self.game_state
+                    {
                         while let Some(update) = state.poll_worldgen_progress() {
+                            *title = update.title;
                             *progress = update.progress01.clamp(0.0, 1.0);
                             *phase = update.phase;
+                            *stats = update.stats;
                         }
-                        completed_spawn = state.try_finish_new_level_generation(&self.camera);
+                        completed_spawn = state.try_finish_world_startup_loading(&self.camera);
                     }
                 }
 
                 if let Some(spawn_feet) = completed_spawn {
                     self.clear_action_state();
-                    let spawn_data = self
-                        .state
-                        .as_ref()
-                        .map(|state| Self::settle_spawn_feet(&state.world, spawn_feet));
+                    let spawn_data = self.state.as_mut().map(|state| {
+                        let center_x = spawn_feet.x.floor() as i32;
+                        let center_z = spawn_feet.z.floor() as i32;
+                        Self::world_spawn_settled_feet_near(state, center_x, center_z)
+                    });
                     if let Some((settled_feet, on_ground)) = spawn_data {
                         self.apply_settled_spawn(settled_feet, on_ground);
                     }
                     if let Some(state) = self.state.as_mut() {
-                        state.set_render_distance(self.render_distance, &self.camera);
+                        state.set_render_distance(
+                            self.settings.graphics.render_distance,
+                            &self.camera,
+                        );
                     }
+                    self.world_session_started = true;
                     self.game_state = GameState::InGame;
+                    if let Some(window) = self.window.as_ref() {
+                        self.controller.set_mouse_capture(window, true);
+                    }
                 }
 
                 if self.is_generating_world()
                     && self
                         .state
                         .as_ref()
-                        .is_some_and(|state| !state.is_generating_new_level())
+                        .is_some_and(|state| !state.is_world_startup_loading())
                 {
                     self.game_state = GameState::InGame;
+                    self.world_session_started = true;
+                    if let Some(window) = self.window.as_ref() {
+                        self.controller.set_mouse_capture(window, true);
+                    }
                 }
 
                 if self.is_generating_world() {
                     self.clear_action_state();
                 }
 
+                let frame_input_trace = perf_trace::scope("frame.input").with_counts(format!(
+                    "chat_open={} debug={} wheel_accum={:.2}",
+                    self.chat_open as u8, self.show_debug_overlay as u8, self.mouse_wheel_accum_y
+                ));
                 let in_game = self.is_in_game();
+                let gameplay_active = in_game && !self.chat_open;
+                let world_processing_active =
+                    gameplay_active || self.is_generating_world() || self.world_session_started;
                 let debug_lines_owned = if self.show_debug_overlay && in_game {
                     Some(self.build_debug_overlay_lines())
                 } else {
@@ -908,12 +2296,47 @@ impl ApplicationHandler for App {
                 let debug_line_refs = debug_lines_owned
                     .as_ref()
                     .map(|lines| lines.iter().map(|line| line.as_str()).collect::<Vec<_>>());
+                let chat_lines_owned = if in_game {
+                    let line_count = self.chat_lines.len().min(CHAT_VISIBLE_LINES);
+                    let start = self.chat_lines.len().saturating_sub(line_count);
+                    Some(
+                        self.chat_lines
+                            .iter()
+                            .skip(start)
+                            .map(|line| {
+                                (
+                                    line.text.clone(),
+                                    now.saturating_duration_since(line.time).as_secs_f32(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                } else {
+                    None
+                };
+                drop(frame_input_trace);
+                let menu_overlay_owned = self.menu_overlay_content();
+                let menu_item_refs = menu_overlay_owned.as_ref().map(|(_, items, _, _)| {
+                    items.iter().map(|item| item.as_str()).collect::<Vec<_>>()
+                });
+                let menu_open_for_render = self.is_menu_open();
+                let show_menu_panorama = matches!(&self.game_state, GameState::MainMenu { .. });
+                let inventory_open_for_render = self.is_inventory_open();
                 if let Some(state) = self.state.as_mut() {
                     let _update_trace = perf_trace::scope("app.update");
-                    state.begin_frame_profiling(dt * 1000.0);
-                    state.world_time.advance(dt);
+                    let frame_sim_trace = perf_trace::scope("frame.sim").with_counts(format!(
+                        "gameplay_active={} world_active={} move_mode={:?} in_game={}",
+                        gameplay_active as u8,
+                        world_processing_active as u8,
+                        self.player.mode,
+                        in_game as u8
+                    ));
+                    if world_processing_active {
+                        state.begin_frame_profiling(dt * 1000.0);
+                        state.world_time.advance(dt);
+                    }
 
-                    if in_game {
+                    if gameplay_active {
                         let dt_non_negative = dt.max(0.0);
                         {
                             let _perf_scope = self.perf.scope(PerfCat::Movement);
@@ -981,7 +2404,14 @@ impl ApplicationHandler for App {
                                 &mut self.player,
                                 &fluid_state_after_move,
                             );
-                            self.camera.position = self.player.eye_position();
+                            Self::update_view_bobbing_state(
+                                &mut self.camera,
+                                &mut self.view_bobbing,
+                                &self.player,
+                                self.settings.gameplay.view_bobbing,
+                                dt_non_negative,
+                                gameplay_active,
+                            );
 
                             self.break_cooldown_seconds =
                                 (self.break_cooldown_seconds - dt_non_negative).max(0.0);
@@ -989,18 +2419,33 @@ impl ApplicationHandler for App {
                                 (self.place_cooldown_seconds - dt_non_negative).max(0.0);
                             if self.controller.mouse_captured {
                                 if self.break_held && self.break_cooldown_seconds <= f32::EPSILON {
-                                    state.destroy_block_at_camera_ray(&self.camera);
+                                    let view_camera = Self::compose_view_camera(
+                                        self.camera,
+                                        self.settings.gameplay.view_bobbing,
+                                        self.view_bobbing,
+                                    );
+                                    state.destroy_block_at_camera_ray(
+                                        &view_camera,
+                                        self.player.player_mode,
+                                    );
                                     self.break_cooldown_seconds =
                                         Self::block_action_repeat_cooldown_seconds();
                                 }
                                 if self.place_held && self.place_cooldown_seconds <= f32::EPSILON {
-                                    state.place_block_at_camera_ray(
-                                        &self.camera,
-                                        selected_block,
-                                        self.player.feet_position,
-                                    );
-                                    self.place_cooldown_seconds =
-                                        Self::block_action_repeat_cooldown_seconds();
+                                    if let Some(selected_block) = selected_block {
+                                        let view_camera = Self::compose_view_camera(
+                                            self.camera,
+                                            self.settings.gameplay.view_bobbing,
+                                            self.view_bobbing,
+                                        );
+                                        state.place_block_at_camera_ray(
+                                            &view_camera,
+                                            selected_block,
+                                            self.player.feet_position,
+                                        );
+                                        self.place_cooldown_seconds =
+                                            Self::block_action_repeat_cooldown_seconds();
+                                    }
                                 }
                             } else {
                                 self.break_held = false;
@@ -1024,21 +2469,36 @@ impl ApplicationHandler for App {
                             .unwrap_or(true);
                         {
                             let _perf_scope = self.perf.scope(PerfCat::Highlight);
-                            state.update_face_highlight(&self.camera, blink_visible);
+                            let view_camera = Self::compose_view_camera(
+                                self.camera,
+                                self.settings.gameplay.view_bobbing,
+                                self.view_bobbing,
+                            );
+                            state.update_face_highlight(&view_camera, blink_visible);
                         }
                     } else {
+                        Self::update_view_bobbing_state(
+                            &mut self.camera,
+                            &mut self.view_bobbing,
+                            &self.player,
+                            self.settings.gameplay.view_bobbing,
+                            dt.max(0.0),
+                            false,
+                        );
                         let _perf_scope = self.perf.scope(PerfCat::Highlight);
                         state.clear_targeting_visuals();
                     }
 
-                    {
-                        let _perf_scope = self.perf.scope(PerfCat::ChunkStream);
-                        state.process_dirty_chunk_meshes(&self.camera);
-                    }
-                    state.pump_mesh_results(&self.camera);
-                    {
-                        let _perf_scope = self.perf.scope(PerfCat::TexAnim);
-                        state.update_texture_animations(dt);
+                    if world_processing_active {
+                        {
+                            let _perf_scope = self.perf.scope(PerfCat::ChunkStream);
+                            state.process_dirty_chunk_meshes(&self.camera);
+                        }
+                        state.pump_mesh_results(&self.camera);
+                        {
+                            let _perf_scope = self.perf.scope(PerfCat::TexAnim);
+                            state.update_texture_animations(dt);
+                        }
                     }
 
                     let target_fov = if !in_game {
@@ -1087,11 +2547,20 @@ impl ApplicationHandler for App {
                         self.camera.position,
                         underwater_kind,
                     );
+                    let render_camera = if show_menu_panorama {
+                        Camera::default()
+                    } else {
+                        Self::compose_view_camera(
+                            self.camera,
+                            self.settings.gameplay.view_bobbing,
+                            self.view_bobbing,
+                        )
+                    };
                     let world_time = state.world_time;
                     {
                         let _perf_scope = self.perf.scope(PerfCat::Uniforms);
                         state.update_camera_uniform(
-                            &self.camera,
+                            &render_camera,
                             underwater_kind,
                             overlay_alpha,
                             &world_time,
@@ -1099,38 +2568,139 @@ impl ApplicationHandler for App {
                     }
 
                     let generation_overlay_owned = match &self.game_state {
-                        GameState::GeneratingWorld { progress, phase } => {
-                            Some((*progress, phase.clone()))
-                        }
-                        GameState::InGame | GameState::Paused { .. } => None,
+                        GameState::GeneratingWorld {
+                            title,
+                            progress,
+                            phase,
+                            stats,
+                        } => Some((title.clone(), *progress, phase.clone(), *stats)),
+                        GameState::InGame
+                        | GameState::MainMenu { .. }
+                        | GameState::Paused { .. }
+                        | GameState::Options(_)
+                        | GameState::Inventory { .. } => None,
                     };
                     let generation_overlay =
-                        generation_overlay_owned.as_ref().map(|(progress, phase)| {
-                            GenerationOverlay {
+                        generation_overlay_owned
+                            .as_ref()
+                            .map(|(title, progress, phase, stats)| GenerationOverlay {
+                                title: title.as_str(),
                                 progress01: *progress,
                                 phase: phase.as_str(),
-                            }
-                        });
-                    let pause_overlay = match &self.game_state {
-                        GameState::Paused { selected } => Some(PauseOverlay {
-                            selected: *selected,
-                            items: &PAUSE_MENU_ITEMS,
-                        }),
+                                stats: *stats,
+                            });
+                    let menu_enabled_owned = menu_overlay_owned
+                        .as_ref()
+                        .map(|(_, items, _, _)| vec![true; items.len()]);
+                    let menu_overlay = menu_overlay_owned
+                        .as_ref()
+                        .zip(menu_item_refs.as_ref())
+                        .zip(menu_enabled_owned.as_ref())
+                        .map(
+                            |(((title, _, footer, selected), items), enabled)| MenuOverlay {
+                                title: title.as_str(),
+                                selected: *selected,
+                                pressed: self.menu_pressed_index,
+                                items: items.as_slice(),
+                                enabled: Some(enabled.as_slice()),
+                                footer: footer.as_deref(),
+                                show_panorama: show_menu_panorama,
+                            },
+                        );
+                    let inventory_overlay_owned = match &self.game_state {
+                        GameState::Inventory {
+                            selected_palette,
+                            selected_hotbar_slot,
+                            scroll,
+                            dragged_block,
+                        } => {
+                            let page =
+                                state.inventory_clamp_palette_page(*scroll, CLASSIC_PALETTE.len());
+                            let hovered_palette = state.inventory_palette_item_at_pos_px(
+                                CLASSIC_PALETTE.len(),
+                                page,
+                                self.cursor_pos.0,
+                                self.cursor_pos.1,
+                            );
+                            let hovered_hotbar = state.inventory_hotbar_slot_at_pos_px(
+                                self.cursor_pos.0,
+                                self.cursor_pos.1,
+                            );
+                            Some((
+                                *selected_palette,
+                                *selected_hotbar_slot,
+                                page,
+                                hovered_palette,
+                                hovered_hotbar,
+                                *dragged_block,
+                            ))
+                        }
                         _ => None,
                     };
+                    let inventory_overlay = inventory_overlay_owned.as_ref().map(
+                        |(
+                            selected_palette,
+                            selected_hotbar_slot,
+                            page,
+                            hovered_palette,
+                            hovered_hotbar,
+                            dragged_block,
+                        )| {
+                            InventoryOverlay {
+                                palette_blocks: CLASSIC_PALETTE,
+                                selected_palette: (*selected_palette)
+                                    .min(CLASSIC_PALETTE.len().saturating_sub(1)),
+                                selected_hotbar_slot: (*selected_hotbar_slot)
+                                    .min(HOTBAR_SLOT_COUNT.saturating_sub(1)),
+                                page: *page,
+                                hovered_palette: *hovered_palette,
+                                hovered_hotbar_slot: *hovered_hotbar,
+                                dragged_block: *dragged_block,
+                                cursor_px: [self.cursor_pos.0, self.cursor_pos.1],
+                            }
+                        },
+                    );
                     let debug_overlay = debug_line_refs.as_ref().map(|lines| DebugOverlay {
                         lines: lines.as_slice(),
                     });
+                    let chat_line_refs = chat_lines_owned.as_ref().map(|lines| {
+                        lines
+                            .iter()
+                            .map(|(text, age_seconds)| ChatOverlayLine {
+                                text: text.as_str(),
+                                age_seconds: *age_seconds,
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    let chat_overlay = chat_line_refs.as_ref().map(|lines| ChatOverlay {
+                        recent_lines: lines.as_slice(),
+                        chat_open: self.chat_open,
+                        chat_input: self.chat_input.as_str(),
+                        chat_input_cursor: self.chat_input_cursor,
+                    });
 
+                    drop(frame_sim_trace);
                     let render_result = {
+                        let _render_submit_trace = perf_trace::scope("frame.render.submit")
+                            .with_counts(format!(
+                                "debug={} chat_open={} inv={} menu={}",
+                                self.show_debug_overlay as u8,
+                                self.chat_open as u8,
+                                inventory_open_for_render as u8,
+                                menu_open_for_render as u8
+                            ));
                         let _render_trace = perf_trace::scope("app.render");
                         let _perf_scope = self.perf.scope(PerfCat::Render);
                         state.render(
-                            &self.camera,
+                            &render_camera,
                             underwater_kind,
                             generation_overlay,
-                            pause_overlay,
+                            menu_overlay,
+                            &self.hotbar,
+                            self.selected_slot,
+                            inventory_overlay,
                             debug_overlay,
+                            chat_overlay,
                         )
                     };
                     match render_result {
@@ -1153,6 +2723,25 @@ impl ApplicationHandler for App {
                     }
                 }
                 let frame_ms = self.perf.end_frame();
+                if frame_ms > HITCH_LOG_THRESHOLD_MS {
+                    let counters = self
+                        .state
+                        .as_ref()
+                        .map(State::hitch_counters)
+                        .unwrap_or_else(HitchCounters::default);
+                    perf_trace::instant_event(
+                        "frame.hitch",
+                        &format!(
+                            "dt_ms={:.2} chunks={} mesh_jobs={} lighting_dirty={} storage_inflight={} active_sim_columns={}",
+                            frame_ms,
+                            counters.loaded_chunks,
+                            counters.mesh_jobs_queued,
+                            counters.lighting_dirty_chunks,
+                            counters.storage_loads_inflight,
+                            counters.active_sim_columns
+                        ),
+                    );
+                }
                 if self
                     .state
                     .as_ref()
@@ -1160,7 +2749,7 @@ impl ApplicationHandler for App {
                 {
                     if let Some(state) = self.state.as_ref() {
                         let summary = state.format_stall_report(frame_ms);
-                        eprintln!("{summary}");
+                        crate::console_error!("{summary}");
                         let _ = perf_trace::write_stall_report(&summary);
                     }
                 }
@@ -1187,4 +2776,37 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::default();
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_test_chat() -> App {
+        let mut app = App::default();
+        app.game_state = GameState::InGame;
+        app.open_chat();
+        app.suppress_next_chat_commit = false;
+        app
+    }
+
+    #[test]
+    fn chat_accepts_keyboard_text_without_ime_commit() {
+        let mut app = open_test_chat();
+
+        app.chat_insert_text("hello", ChatTextInputSource::Keyboard);
+
+        assert_eq!(app.chat_input, "hello");
+        assert_eq!(app.chat_input_cursor, "hello".len());
+    }
+
+    #[test]
+    fn chat_dedups_matching_keyboard_and_ime_text() {
+        let mut app = open_test_chat();
+
+        app.chat_insert_text("a", ChatTextInputSource::Keyboard);
+        app.chat_insert_text("a", ChatTextInputSource::Ime);
+
+        assert_eq!(app.chat_input, "a");
+    }
 }

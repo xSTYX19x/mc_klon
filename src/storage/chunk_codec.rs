@@ -3,6 +3,7 @@ use std::io;
 use std::sync::Arc;
 
 use crate::blocks::{BlockId, BlockRegistry};
+use crate::perf::trace as perf_trace;
 use crate::storage::format::{
     COLUMN_PAYLOAD_FORMAT_VERSION, COLUMN_PAYLOAD_MAGIC, SECTION_BLOCK_COUNT,
 };
@@ -279,7 +280,12 @@ pub(crate) fn encode_column(world: &World, cx: i32, cz: i32) -> io::Result<Vec<u
         for &block in chunk.blocks.iter() {
             any_non_air |= block != BlockId::Air;
         }
-        section_inputs.push((cy, chunk.blocks.as_slice(), chunk.block_data.as_slice(), any_non_air));
+        section_inputs.push((
+            cy,
+            chunk.blocks.as_slice(),
+            chunk.block_data.as_slice(),
+            any_non_air,
+        ));
     }
 
     encode_column_from_sections(
@@ -582,7 +588,7 @@ pub(crate) fn decode_column(bytes: &[u8]) -> io::Result<ColumnBlob> {
     Ok(column)
 }
 
-pub(crate) fn apply_column(world: &mut World, column: ColumnBlob) -> io::Result<()> {
+pub(crate) fn validate_column_for_world(world: &World, column: &ColumnBlob) -> io::Result<()> {
     if column.chunk_size != world.chunk_size()
         || column.min_y != world.min_y()
         || column.max_y != world.max_y()
@@ -610,7 +616,82 @@ pub(crate) fn apply_column(world: &mut World, column: ColumnBlob) -> io::Result<
         ));
     }
 
-    validate_column_blob_shape(&column)?;
+    validate_column_blob_shape(column)?;
+    Ok(())
+}
+
+pub(crate) fn decode_chunk_from_section_blob(
+    world: &World,
+    column: &ColumnBlob,
+    section: &SectionBlob,
+) -> io::Result<Option<Chunk>> {
+    validate_column_for_world(world, column)?;
+    let block_registry = BlockRegistry::new();
+    let data_bytes = section.data.decode_values()?;
+    let mut any_non_air = false;
+    let blocks = match &section.blocks {
+        EncodedBlocks::LegacyManifestIds(blocks_legacy) => {
+            let block_bytes = blocks_legacy.decode_values()?;
+            let mut out = Vec::with_capacity(SECTION_BLOCK_COUNT);
+            for &raw in &block_bytes {
+                let block = world.decode_manifest_block_id(raw as u32);
+                any_non_air |= block != BlockId::Air;
+                out.push(block);
+            }
+            out
+        }
+        EncodedBlocks::NamePaletteBitpacked {
+            palette,
+            bits_per_entry,
+            packed_words,
+        } => {
+            let palette_resolved = {
+                let _trace_scope = perf_trace::scope("apply_saved.apply_column.palette_resolve");
+                let mut resolved = Vec::with_capacity(palette.len());
+                for name in palette {
+                    let block = block_registry.resolve_fast(name).unwrap_or_else(|| {
+                        crate::console_error!(
+                            "save decode: unknown block '{}' in section y={} at column ({},{}); mapping to air",
+                            name, section.cy, column.cx, column.cz
+                        );
+                        BlockId::Air
+                    });
+                    resolved.push(block);
+                }
+                resolved
+            };
+            let indices = {
+                let _trace_scope = perf_trace::scope("apply_saved.apply_column.indices_unpack");
+                unpack_indices_u32(*bits_per_entry, packed_words, palette.len())?
+            };
+            {
+                let _trace_scope = perf_trace::scope("apply_saved.apply_column.blocks_fill");
+                let mut out = vec![BlockId::Air; SECTION_BLOCK_COUNT];
+                for (voxel_idx, palette_index) in indices.iter().enumerate() {
+                    let block = palette_resolved[*palette_index as usize];
+                    any_non_air |= block != BlockId::Air;
+                    out[voxel_idx] = block;
+                }
+                out
+            }
+        }
+    };
+
+    let any_non_zero_data = data_bytes.iter().any(|&raw| raw != 0);
+    if !any_non_air && !any_non_zero_data {
+        return Ok(None);
+    }
+
+    Ok(Some(Chunk::from_parts(
+        Arc::new(blocks),
+        Arc::new(data_bytes),
+        Arc::new(vec![0; SECTION_BLOCK_COUNT]),
+        0,
+    )))
+}
+
+pub(crate) fn apply_column(world: &mut World, column: ColumnBlob) -> io::Result<()> {
+    validate_column_for_world(world, &column)?;
 
     for cy in column.min_section_y..=column.max_section_y {
         world.chunks.remove(&ChunkCoord {
@@ -620,57 +701,10 @@ pub(crate) fn apply_column(world: &mut World, column: ColumnBlob) -> io::Result<
         });
     }
 
-    let block_registry = BlockRegistry::new();
-    for section in column.sections {
-        let data_bytes = section.data.decode_values()?;
-        let mut blocks = Vec::with_capacity(SECTION_BLOCK_COUNT);
-        let mut any_non_air = false;
-        let mut any_non_zero_data = false;
-        match section.blocks {
-            EncodedBlocks::LegacyManifestIds(blocks_legacy) => {
-                let block_bytes = blocks_legacy.decode_values()?;
-                for &raw in &block_bytes {
-                    let block = world.decode_manifest_block_id(raw as u32);
-                    any_non_air |= block != BlockId::Air;
-                    blocks.push(block);
-                }
-            }
-            EncodedBlocks::NamePaletteBitpacked {
-                palette,
-                bits_per_entry,
-                packed_words,
-            } => {
-                let indices = unpack_indices_u32(bits_per_entry, &packed_words, palette.len())?;
-                let mut warned_missing = HashSet::new();
-                for palette_index in indices {
-                    let name = &palette[palette_index as usize];
-                    let block = block_registry.resolve(name).unwrap_or_else(|| {
-                        if warned_missing.insert(name.clone()) {
-                            eprintln!(
-                                "save decode: unknown block '{}' in section y={} at column ({},{}); mapping to air",
-                                name, section.cy, column.cx, column.cz
-                            );
-                        }
-                        BlockId::Air
-                    });
-                    any_non_air |= block != BlockId::Air;
-                    blocks.push(block);
-                }
-            }
-        }
-        for &raw in &data_bytes {
-            any_non_zero_data |= raw != 0;
-        }
-        if !any_non_air && !any_non_zero_data {
+    for section in &column.sections {
+        let Some(chunk) = decode_chunk_from_section_blob(world, &column, section)? else {
             continue;
-        }
-
-        let chunk = Chunk::from_parts(
-            Arc::new(blocks),
-            Arc::new(data_bytes),
-            Arc::new(vec![0; SECTION_BLOCK_COUNT]),
-            0,
-        );
+        };
         world.chunks.insert(
             ChunkCoord {
                 x: column.cx,
@@ -753,9 +787,7 @@ fn validate_column_blob_shape(column: &ColumnBlob) -> io::Result<()> {
                 packed_words,
             } => {
                 if column.format_version == COLUMN_PAYLOAD_FORMAT_VERSION_V1 {
-                    return invalid_data(
-                        "name-palette block encoding is not valid for v1 columns",
-                    );
+                    return invalid_data("name-palette block encoding is not valid for v1 columns");
                 }
                 validate_name_palette_blocks(palette, *bits_per_entry, packed_words)?;
                 let _ = unpack_indices_u32(*bits_per_entry, packed_words, palette.len())?;
@@ -896,10 +928,7 @@ fn validate_name_palette_blocks(
     packed_words: &[u64],
 ) -> io::Result<()> {
     if palette.is_empty() || palette.len() > SECTION_BLOCK_COUNT {
-        return invalid_data(format!(
-            "invalid v2 block palette length {}",
-            palette.len()
-        ));
+        return invalid_data(format!("invalid v2 block palette length {}", palette.len()));
     }
     if bits_per_entry == 0 || bits_per_entry > 16 {
         return invalid_data(format!(

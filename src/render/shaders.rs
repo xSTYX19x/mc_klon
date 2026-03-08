@@ -58,8 +58,10 @@ fn vs_main(input: VsIn) -> VsOut {
 
 @fragment
 fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
-    let GRASS_TINT: vec3<f32> = vec3<f32>(124.0 / 255.0, 189.0 / 255.0, 107.0 / 255.0);
+    let GRASS_TINT: vec3<f32> = vec3<f32>(90.0 / 255.0, 200.0 / 255.0, 70.0 / 255.0);
     let WATER_TINT: vec4<f32> = vec4<f32>(63.0 / 255.0, 118.0 / 255.0, 228.0 / 255.0, 0.60);
+    let MIN_WORLD_BRIGHTNESS = 0.045;
+    let MIN_SKY_BRIGHTNESS = 0.16;
     let anim = anim_table[input.tex_layer];
     let frame = min(anim.current_frame, max(anim.sheet_frames, 1u) - 1u);
     var uv_local = input.uv;
@@ -71,6 +73,7 @@ fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
     if (sampled.a < 0.5) {
         discard;
     }
+    // Terrain shading is baked during meshing so the shader only applies texture, tint, and light.
     var base_color = sampled.rgb * input.color;
     var tint_alpha = 1.0;
     if (input.tint_kind == 1u) {
@@ -84,7 +87,9 @@ fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
     let block_light = f32(input.light_packed & 0xFu) / 15.0;
     let lighting_debug_mode = u32(round(clamp(camera.sky_params.y, 0.0, 4.0)));
     let sky_brightness = clamp(camera.sky_params.x, 0.0, 1.0);
-    var light_f = max(block_light, sky_light * sky_brightness);
+    let effective_sky_brightness = mix(MIN_SKY_BRIGHTNESS, 1.0, sky_brightness);
+    var light_f = max(block_light, sky_light * effective_sky_brightness);
+    light_f = max(light_f, MIN_WORLD_BRIGHTNESS);
     if (lighting_debug_mode == 1u) {
         light_f = 1.0;
     } else if (lighting_debug_mode == 2u) {
@@ -155,6 +160,7 @@ struct VsOut {
     @location(0) uv: vec2<f32>,
     @location(1) @interpolate(flat) tex_layer: u32,
     @location(2) color: vec3<f32>,
+    @location(3) @interpolate(flat) mode: u32,
 };
 
 @vertex
@@ -164,15 +170,14 @@ fn vs_main(input: VsIn) -> VsOut {
     out.uv = input.uv;
     out.tex_layer = input.tex_layer;
     out.color = input.color;
+    out.mode = input._mode;
     return out;
 }
 
 @fragment
 fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
     let sampled = textureSample(sky_tex, sky_sampler, input.uv, i32(input.tex_layer));
-    let max_rgb = max(sampled.r, max(sampled.g, sampled.b));
-    // Sun/moon textures can ship with opaque black backgrounds; treat near-black as transparent.
-    if (sampled.a <= 0.01 || max_rgb <= 0.01) {
+    if (sampled.a <= 0.01) {
         discard;
     }
     return vec4<f32>(sampled.rgb * input.color, sampled.a);
@@ -268,6 +273,7 @@ struct VsIn {
     @location(2) tex_layer: u32,
     @location(3) color: vec3<f32>,
     @location(4) mode: u32,
+    @location(5) alpha_or_light: u32,
 };
 
 struct VsOut {
@@ -276,6 +282,7 @@ struct VsOut {
     @location(1) uv: vec2<f32>,
     @location(2) @interpolate(flat) tex_layer: u32,
     @location(3) @interpolate(flat) mode: u32,
+    @location(4) @interpolate(flat) alpha_or_light: u32,
 };
 
 @vertex
@@ -286,6 +293,19 @@ fn vs_main(input: VsIn) -> VsOut {
     out.uv = input.uv;
     out.tex_layer = input.tex_layer;
     out.mode = input.mode;
+    out.alpha_or_light = input.alpha_or_light;
+    return out;
+}
+
+@vertex
+fn vs_main_3d_overlay(input: VsIn) -> VsOut {
+    var out: VsOut;
+    out.clip_pos = camera.view_proj * vec4<f32>(input.position, 1.0);
+    out.color = input.color;
+    out.uv = input.uv;
+    out.tex_layer = input.tex_layer;
+    out.mode = input.mode;
+    out.alpha_or_light = input.alpha_or_light;
     return out;
 }
 
@@ -299,11 +319,20 @@ fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
             uv_local = fract(input.uv);
         }
         let sampled = textureSample(block_tex, block_sampler, uv_local, i32(input.tex_layer + frame));
+        if (sampled.a < 0.1) {
+            discard;
+        }
         return vec4<f32>(sampled.rgb * input.color, sampled.a);
     } else if (input.mode == 2u) {
         let sampled = textureSample(block_tex, block_sampler, fract(input.uv), i32(input.tex_layer));
+        if (sampled.a < 0.1) {
+            discard;
+        }
         let overlay_alpha = camera.fog_color.a;
         return vec4<f32>(sampled.rgb * input.color, sampled.a * overlay_alpha);
+    } else if (input.mode == 3u) {
+        let alpha = clamp(f32(input.alpha_or_light & 0xFFu) / 255.0, 0.0, 1.0);
+        return vec4<f32>(input.color, alpha);
     }
     return vec4<f32>(input.color, 1.0);
 }

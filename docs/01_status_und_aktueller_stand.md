@@ -1,133 +1,158 @@
-# Aktueller Stand (Code-Realitaet)
+# Current State (Code Reality)
 
-Stand: 2026-03-01
+Status: 2026-03-07
 
-## Toolchain / Dependencies
+## Project Direction
 
-- Rust Edition 2024
-- `winit = 0.30`
-- `wgpu = 28`
-- `pollster = 0.4`
-- `glam = 0.32`
-- `bytemuck = 1.16`
-- `image = 0.25`
-- `anyhow = 1`
-- `fastnoise-lite = 1`
-- `serde` / `serde_json`
-- `rayon`
-- `crossbeam-channel`
-- `flate2`
+The repo is no longer in the phase where the main question is "whether" to build modern contracts.
+That direction is now active in the code:
 
-## Projektstruktur (wichtige Module)
+- early-era features are still introduced in a Classic/Pre-Classic order
+- rendering, startup flow, settings, UI skinning, and worldgen are implemented against reusable systems
+- the current priority is extending those systems cleanly instead of replacing them later
 
-- `src/app/mod.rs`: App-Loop, Input, Game-State (`InGame`, `Paused`, `GeneratingWorld`)
-- `src/render/state.rs`: Render-/Streaming-/Storage-Orchestrierung, Overlay, Budgets
-- `src/world/mod.rs`: World-Daten, Chunks, Lighting-Basis, Registry/Manifest-Mapping
-- `src/world/*_system.rs`: Sim-Systeme (`fluids`, `block_entities`, `random_ticks`)
-- `src/meshing/*`: Greedy/Plants/Liquids + Memory-Pooling
-- `src/worldgen/*`: Terrain, Density, Surface Rules, Carvers
-- `src/storage/*`: `world.meta`, Region-I/O, Codec, Save/Load-Worker
+## Important Modules
 
-## Implementierte Systeme
+- `src/app/mod.rs`: app loop, state transitions, menus, startup flow, input routing
+- `src/render/state.rs`: renderer, streaming orchestration, overlays, UI rendering, preview draws
+- `src/render/chunkgen_worker.rs`: column worldgen feature passes on top of terrain generation
+- `src/render/shaders.rs`: world and UI shaders
+- `src/settings.rs`: persistent client settings and control bindings
+- `src/camera.rs`: gameplay camera plus final render-layer view bobbing
+- `src/blocks/mod.rs`: block metadata, shapes, occlusion, selection/collision contracts
+- `src/world/raycast.rs`: selection and hit testing
+- `src/worldgen/ores.rs`: data-driven ore feature pass
+- `src/storage/*`: world metadata, regions, async save/load
 
-### Rendering / GPU
+## Implemented Systems
 
-- Layered Rendering (`Opaque`, `Cutout`, `Transparent`) mit Depth Buffer
-- Frustum-Culling fuer Rendering und Meshing-Dispatch
-- Far-LOD-Pfad (aktivierbar), separate LOD-Streaming-/Upload-Budgets
-- Fog-Varianten (Default/Water/Lava), Wasser-Overlay, Textur-Animationen (`.mcmeta`)
-- UI/Overlays: Crosshair, Block-Preview, Pause-Menue, Generation-Screen, Debug-Overlay
-- Debug-Views fuer Depth/Culling/AO/Lighting
+### Rendering / Meshing
 
-### Gameplay / Input / UI
+- layered rendering (`Opaque`, `Cutout`, `Transparent`) with depth buffer
+- frustum culling for rendering and mesh dispatch
+- far-LOD path with separate streaming/upload budgets
+- deterministic terrain shading path:
+  - face visibility independent from AO
+  - AO/light sampling based on explicit occlusion shapes
+  - partial blocks no longer treated as full blockers by default
+  - shader receives stable baked vertex shading/light inputs
+- debug views for depth/culling/AO/lighting
+- 3D preview meshes for block models are reused for UI item previews
 
-- FPS-Kamera, Cursor-Capture, Hotbar (`1..9` + Mausrad)
-- Block abbauen/platzieren mit Repeat-Cooldown
-- Pause-Menue (`ESC`) mit Save/Generate/Exit
-- Neue Welt generieren (`N`) mit Progress-Overlay
-- Render Distance (`F`) und Simulation Distance (`G`) separat schaltbar
+### Shapes / Interaction
 
-### Bewegung / Physik
+- separate block concepts for render shape, collision shape, selection/raycast shape, and occlusion shape
+- explicit occlusion coverage for full cubes, lower slabs, cross-plants, and decorative non-occluders
+- plant-like decorative blocks use smaller centered selection boxes instead of full-block targeting
+- decorative cross-plants remain non-colliding and non-occluding
 
-- Walking + Flight (Double-Space Toggle)
-- Sprint inkl. Double-Tap-Forward-Latch
-- Kollision + Step-Up
-- Swim/Wading mit fluid-abh. Verhalten
+### Startup / Streaming
 
-### Simulation
+- startup enters a loading state before gameplay
+- first world boot and "Generate new level" share the same startup loading path
+- startup prioritizes spawn-area chunk preparation near-to-far
+- readiness gating waits for critical startup chunks to be generated/applied/meshed/uploaded before entering gameplay
+- world rendering is suppressed during loading instead of drawing an unfinished world behind the overlay
 
-- Fester Sim-Tick (20 TPS) mit Catchup-Limit pro Frame
-- Sim-System-Framework (`SimSystem`) mit aktiven Sim-Spalten
-- Systeme:
-  - FluidsSystem
-  - BlockEntitiesSystem
-  - RandomTicksSystem
-- Aktive Sim-Spalten aus Simulation Distance plus aktivierten Ticking Areas
+### UI / UX / Settings
 
-### Blocks / Meshing
+- main menu, pause menu, and options menu are active
+- menu buttons use textured GUI widget assets with hover/pressed/disabled-capable rendering
+- persistent settings file at `save/settings.json`
+- settings are separated into:
+  - gameplay
+  - graphics
+  - controls
+- current settings surfaced in UI:
+  - view bobbing on/off
+  - render distance
+  - VSync on/off
+  - gameplay control rebinding for core actions
+- runtime application is live for bobbing, render distance, and VSync
+- control rebinding swaps conflicting assignments instead of silently duplicating keys
 
-- Erweiterte Blockpalette inkl. Bedrock, Wasser/Lava (still/flowing), Sand, Obsidian
-- Blockmodelle: Cube, CrossPlant, Liquid
-- Greedy Meshing fuer Solid-Layer
-- Spezifischer Liquid-Mesh-Pfad
-- Thread-local MeshingPool inkl. Liquid-Caches
+### Camera / Movement
 
-### Fluids
+- walking, flight, swim/wading, sprint logic, collisions, and step-up
+- classic first-person walking bobbing implemented as a final camera transform layer
+- bobbing is grounded-movement driven, speed-scaled, smooth, and settings-controlled
+- raw look direction remains separate from bobbing offset/roll
 
-- Wasser- und Lava-Scheduler mit separaten Tickraten
-- Rebuild aus Weltbloecken beim Load/Reset
-- Mixing-Regeln (Obsidian/Cobblestone/Stone)
-- Umfangreiche Unit-Tests in `src/world/fluids.rs`
+### Inventory / Hotbar Presentation
 
-### World / Chunks / Lighting
-
-- Chunk-Groesse: `16x16x16`
-- Vertikaler Bereich aktuell `0..255` (`min_y=0`, `max_y=255`)
-- Skylight/Blocklight-Rebuild und asynchrone Lighting-Worker
-- Remesh/Relight-Trigger bei Block- und Fluid-Aenderungen
+- inventory and hotbar blocks render as 3D isometric previews
+- cross-plants use crossed geometry in previews instead of flat sprites
+- preview meshes are cached by block type instead of rebuilt every frame
 
 ### Worldgen
 
-- Presets: `Flatish`, `Rd161348Like`, `Hilly`
-- Seeded Terrain ueber Terrain/Density/Pipeline-Bausteine
-- Surface Rules, Caves, Ravines
-- Water/Lava Lakes + Water Springs im Chunkgen-Worker
-- Sea-Level in `WorldConfig`/`world.meta` (Default 64)
+- presets: `Flatish`, `ClassicFlatter`, `Rd161348Like`, `Hilly`
+- terrain + density + surface rules
+- carvers (caves/ravines)
+- lakes/springs and shoreline post-processing
+- foliage pass (flowers + mushrooms)
+- ore generation as a dedicated deterministic feature pass after carvers
+- current ore profile is data-driven per ore type:
+  - replacement rule
+  - vein size
+  - attempts/frequency
+  - vertical distribution
+  - exposed-air policy
+- ore generation is seeded per world/preset/source chunk and samples neighboring source chunks for seam-stable cross-border veins
 
-### Save / Load
+### Save / Load / Simulation
 
-- Aktives Save-Layout:
+- active save layout:
   - `save/world.meta`
   - `save/manifest.json`
+  - `save/ticking_areas.bin`
   - `save/region/*.mca`
-- Atomare Writes fuer Meta + Manifest
-- Region-Storage mit Zlib-komprimierten Spaltenpayloads
-- Async Save-Writer + Async Load-Worker
-- Autosave-Sweep mit Budget pro Frame
-- Legacy `save/world.bin` weiterhin im Code, aber nicht als Primaerpfad
+- async save writer + async load worker
+- fixed simulation tick (20 TPS)
+- simulation distance separated from render distance
+- fluids, block entities, and random ticks run through the sim-system path
 
-## Performance / Architektur-Status
+## Runtime Caveats That Are Still Real
 
-- Worker-Pools: Chunkgen, Meshing, Lighting, Storage
-- Budgetierte Stage-Loops im Streaming (Dispatch, Upload, Chunkgen-Apply, Saved-Load)
-- Backpressure-Mechanismen und Coalescing fuer Save/Fluid/Mesh
-- Perf-Trace/CSV/Overlay-Instrumentierung vorhanden
+- hotbar digit keys `1..9` are still not wired to slot selection
+- world lighting still contains coarser full-block assumptions than the newer meshing occlusion contract
+- startup focus is still centered around the current spawn/bootstrap target rather than a richer persisted player-spawn/facing contract
+- the project still carries many pre-existing warnings in `cargo check` / `cargo test`
 
-## Offene Punkte (bereinigt)
+## Current Open Work By Subsystem
 
-### Hoch
+### Rendering
 
-1. Boundary-Ocean-Visualisierung ausserhalb der harten Weltgrenze
-2. Legacy-Worldgen-Pfade in `world/mod.rs` gegen aktive Worker-Pipeline weiter konsolidieren
-3. Save-/Manifest-Doku auf Migrationsfaelle (groessere Block-Registries) erweitern
+1. extend the occlusion/selection contract to more non-cube shapes such as stairs, panes, fences, torches, and rails
+2. make lighting and exposure checks use the same shape-aware rules as meshing
+3. add better debug visualization for face coverage, baked AO classes, and preview cache behavior
 
-### Mittel
+### Worldgen
 
-1. Biome-/Material-Layering ueber aktuelle Surface Rules hinaus
-2. Worldgen-Tuning pro Preset mit reproduzierbaren Snapshot-Tests
-3. Ticking-Areas auch ueber persistente/benutzerseitige Konfiguration steuerbar machen
+1. split ore tables by preset/profile instead of one shared default table
+2. add richer ore rules: hidden-only exposure, more ore families, and biome/material-aware replacement
+3. strengthen deterministic regression coverage with sampled-world statistics and seam checks
 
-### Niedrig
+### UI / UX
 
-1. Historische Paritaetsfeatures (z.B. Humans/Mob-Stub)
-2. Weitere Profiling-Repro-Szenen und Benchmark-Protokolle
+1. keep expanding the options UI without reintroducing scattered hard-coded runtime settings
+2. move remaining block-selection/icon paths onto the same 3D preview system
+3. add a fuller ticking-area/editor UX instead of shortcut-only management
+
+### Gameplay
+
+1. wire hotbar digit keys and decide whether they belong in the rebindable controls set
+2. continue block-shape gameplay polish for future interactables
+3. decide how spawn persistence and first-view direction should affect startup readiness
+
+### Performance
+
+1. document reproducible startup and streaming benchmark scenes
+2. measure ore-pass, preview-cache, and loading-screen warmup costs before deeper optimization work
+3. continue consolidating legacy worldgen/storage paths that still duplicate logic
+
+### Docs / Cleanup
+
+1. keep README, status docs, backlog docs, and worldgen TODOs updated after feature landings
+2. reduce stale notes that still describe pre-settings or pre-loading-screen behavior
+3. tighten file/module comments around the newer contracts so they are discoverable from code as well as docs

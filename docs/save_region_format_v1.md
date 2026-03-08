@@ -1,91 +1,137 @@
-# Save System Region Format v1
+# Save System Region Format (v2 Active, v1 Compatible)
 
-Stand: 2026-03-01
+Status: 2026-03-04
 
-Diese Spezifikation beschreibt den aktiven Save-Pfad.
+This specification describes the active save path.
 
 ## Scope
 
-Persistiert werden:
+Persisted:
 
-- Blockinhalte pro Chunk-Sektion (`blocks`, `block_data`)
-- World-Parameter (`seed`, `preset`, `sea_level`, `min_y`, `max_y`, `chunk_size`)
-- Block-ID-Mapping-Kontext ueber World Manifest
+- block contents per chunk section (`blocks`, `block_data`)
+- world parameters (`seed`, `preset`, `sea_level`, `min_y`, `max_y`, `chunk_size`)
+- boundary parameters (`boundary_ocean`, `boundary_radius_chunks`)
+- save/manifest context (`save_format_version`, `block_id_version`, `block_registry_hash`)
+- ticking areas (`save/ticking_areas.bin`)
 
-Nicht persistiert (runtime-only):
+Not persisted (runtime-only):
 
-- Lighting-Buffer (werden nach Load neu aufgebaut)
-- Runtime-Revisionszaehler
+- lighting buffers (rebuilt after load)
+- runtime revision counters
 
-## Dateilayout
+## File Layout
 
-- Save-Root: `save/`
+- Save root: `save/`
 - Meta: `save/world.meta`
 - Manifest: `save/manifest.json`
-- Regionen: `save/region/r.<rx>.<rz>.mca`
+- Ticking areas: `save/ticking_areas.bin`
+- Regions: `save/region/r.<rx>.<rz>.mca`
 
-## `world.meta` (v1)
+## `world.meta` (format_version = 1)
 
-Pflichtfelder:
+Required fields:
 
 - `magic = "MKWM"`
 - `format_version = 1`
 - `world_seed` (`u64`)
 - `preset` (`flatish | rd161348_like | hilly`)
 - `sea_level`, `min_y`, `max_y`, `chunk_size`
+- `boundary_ocean`, `boundary_radius_chunks`
 - `block_id_version = 1`
+- `save_format_version` (`1` or `2`, actively produced: `2`)
 
-Validierung ist strikt (`deny_unknown_fields` in Wire-Typ).
+Optional:
+
+- `block_registry_hash` (manifest signature for drift detection)
+
+Validation is strict (`deny_unknown_fields` in the wire type).
+
+Important validation rules:
+
+- `chunk_size == 16`
+- `min_y <= max_y`
+- height range section-aligned (`min_y % 16 == 0`, `max_y % 16 == 15`)
+- `sea_level` within `[min_y, max_y]`
+- `boundary_radius_chunks >= 0`
+- `save_format_version` only `1` or `2`
 
 ## `manifest.json` (v1)
 
-Pflichtfelder:
+Required fields:
 
 - `format_version`
 - `game_version`
 - `content_signature`
-- `blocks[]` mit `(id, key)`
+- `blocks[]` with `(id, key)`
 
-Funktion:
+Function:
 
-- Mapping zwischen gespeicherten IDs und Runtime-Blockdefinitionen
-- Fallback auf Missing-Block, wenn Manifest-Key im aktuellen Runtime-Registry fehlt
+- registry/version context for save-load and diagnostics
+- mapping fallbacks for legacy v1 columns (manifest ID -> runtime block)
+
+## `ticking_areas.bin` (format_version = 1)
+
+The historical filename is `.bin`, but the content is JSON.
+
+Required fields:
+
+- `format_version = 1`
+- `areas[]` with:
+  - `id`
+  - `cx`, `cz`
+  - `radius_chunks`
+  - `flags_bits`
+
+Semantics:
+
+- `radius_chunks` is clamped to `0..32` on load/write
+- `flags_bits` currently uses:
+  - Bit 0: `KEEP_LOADED`
+  - Bit 1: `TICK_FLUIDS`
+  - Bit 2: `TICK_LIGHTING`
+  - Bit 3: `TICK_ENTITIES`
+
+Write strategy: atomic via tmp + rename.
 
 ## Region Container (`.mca`)
 
-Minecraft-aehnlicher Container:
+Minecraft-like container:
 
-- 8 KiB Header (Location + Timestamp Tables)
-- 4 KiB Sektoren
-- Chunk-Spalten als Blob mit Kompressionsbyte `2` (zlib)
+- 8 KiB header (location + timestamp tables)
+- 4 KiB sectors
+- chunk columns as blobs with compression byte `2` (zlib)
+- region mapping via Euclidean division (`32x32` chunks per region), negative coordinates are mapped correctly
 
-## Column Payload (`MKCL`, v1)
+## Column Payload (`MKCL`)
 
-- Header mit Koordinaten/Hoehenparametern
-- sektionierte Daten (`cy`-Records)
-- CRC32 ueber unkomprimierte Payload-Daten
+### Active: `format_version = 2`
 
-Sektionen enthalten je 4096 Werte fuer:
+- header with coordinates/height parameters
+- sectioned data (`cy` records)
+- CRC32 over uncompressed payload data
+- `blocks` as `NamePaletteBitpacked`:
+  - palette of block keys (`String`)
+  - bitpacked indices
+- `data` still as `EncodedArray` (`Single` or `PaletteBitpacked`, `u8`)
 
-- `blocks`
-- `data`
+### Legacy: `format_version = 1` (read-only compatible)
 
-Encoding pro Array:
+- `blocks` as manifest-based `u8` values
+- can be migrated via CLI:
+  - `cargo run -- --migrate-save-v1-to-v2`
 
-- `Single(value)` oder
-- `PaletteBitpacked`
+## Important Invariants (Current)
 
-## Wichtige Invariante (aktuell)
+- active v2 columns have **no** `u8` limit for `blocks` (string palette instead of manifest `u8`)
+- legacy v1 columns remain readable (compatibility on load)
+- `world.meta.save_format_version` must be `1` or `2`
 
-On-disk `blocks` speichern aktuell **Manifest-ID als `u8`**.
-Damit muss jede benutzte Manifest-ID in `0..=255` liegen.
-Groessere Content-Sets erfordern ein Format-Upgrade.
+## Crash Safety
 
-## Crash-Safety
+- `world.meta` and `manifest.json`: atomic via tmp + rename + file/directory sync
+- `ticking_areas.bin`: atomic via tmp + rename
+- region writes append-or-relocate, update header only after a successful data write
 
-- `world.meta`/`manifest.json` atomar via tmp + rename + sync
-- Region Writes append-or-relocate, Header erst nach erfolgreichem Datenwrite aktualisieren
+## Legacy Boundary
 
-## Legacy-Grenze
-
-`save/world.bin` gilt als Legacy. Der aktive Runtime-Pfad ist `world.meta` + `manifest.json` + `region/*.mca`.
+`save/world.bin` is considered legacy. The active runtime path is `world.meta` + `manifest.json` + `ticking_areas.bin` + `region/*.mca`.

@@ -1,37 +1,37 @@
 # Java/Bedrock Takeaways (Performance North Star)
 
-Stand: 2026-03-01
+Status: 2026-03-04
 
-## Kurzfazit
+## Short Summary
 
-Fuer dieses Repo bleiben drei Leitlinien zentral:
+Three guidelines remain central for this repo:
 
 1. Render != Simulation != Always-On
-2. Streaming als budgetierte Pipeline mit Backpressure
-3. Datenlayout so gestalten, dass Content wachsen kann
+2. Streaming as a budgeted pipeline with backpressure
+3. Shape the data layout so content can grow
 
-## Statusmatrix (Ist-Code)
+## Status Matrix (Current Code)
 
-| Empfehlung | Status | Notes |
+| Recommendation | Status | Notes |
 | --- | --- | --- |
-| Render Distance vs Simulation Distance trennen | DONE | Beide Distanzen existieren, getrennte Steuerung (`F`/`G`). |
-| Fixed timestep fuer Simulation | DONE | Sim-Systeme laufen ueber festen Tick (20 TPS, Catchup-Limit). |
-| Ticking Areas / Always-On-Zonen | PARTIAL | Infrastruktur vorhanden (`TickingArea` in `render/state.rs`), aber noch kein vollstaendiger User-Workflow/Persistenz. |
-| Chunk lifecycle mit Budgets/Backpressure | DONE | Budgetierte Streaming-Stages, Inflight-/Queue-Kontrolle, Coalescing vorhanden. |
-| Far-LOD fuer grosse Sichtweiten | DONE | LOD-Streaming, LOD-Upload-Budgets, Runtime-Toggle (`F6`). |
-| Lighting als separater asynchroner Pfad | DONE | Lighting-Worker + generation-guarded apply path vorhanden. |
-| Registry/Manifest als Content-Basis | DONE | `save/manifest.json` + runtime mapper aktiv. |
-| Palette/Bitpacking als Runtime-Storage im Chunk | PARTIAL | Save-Codec hat bitpacked Arrays; In-Memory-Chunk ist noch klassisch (`BlockId`, `block_data`). |
-| GPU-driven/Indirect Rendering | MISSING | Noch kein Ziel fuer kurzfristige Roadmap. |
+| Separate render distance vs simulation distance | DONE | Both distances exist, with separate control (`F`/`G`). |
+| Fixed timestep for simulation | DONE | Simulation systems run on a fixed tick (20 TPS, catchup limit). |
+| Ticking areas / always-on zones | PARTIAL | Persistence exists (`save/ticking_areas.bin`) and there are shortcuts (`Ctrl+T` / `Ctrl+Shift+T`), but no complete in-game editor for radius/flags yet. |
+| Chunk lifecycle with budgets/backpressure | DONE | Budgeted streaming stages, inflight/queue control, and coalescing are present. |
+| Far LOD for large view distances | DONE | LOD streaming, LOD upload budgets, runtime toggle (`F6`). |
+| Lighting as a separate asynchronous path | DONE | Lighting worker + generation-guarded apply path exist. |
+| Registry/manifest as content foundation | DONE | `save/manifest.json` + runtime mapper are active. |
+| Palette/bitpacking as runtime storage in the chunk | PARTIAL | Save codec has bitpacked arrays; the in-memory chunk is still classic (`BlockId`, `block_data`). |
+| GPU-driven/indirect rendering | MISSING | Not yet a target for the near-term roadmap. |
 
-## Naechste Architektur-Schritte
+## Next Architecture Steps
 
-1. Ticking-Areas productisieren (Konfiguration, Persistenz, UX)
-2. Manifest-/ID-Migration fuer >256 Storage-IDs designen
-3. Worldgen-Pfadkonsolidierung weiter vorantreiben
+1. Productize ticking areas (configuration, flags, UX)
+2. Measure/improve V2 storage efficiency for block-name palettes
+3. Continue consolidating the worldgen path
 
 ## Guardrails
 
-- Optimieren nur mit reproduzierbaren Messungen
-- Frametimes priorisieren, nicht Peak-FPS
-- Kein grosser Datenlayout-Refactor ohne klares Migration- und Testkonzept
+- Optimize only with reproducible measurements
+- Prioritize frame times, not peak FPS
+- No large data-layout refactor without a clear migration and test concept

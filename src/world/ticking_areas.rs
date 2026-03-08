@@ -68,9 +68,7 @@ pub(crate) struct TickingArea {
 
 impl TickingArea {
     pub(crate) fn normalized(mut self) -> Self {
-        self.radius_chunks = self
-            .radius_chunks
-            .clamp(0, TICKING_AREA_MAX_RADIUS_CHUNKS);
+        self.radius_chunks = self.radius_chunks.clamp(0, TICKING_AREA_MAX_RADIUS_CHUNKS);
         self
     }
 }

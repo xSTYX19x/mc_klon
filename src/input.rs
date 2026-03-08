@@ -4,6 +4,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window};
 
 use crate::camera::Camera;
+use crate::settings::{InputAction, InputBindings};
 
 pub(crate) struct CameraController {
     pub(crate) move_forward: bool,
@@ -44,21 +45,24 @@ impl CameraController {
         }
     }
 
-    pub(crate) fn process_key(&mut self, event: &KeyEvent) {
+    pub(crate) fn process_key(&mut self, event: &KeyEvent, bindings: &InputBindings) {
         let pressed = event.state == ElementState::Pressed;
         let PhysicalKey::Code(code) = event.physical_key else {
             return;
         };
 
-        match code {
-            KeyCode::KeyW => self.move_forward = pressed,
-            KeyCode::KeyS => self.move_backward = pressed,
-            KeyCode::KeyA => self.move_left = pressed,
-            KeyCode::KeyD => self.move_right = pressed,
-            KeyCode::Space => self.move_up = pressed,
-            KeyCode::ShiftLeft | KeyCode::ShiftRight => self.move_down = pressed,
-            KeyCode::ControlLeft | KeyCode::ControlRight => self.sprint_held = pressed,
-            _ => {}
+        for (action, target) in [
+            (InputAction::MoveForward, &mut self.move_forward),
+            (InputAction::MoveBackward, &mut self.move_backward),
+            (InputAction::MoveLeft, &mut self.move_left),
+            (InputAction::MoveRight, &mut self.move_right),
+            (InputAction::Jump, &mut self.move_up),
+            (InputAction::Sneak, &mut self.move_down),
+            (InputAction::Sprint, &mut self.sprint_held),
+        ] {
+            if bindings.key_for(action) == code {
+                *target = pressed;
+            }
         }
         self.refresh_sprint();
     }
