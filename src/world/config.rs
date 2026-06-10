@@ -1,4 +1,4 @@
-use super::CHUNK_SIZE;
+use super::{CHUNK_SIZE, WorldEnvironment};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct WorldConfig {
@@ -9,6 +9,7 @@ pub(crate) struct WorldConfig {
     pub(crate) chunk_size: i32,
     pub(crate) boundary_ocean: bool,
     pub(crate) boundary_radius_chunks: i32,
+    pub(crate) environment: WorldEnvironment,
 }
 
 impl WorldConfig {
@@ -31,6 +32,10 @@ impl WorldConfig {
     pub(crate) fn boundary_radius_chunks(&self) -> i32 {
         self.boundary_radius_chunks.max(0)
     }
+
+    pub(crate) fn environment(&self) -> WorldEnvironment {
+        self.environment
+    }
 }
 
 impl Default for WorldConfig {
@@ -43,6 +48,7 @@ impl Default for WorldConfig {
             chunk_size: CHUNK_SIZE,
             boundary_ocean: false,
             boundary_radius_chunks: 128,
+            environment: WorldEnvironment::Temperate,
         }
     }
 }

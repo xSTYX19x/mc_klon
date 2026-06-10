@@ -114,7 +114,7 @@ impl InputAction {
             Self::Jump => KeyCode::Space,
             Self::Sneak => KeyCode::ShiftLeft,
             Self::Sprint => KeyCode::ControlLeft,
-            Self::OpenInventory => KeyCode::KeyE,
+            Self::OpenInventory => KeyCode::KeyB,
             Self::OpenChat => KeyCode::KeyT,
             Self::PauseMenu => KeyCode::Escape,
         }

@@ -5,7 +5,7 @@ use crate::blocks::{BlockModel, BlockTextureLookup, Face};
 use crate::world::{BlockAccess, CHUNK_SIZE, ChunkCoord};
 
 use super::greedy::push_textured_quad;
-use super::{CpuMeshData, LayeredChunkGeometry, chunk_world_origin};
+use super::{WorldCpuMeshData, LayeredChunkGeometry, MeshLayerMask, chunk_world_origin};
 
 #[cfg(feature = "allocation_tracking")]
 use crate::perf::ALLOCATION_TRACKER;
@@ -493,7 +493,7 @@ fn liquid_side_v(kind: FluidKind, local_y: f32) -> f32 {
 }
 
 fn emit_liquid_side(
-    mesh: &mut CpuMeshData,
+    mesh: &mut WorldCpuMeshData,
     kind: FluidKind,
     face: Face,
     wx: f32,
@@ -573,6 +573,7 @@ pub(super) fn append_liquids_in_chunk_pooled(
     coord: ChunkCoord,
     chunk_offset: [f32; 3],
     texture_lookup: &BlockTextureLookup,
+    requested_layers: MeshLayerMask,
     layered: &mut LayeredChunkGeometry,
     pool_opt: Option<&mut super::pool::MeshingPool>,
 ) {
@@ -591,11 +592,19 @@ pub(super) fn append_liquids_in_chunk_pooled(
             chunk_origin,
             chunk_offset,
             texture_lookup,
+            requested_layers,
             layered,
             &mut pool.liquid_pool,
         );
     } else {
-        append_liquids_in_chunk(world, coord, chunk_offset, texture_lookup, layered);
+        append_liquids_in_chunk(
+            world,
+            coord,
+            chunk_offset,
+            texture_lookup,
+            requested_layers,
+            layered,
+        );
     }
 }
 
@@ -604,6 +613,7 @@ pub(super) fn append_liquids_in_chunk(
     coord: ChunkCoord,
     chunk_offset: [f32; 3],
     texture_lookup: &BlockTextureLookup,
+    requested_layers: MeshLayerMask,
     layered: &mut LayeredChunkGeometry,
 ) {
     let Some(chunk) = world.get_chunk(coord) else {
@@ -635,6 +645,7 @@ pub(super) fn append_liquids_in_chunk(
             chunk_origin,
             chunk_offset,
             texture_lookup,
+            requested_layers,
             layered,
             &mut pool,
         );
@@ -652,6 +663,7 @@ fn append_liquids_in_chunk_with_pool(
     chunk_origin: IVec3,
     chunk_offset: [f32; 3],
     texture_lookup: &BlockTextureLookup,
+    requested_layers: MeshLayerMask,
     layered: &mut LayeredChunkGeometry,
     pool: &mut LiquidMeshingPool,
 ) {
@@ -662,6 +674,10 @@ fn append_liquids_in_chunk_with_pool(
                 let BlockModel::Liquid { kind } = texture_lookup.model_for(id) else {
                     continue;
                 };
+                let render_layer = texture_lookup.render_layer_for(id);
+                if !requested_layers.contains_render_layer(render_layer) {
+                    continue;
+                }
 
                 let world_pos = chunk_origin + IVec3::new(x, y, z);
                 let covered = is_covered(world, world_pos, kind);
@@ -687,7 +703,6 @@ fn append_liquids_in_chunk_with_pool(
                 );
 
                 let data = world.get_block_data(world_pos);
-                let render_layer = texture_lookup.render_layer_for(id);
                 let mesh = layered.mesh_mut(render_layer);
                 let still_block = make_still(kind);
                 let side_block = if is_source(id, data) {

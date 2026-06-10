@@ -15,8 +15,8 @@ use super::flatten_layered_geometry;
 use super::liquids::fluid_surface_height_at;
 use super::neighborhood::{MeshingNeighborhood, PADDED_CHUNK_STRIDE_Y, PADDED_CHUNK_STRIDE_Z};
 use super::{
-    CpuMeshData, FULLBRIGHT_LIGHT_PACKED, LayeredChunkGeometry, Vertex, chunk_offset,
-    chunk_world_origin, pack_vertex_light,
+    WorldCpuMeshData, WorldVertex, FULLBRIGHT_LIGHT_PACKED, LayeredChunkGeometry, MeshLayerMask,
+    chunk_offset, chunk_world_origin, pack_uv, pack_shade, pack_vertex_light,
 };
 
 static DEBUG_DISABLE_AO: AtomicBool = AtomicBool::new(false);
@@ -231,6 +231,14 @@ fn should_emit_bottom_slab_face(
     if !neighbor.is_voxel_filled() {
         return true;
     }
+    if matches!(
+        texture_lookup.model_for(current),
+        BlockModel::LayerBottom { .. }
+    ) && current == neighbor
+        && matches!(face, Face::North | Face::South | Face::East | Face::West)
+    {
+        return false;
+    }
 
     let neighbor_info = texture_lookup.info_for(neighbor);
     let required = match face {
@@ -255,6 +263,7 @@ fn append_bottom_slabs_in_chunk(
     chunk_origin: IVec3,
     chunk_offset: [f32; 3],
     texture_lookup: &BlockTextureLookup,
+    requested_layers: MeshLayerMask,
     layered: &mut LayeredChunkGeometry,
 ) {
     let faces: [(Face, [[i32; 3]; 4]); 6] = [
@@ -270,9 +279,20 @@ fn append_bottom_slabs_in_chunk(
         for z in 0..CHUNK_SIZE {
             for x in 0..CHUNK_SIZE {
                 let id = chunk.get(x, y, z);
-                if !id.is_voxel_filled() || texture_lookup.model_for(id) != BlockModel::SlabBottom {
+                let layer_height = match texture_lookup.model_for(id) {
+                    BlockModel::SlabBottom => 8u8,
+                    BlockModel::LayerBottom { height_px } => height_px,
+                    _ => continue,
+                };
+                if !id.is_voxel_filled() {
                     continue;
                 }
+                let render_layer = texture_lookup.render_layer_for(id);
+                if !requested_layers.contains_render_layer(render_layer) {
+                    continue;
+                }
+                let layer_height_f = layer_height as f32 / 16.0;
+                let render_bounds = RenderBounds::bottom_layer(layer_height_f);
 
                 let world_pos = chunk_origin + IVec3::new(x, y, z);
                 for (face, quad) in faces {
@@ -280,7 +300,6 @@ fn append_bottom_slabs_in_chunk(
                         continue;
                     }
 
-                    let render_layer = texture_lookup.render_layer_for(id);
                     let mesh = layered.mesh_mut(render_layer);
                     let base_index = mesh.vertices.len() as u32;
                     let tex_layer = texture_lookup.layer_for(id, face);
@@ -288,30 +307,31 @@ fn append_bottom_slabs_in_chunk(
                     let mut quad_uvs = face_uvs_for_quad(face, quad);
                     if matches!(face, Face::North | Face::South | Face::East | Face::West) {
                         for uv in &mut quad_uvs {
-                            uv[1] *= 0.5;
+                            uv[1] *= layer_height_f;
                         }
                     }
 
                     for (corner_index, p) in quad.iter().enumerate() {
-                        let vertex_local = [p[0] as f32, p[1] as f32 * 0.5, p[2] as f32];
+                        let vertex_local = [p[0] as f32, p[1] as f32 * layer_height_f, p[2] as f32];
                         let (shade, light_packed) = face_vertex_shade_and_light(
                             world,
                             world_pos,
                             face,
-                            RenderBounds::LOWER_SLAB,
+                            render_bounds,
                             vertex_local,
                         );
-                        mesh.vertices.push(Vertex {
+                        mesh.vertices.push(WorldVertex {
                             position: [
                                 x as f32 + vertex_local[0] + chunk_offset[0],
                                 y as f32 + vertex_local[1] + chunk_offset[1],
                                 z as f32 + vertex_local[2] + chunk_offset[2],
                             ],
-                            uv: quad_uvs[corner_index],
+                            uv: pack_uv(quad_uvs[corner_index][0], quad_uvs[corner_index][1]),
                             tex_layer,
-                            color: [shade, shade, shade],
-                            tint_kind,
-                            light_packed,
+                            shade: pack_shade(shade),
+                            tint_kind: tint_kind as u8,
+                            light_packed: light_packed as u8,
+                            _pad: 0,
                         });
                     }
 
@@ -354,6 +374,14 @@ impl RenderBounds {
         min: [0.0, 0.0, 0.0],
         max: [1.0, 0.5, 1.0],
     };
+
+    #[inline(always)]
+    fn bottom_layer(height: f32) -> Self {
+        Self {
+            min: [0.0, 0.0, 0.0],
+            max: [1.0, height.clamp(0.0, 1.0), 1.0],
+        }
+    }
 
     #[inline(always)]
     fn midpoint(self, axis: usize) -> f32 {
@@ -789,9 +817,13 @@ pub(crate) fn build_chunk_mesh_layered_naive_dense_pooled(
     coord: ChunkCoord,
     texture_lookup: &BlockTextureLookup,
     pool: &mut super::pool::MeshingPool,
+    requested_layers: MeshLayerMask,
 ) -> (LayeredChunkGeometry, MeshGenerationStats) {
     let mut layered = LayeredChunkGeometry::default();
     let mut stats = MeshGenerationStats::default();
+    if requested_layers.is_empty() {
+        return (layered, stats);
+    }
     stats.scratch_buffers_reused = pool.scratch_buffers_reused();
     stats.capacity_hints_used = pool.prepare_layered_geometry(&mut layered);
     build_chunk_mesh_layered_naive_dense_internal(
@@ -799,6 +831,7 @@ pub(crate) fn build_chunk_mesh_layered_naive_dense_pooled(
         coord,
         texture_lookup,
         pool,
+        requested_layers,
         &mut layered,
         &mut stats,
     );
@@ -815,6 +848,7 @@ fn build_chunk_mesh_layered_naive_dense_internal(
     coord: ChunkCoord,
     texture_lookup: &BlockTextureLookup,
     pool: &mut super::pool::MeshingPool,
+    requested_layers: MeshLayerMask,
     layered: &mut LayeredChunkGeometry,
     stats: &mut MeshGenerationStats,
 ) {
@@ -840,6 +874,9 @@ fn build_chunk_mesh_layered_naive_dense_internal(
                 }
                 let info = texture_lookup.info_for(id);
                 if info.model != BlockModel::Cube {
+                    continue;
+                }
+                if !requested_layers.contains_render_layer(info.render_layer) {
                     continue;
                 }
 
@@ -881,17 +918,18 @@ fn build_chunk_mesh_layered_naive_dense_internal(
                             face,
                             corner_local,
                         );
-                        mesh.vertices.push(Vertex {
+                        mesh.vertices.push(WorldVertex {
                             position: [
                                 (x + p[0]) as f32 + chunk_offset[0],
                                 (y + p[1]) as f32 + chunk_offset[1],
                                 (z + p[2]) as f32 + chunk_offset[2],
                             ],
-                            uv: quad_uvs[corner_index],
+                            uv: pack_uv(quad_uvs[corner_index][0], quad_uvs[corner_index][1]),
                             tex_layer,
-                            color: [shade, shade, shade],
-                            tint_kind,
-                            light_packed,
+                            shade: pack_shade(shade),
+                            tint_kind: tint_kind as u8,
+                            light_packed: light_packed as u8,
+                            _pad: 0,
                         });
                     }
 
@@ -917,20 +955,24 @@ fn build_chunk_mesh_layered_naive_dense_internal(
         chunk_origin,
         chunk_offset,
         texture_lookup,
+        requested_layers,
         layered,
     );
-    append_cross_plants_in_chunk_pooled(
-        neighborhood.center_chunk(),
-        chunk_offset,
-        texture_lookup,
-        &mut layered.cutout,
-        Some(pool),
-    );
+    if requested_layers.contains(MeshLayerMask::CUTOUT) {
+        append_cross_plants_in_chunk_pooled(
+            neighborhood.center_chunk(),
+            chunk_offset,
+            texture_lookup,
+            &mut layered.cutout,
+            Some(pool),
+        );
+    }
     append_liquids_in_chunk_pooled(
         neighborhood,
         coord,
         chunk_offset,
         texture_lookup,
+        requested_layers,
         layered,
         Some(pool),
     );
@@ -941,9 +983,13 @@ pub(crate) fn build_chunk_mesh_greedy_layered_dense_pooled(
     coord: ChunkCoord,
     texture_lookup: &BlockTextureLookup,
     pool: &mut super::pool::MeshingPool,
+    requested_layers: MeshLayerMask,
 ) -> (LayeredChunkGeometry, MeshGenerationStats) {
     let mut layered = LayeredChunkGeometry::default();
     let mut stats = MeshGenerationStats::default();
+    if requested_layers.is_empty() {
+        return (layered, stats);
+    }
     stats.scratch_buffers_reused = pool.scratch_buffers_reused();
     stats.capacity_hints_used = pool.prepare_layered_geometry(&mut layered);
     build_chunk_mesh_greedy_layered_dense_internal(
@@ -951,6 +997,7 @@ pub(crate) fn build_chunk_mesh_greedy_layered_dense_pooled(
         coord,
         texture_lookup,
         pool,
+        requested_layers,
         &mut layered,
         &mut stats,
     );
@@ -967,6 +1014,7 @@ fn build_chunk_mesh_greedy_layered_dense_internal(
     coord: ChunkCoord,
     texture_lookup: &BlockTextureLookup,
     pool: &mut super::pool::MeshingPool,
+    requested_layers: MeshLayerMask,
     layered: &mut LayeredChunkGeometry,
     stats: &mut MeshGenerationStats,
 ) {
@@ -1017,8 +1065,12 @@ fn build_chunk_mesh_greedy_layered_dense_internal(
                     };
                     let a_info = texture_lookup.info_for(a);
                     let b_info = texture_lookup.info_for(b);
-                    let a_cube = a.is_voxel_filled() && a_info.model == BlockModel::Cube;
-                    let b_cube = b.is_voxel_filled() && b_info.model == BlockModel::Cube;
+                    let a_cube = a.is_voxel_filled()
+                        && a_info.model == BlockModel::Cube
+                        && requested_layers.contains_render_layer(a_info.render_layer);
+                    let b_cube = b.is_voxel_filled()
+                        && b_info.model == BlockModel::Cube
+                        && requested_layers.contains_render_layer(b_info.render_layer);
                     let a_index = if slice >= 0 {
                         Some(MeshingNeighborhood::local_padded_index(
                             a_local.x, a_local.y, a_local.z,
@@ -1185,13 +1237,14 @@ fn build_chunk_mesh_greedy_layered_dense_internal(
                             face,
                             corner_local,
                         );
-                        mesh.vertices.push(Vertex {
+                        mesh.vertices.push(WorldVertex {
                             position: p(qp),
-                            uv,
+                            uv: pack_uv(uv[0], uv[1]),
                             tex_layer,
-                            color: [shade, shade, shade],
-                            tint_kind,
-                            light_packed,
+                            shade: pack_shade(shade),
+                            tint_kind: tint_kind as u8,
+                            light_packed: light_packed as u8,
+                            _pad: 0,
                         });
                     }
                     mesh.indices.extend_from_slice(&[
@@ -1225,20 +1278,24 @@ fn build_chunk_mesh_greedy_layered_dense_internal(
         chunk_origin,
         chunk_offset,
         texture_lookup,
+        requested_layers,
         layered,
     );
-    append_cross_plants_in_chunk_pooled(
-        neighborhood.center_chunk(),
-        chunk_offset,
-        texture_lookup,
-        &mut layered.cutout,
-        Some(pool),
-    );
+    if requested_layers.contains(MeshLayerMask::CUTOUT) {
+        append_cross_plants_in_chunk_pooled(
+            neighborhood.center_chunk(),
+            chunk_offset,
+            texture_lookup,
+            &mut layered.cutout,
+            Some(pool),
+        );
+    }
     append_liquids_in_chunk_pooled(
         neighborhood,
         coord,
         chunk_offset,
         texture_lookup,
+        requested_layers,
         layered,
         Some(pool),
     );
@@ -1351,17 +1408,18 @@ fn build_chunk_mesh_layered_naive_internal(
                             face,
                             corner_world_i,
                         );
-                        mesh.vertices.push(Vertex {
+                        mesh.vertices.push(WorldVertex {
                             position: [
                                 (x + p[0]) as f32 + chunk_offset[0],
                                 (y + p[1]) as f32 + chunk_offset[1],
                                 (z + p[2]) as f32 + chunk_offset[2],
                             ],
-                            uv: quad_uvs[corner_index],
+                            uv: pack_uv(quad_uvs[corner_index][0], quad_uvs[corner_index][1]),
                             tex_layer,
-                            color: [shade, shade, shade],
-                            tint_kind,
-                            light_packed,
+                            shade: pack_shade(shade),
+                            tint_kind: tint_kind as u8,
+                            light_packed: light_packed as u8,
+                            _pad: 0,
                         });
                     }
 
@@ -1388,6 +1446,7 @@ fn build_chunk_mesh_layered_naive_internal(
         chunk_origin,
         chunk_offset,
         texture_lookup,
+        MeshLayerMask::ALL,
         layered,
     );
     append_cross_plants_in_chunk_pooled(
@@ -1402,6 +1461,7 @@ fn build_chunk_mesh_layered_naive_internal(
         coord,
         chunk_offset,
         texture_lookup,
+        MeshLayerMask::ALL,
         layered,
         Some(pool),
     );
@@ -1670,13 +1730,14 @@ fn build_chunk_mesh_greedy_layered_internal(
                             face,
                             corner_world_i,
                         );
-                        mesh.vertices.push(Vertex {
+                        mesh.vertices.push(WorldVertex {
                             position: p(qp),
-                            uv,
+                            uv: pack_uv(uv[0], uv[1]),
                             tex_layer,
-                            color: [shade, shade, shade],
-                            tint_kind,
-                            light_packed,
+                            shade: pack_shade(shade),
+                            tint_kind: tint_kind as u8,
+                            light_packed: light_packed as u8,
+                            _pad: 0,
                         });
                     }
                     mesh.indices.extend_from_slice(&[
@@ -1711,6 +1772,7 @@ fn build_chunk_mesh_greedy_layered_internal(
         chunk_origin,
         chunk_offset,
         texture_lookup,
+        MeshLayerMask::ALL,
         layered,
     );
     append_cross_plants_in_chunk_pooled(
@@ -1725,6 +1787,7 @@ fn build_chunk_mesh_greedy_layered_internal(
         coord,
         chunk_offset,
         texture_lookup,
+        MeshLayerMask::ALL,
         layered,
         Some(pool),
     );
@@ -1735,7 +1798,7 @@ pub(crate) fn build_chunk_mesh_greedy(
     world: &World,
     coord: ChunkCoord,
     texture_lookup: &BlockTextureLookup,
-) -> (Vec<Vertex>, Vec<u32>) {
+) -> (Vec<WorldVertex>, Vec<u32>) {
     flatten_layered_geometry(build_chunk_mesh_greedy_layered(
         world,
         coord,
@@ -1747,7 +1810,7 @@ pub(crate) fn build_chunk_mesh_greedy(
 /// Reduces temporary allocations and improves cache performance
 #[inline]
 pub(super) fn push_textured_quad_simd(
-    mesh: &mut CpuMeshData,
+    mesh: &mut WorldCpuMeshData,
     positions: [[f32; 3]; 4],
     uvs: [[f32; 2]; 4],
     tex_layer: u32,
@@ -1755,46 +1818,48 @@ pub(super) fn push_textured_quad_simd(
 ) {
     let base = mesh.vertices.len() as u32;
 
-    // Reserve capacity to avoid reallocations during quad creation
     mesh.vertices.reserve(4);
     mesh.indices.reserve(6);
 
-    // Create all 4 vertices in one batch to improve cache locality
-    let color = [1.0, 1.0, 1.0];
-    let light = FULLBRIGHT_LIGHT_PACKED;
+    let light = FULLBRIGHT_LIGHT_PACKED as u8;
+    let tk = tint_kind as u8;
 
     mesh.vertices.extend_from_slice(&[
-        Vertex {
+        WorldVertex {
             position: positions[0],
-            uv: uvs[0],
+            uv: pack_uv(uvs[0][0], uvs[0][1]),
             tex_layer,
-            color,
-            tint_kind,
+            shade: 255,
+            tint_kind: tk,
             light_packed: light,
+            _pad: 0,
         },
-        Vertex {
+        WorldVertex {
             position: positions[1],
-            uv: uvs[1],
+            uv: pack_uv(uvs[1][0], uvs[1][1]),
             tex_layer,
-            color,
-            tint_kind,
+            shade: 255,
+            tint_kind: tk,
             light_packed: light,
+            _pad: 0,
         },
-        Vertex {
+        WorldVertex {
             position: positions[2],
-            uv: uvs[2],
+            uv: pack_uv(uvs[2][0], uvs[2][1]),
             tex_layer,
-            color,
-            tint_kind,
+            shade: 255,
+            tint_kind: tk,
             light_packed: light,
+            _pad: 0,
         },
-        Vertex {
+        WorldVertex {
             position: positions[3],
-            uv: uvs[3],
+            uv: pack_uv(uvs[3][0], uvs[3][1]),
             tex_layer,
-            color,
-            tint_kind,
+            shade: 255,
+            tint_kind: tk,
             light_packed: light,
+            _pad: 0,
         },
     ]);
 
@@ -1805,7 +1870,7 @@ pub(super) fn push_textured_quad_simd(
 
 /// Original implementation kept for fallback
 pub(super) fn push_textured_quad_scalar(
-    mesh: &mut CpuMeshData,
+    mesh: &mut WorldCpuMeshData,
     positions: [[f32; 3]; 4],
     uvs: [[f32; 2]; 4],
     tex_layer: u32,
@@ -1813,13 +1878,14 @@ pub(super) fn push_textured_quad_scalar(
 ) {
     let base = mesh.vertices.len() as u32;
     for i in 0..4 {
-        mesh.vertices.push(Vertex {
+        mesh.vertices.push(WorldVertex {
             position: positions[i],
-            uv: uvs[i],
+            uv: pack_uv(uvs[i][0], uvs[i][1]),
             tex_layer,
-            color: [1.0, 1.0, 1.0],
-            tint_kind,
-            light_packed: FULLBRIGHT_LIGHT_PACKED,
+            shade: 255,
+            tint_kind: tint_kind as u8,
+            light_packed: FULLBRIGHT_LIGHT_PACKED as u8,
+            _pad: 0,
         });
     }
     mesh.indices
@@ -1829,7 +1895,7 @@ pub(super) fn push_textured_quad_scalar(
 /// Optimized quad creation with improved memory allocation patterns
 #[inline]
 pub(super) fn push_textured_quad(
-    mesh: &mut CpuMeshData,
+    mesh: &mut WorldCpuMeshData,
     positions: [[f32; 3]; 4],
     uvs: [[f32; 2]; 4],
     tex_layer: u32,
@@ -1842,54 +1908,56 @@ pub(super) fn push_textured_quad(
 /// Use this for large numbers of quads to reduce reallocations
 #[inline]
 pub(super) fn push_textured_quads_batch(
-    mesh: &mut CpuMeshData,
+    mesh: &mut WorldCpuMeshData,
     quads: &[([[f32; 3]; 4], [[f32; 2]; 4], u32, u32)], // (positions, uvs, tex_layer, tint_kind)
 ) {
     let quad_count = quads.len();
 
-    // Reserve all memory upfront to avoid reallocations
     mesh.vertices.reserve(quad_count * 4);
     mesh.indices.reserve(quad_count * 6);
 
-    let color = [1.0, 1.0, 1.0];
-    let light = FULLBRIGHT_LIGHT_PACKED;
+    let light = FULLBRIGHT_LIGHT_PACKED as u8;
 
     for (positions, uvs, tex_layer, tint_kind) in quads {
         let base = mesh.vertices.len() as u32;
+        let tk = *tint_kind as u8;
 
-        // Add vertices in batch
         mesh.vertices.extend_from_slice(&[
-            Vertex {
+            WorldVertex {
                 position: positions[0],
-                uv: uvs[0],
+                uv: pack_uv(uvs[0][0], uvs[0][1]),
                 tex_layer: *tex_layer,
-                color,
-                tint_kind: *tint_kind,
+                shade: 255,
+                tint_kind: tk,
                 light_packed: light,
+                _pad: 0,
             },
-            Vertex {
+            WorldVertex {
                 position: positions[1],
-                uv: uvs[1],
+                uv: pack_uv(uvs[1][0], uvs[1][1]),
                 tex_layer: *tex_layer,
-                color,
-                tint_kind: *tint_kind,
+                shade: 255,
+                tint_kind: tk,
                 light_packed: light,
+                _pad: 0,
             },
-            Vertex {
+            WorldVertex {
                 position: positions[2],
-                uv: uvs[2],
+                uv: pack_uv(uvs[2][0], uvs[2][1]),
                 tex_layer: *tex_layer,
-                color,
-                tint_kind: *tint_kind,
+                shade: 255,
+                tint_kind: tk,
                 light_packed: light,
+                _pad: 0,
             },
-            Vertex {
+            WorldVertex {
                 position: positions[3],
-                uv: uvs[3],
+                uv: pack_uv(uvs[3][0], uvs[3][1]),
                 tex_layer: *tex_layer,
-                color,
-                tint_kind: *tint_kind,
+                shade: 255,
+                tint_kind: tk,
                 light_packed: light,
+                _pad: 0,
             },
         ]);
 
@@ -2102,8 +2170,8 @@ mod simd_uv_tests {
         let tex_layer = 5;
         let tint_kind = 2;
 
-        let mut scalar_mesh = CpuMeshData::default();
-        let mut simd_mesh = CpuMeshData::default();
+        let mut scalar_mesh = super::super::WorldCpuMeshData::default();
+        let mut simd_mesh = super::super::WorldCpuMeshData::default();
 
         push_textured_quad_scalar(&mut scalar_mesh, positions, uvs, tex_layer, tint_kind);
         push_textured_quad_simd(&mut simd_mesh, positions, uvs, tex_layer, tint_kind);
@@ -2125,7 +2193,7 @@ mod simd_uv_tests {
                 "Texture layer mismatch at vertex {}",
                 i
             );
-            assert_eq!(sv.color, dv.color, "Color mismatch at vertex {}", i);
+            assert_eq!(sv.shade, dv.shade, "Shade mismatch at vertex {}", i);
             assert_eq!(
                 sv.tint_kind, dv.tint_kind,
                 "Tint kind mismatch at vertex {}",
@@ -2231,12 +2299,12 @@ mod simd_uv_tests {
         let naive_at_target: Vec<_> = naive_vertices
             .iter()
             .filter(|v| v.position == target)
-            .map(|v| (v.color, v.light_packed))
+            .map(|v| (v.shade, v.light_packed))
             .collect();
         let greedy_at_target: Vec<_> = greedy_vertices
             .iter()
             .filter(|v| v.position == target)
-            .map(|v| (v.color, v.light_packed))
+            .map(|v| (v.shade, v.light_packed))
             .collect();
 
         assert!(

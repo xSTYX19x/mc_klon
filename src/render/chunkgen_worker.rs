@@ -78,6 +78,7 @@ const MUSHROOM_CEILING_MAX_DISTANCE: i32 = 3;
 const MUSHROOM_BROWN_PATCH_CHANCE_256: u32 = 64; // 1/4
 const MUSHROOM_RED_PATCH_CHANCE_256: u32 = 32; // 1/8
 const MUSHROOM_PATCH_RADIUS: i32 = 4;
+const WINTER_MAX_SNOW_Y: i32 = WORLD_MAX_Y - 1;
 const MUSHROOM_PATCH_PLACEMENTS_MIN: i32 = 5;
 const MUSHROOM_PATCH_PLACEMENTS_MAX: i32 = 12;
 const LOD_GRID_CELLS_PER_CHUNK: i32 = 4;
@@ -1677,6 +1678,55 @@ fn apply_foliage_to_column(
     apply_mushrooms_to_column(column, world_cfg, preset, chunk_x, chunk_z, terrain_sampler);
 }
 
+#[inline]
+fn winter_surface_supports_snow(block: BlockId) -> bool {
+    block.is_solid()
+        && !matches!(
+            block,
+            BlockId::Air
+                | BlockId::WaterStill
+                | BlockId::WaterFlowing
+                | BlockId::LavaStill
+                | BlockId::LavaFlowing
+                | BlockId::Ice
+                | BlockId::Snow
+        )
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct WinterColumnPassStats {
+    snow_layers: u32,
+    ice_blocks: u32,
+}
+
+fn apply_winter_surface_to_column(column: &mut ColumnBuffer) -> WinterColumnPassStats {
+    let mut stats = WinterColumnPassStats::default();
+    for local_z in 0..CHUNK_SIZE {
+        for local_x in 0..CHUNK_SIZE {
+            for y in (1..=WINTER_MAX_SNOW_Y).rev() {
+                let block = column.get_block(local_x, y, local_z);
+                if block == BlockId::Air {
+                    continue;
+                }
+                let above = column.get_block(local_x, y + 1, local_z);
+                if matches!(block, BlockId::WaterStill | BlockId::WaterFlowing)
+                    && above == BlockId::Air
+                {
+                    column_set_block(column, local_x, y, local_z, BlockId::Ice);
+                    stats.ice_blocks = stats.ice_blocks.saturating_add(1);
+                    break;
+                }
+                if winter_surface_supports_snow(block) && above == BlockId::Air {
+                    column_set_block(column, local_x, y + 1, local_z, BlockId::Snow);
+                    stats.snow_layers = stats.snow_layers.saturating_add(1);
+                }
+                break;
+            }
+        }
+    }
+    stats
+}
+
 struct StreamingWorldColumnGenerator {
     preset: WorldgenPreset,
 }
@@ -1692,7 +1742,11 @@ impl StreamingWorldColumnGenerator {
         cz: i32,
         out: &mut ColumnBuffer,
         ctx: &mut GenContext,
-    ) -> (Vec<u32>, ColumnGenerationStageTimings) {
+    ) -> (
+        Vec<u32>,
+        ColumnGenerationStageTimings,
+        WinterColumnPassStats,
+    ) {
         let cfg = WorldConfig { ..ctx.world_cfg };
         let min_chunk_y = cfg.min_y.div_euclid(CHUNK_SIZE);
         let max_chunk_y = cfg.max_y.div_euclid(CHUNK_SIZE);
@@ -1711,6 +1765,7 @@ impl StreamingWorldColumnGenerator {
             lava_lakes,
         };
         let mut stage_timings = ColumnGenerationStageTimings::default();
+        let mut winter_stats = WinterColumnPassStats::default();
 
         // 1) Base terrain fill
         ctx.report_progress("Base terrain fill", 0, 7);
@@ -1788,7 +1843,12 @@ impl StreamingWorldColumnGenerator {
         apply_foliage_to_column(out, &cfg, self.preset, cx, cz, &terrain_sampler);
         stage_timings.foliage = stage_started.elapsed();
         ctx.report_progress("Foliage", 7, 7);
-        (shoreline_sand_by_chunk, stage_timings)
+        if cfg.environment().enables_winter_surface_rules() {
+            let stage_started = Instant::now();
+            winter_stats = apply_winter_surface_to_column(out);
+            stage_timings.winter_surface = stage_started.elapsed();
+        }
+        (shoreline_sand_by_chunk, stage_timings, winter_stats)
     }
 }
 
@@ -1807,13 +1867,14 @@ struct ColumnGenerationStageTimings {
     shoreline: Duration,
     trees: Duration,
     foliage: Duration,
+    winter_surface: Duration,
     section_snapshot: Duration,
 }
 
 impl ColumnGenerationStageTimings {
     fn instrumentation_fields(self) -> String {
         format!(
-            "base_ms={:.3} carvers_ms={:.3} ores_ms={:.3} fluid_ms={:.3} shoreline_ms={:.3} trees_ms={:.3} foliage_ms={:.3} snapshot_ms={:.3}",
+            "base_ms={:.3} carvers_ms={:.3} ores_ms={:.3} fluid_ms={:.3} shoreline_ms={:.3} trees_ms={:.3} foliage_ms={:.3} winter_ms={:.3} snapshot_ms={:.3}",
             self.base_terrain_fill.as_secs_f64() * 1000.0,
             self.carvers.as_secs_f64() * 1000.0,
             self.ores.as_secs_f64() * 1000.0,
@@ -1821,6 +1882,7 @@ impl ColumnGenerationStageTimings {
             self.shoreline.as_secs_f64() * 1000.0,
             self.trees.as_secs_f64() * 1000.0,
             self.foliage.as_secs_f64() * 1000.0,
+            self.winter_surface.as_secs_f64() * 1000.0,
             self.section_snapshot.as_secs_f64() * 1000.0,
         )
     }
@@ -1920,13 +1982,18 @@ fn generate_streaming_column_buffer(
     preset: WorldgenPreset,
     chunk_x: i32,
     chunk_z: i32,
-) -> (ColumnBuffer, Vec<u32>, ColumnGenerationStageTimings) {
+) -> (
+    ColumnBuffer,
+    Vec<u32>,
+    ColumnGenerationStageTimings,
+    WinterColumnPassStats,
+) {
     let mut ctx = GenContext::new(world_cfg.seed, world_cfg);
     let generator = StreamingWorldColumnGenerator::new(preset);
     let mut column = ColumnBuffer::new();
-    let (shoreline_sand_by_chunk, stage_timings) =
+    let (shoreline_sand_by_chunk, stage_timings, winter_stats) =
         generator.generate_column_with_debug_stats(chunk_x, chunk_z, &mut column, &mut ctx);
-    (column, shoreline_sand_by_chunk, stage_timings)
+    (column, shoreline_sand_by_chunk, stage_timings, winter_stats)
 }
 
 fn generate_streaming_column(
@@ -1937,11 +2004,16 @@ fn generate_streaming_column(
 ) -> GeneratedColumn {
     let coord = ColumnCoordKey::new(chunk_x, chunk_z);
     let descriptor = ColumnGenerationDescriptor::new(world_cfg, preset);
-    let (column, shoreline_sand_by_chunk, mut stage_timings) =
+    let (column, shoreline_sand_by_chunk, mut stage_timings, winter_stats) =
         generate_streaming_column_buffer(world_cfg, preset, chunk_x, chunk_z);
     let snapshot_started = Instant::now();
-    let sections =
-        build_generated_section_snapshots(coord, descriptor, &column, &shoreline_sand_by_chunk);
+    let sections = build_generated_section_snapshots(
+        coord,
+        descriptor,
+        &column,
+        &shoreline_sand_by_chunk,
+        winter_stats,
+    );
     stage_timings.section_snapshot = snapshot_started.elapsed();
     GeneratedColumn::new(coord, descriptor, sections, stage_timings)
 }
@@ -1953,7 +2025,7 @@ pub(crate) fn generate_streaming_column_for_test(
     chunk_x: i32,
     chunk_z: i32,
 ) -> ColumnBuffer {
-    let (column, _, _) = generate_streaming_column_buffer(world_cfg, preset, chunk_x, chunk_z);
+    let (column, _, _, _) = generate_streaming_column_buffer(world_cfg, preset, chunk_x, chunk_z);
     column
 }
 
@@ -1962,6 +2034,7 @@ fn build_generated_section_snapshots(
     descriptor: ColumnGenerationDescriptor,
     column: &ColumnBuffer,
     shoreline_sand_by_chunk: &[u32],
+    _winter_stats: WinterColumnPassStats,
 ) -> Vec<GeneratedSectionSnapshot> {
     let section_voxel_count = (CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE) as usize;
     let layer_area = (CHUNK_SIZE * CHUNK_SIZE) as usize;
@@ -2431,10 +2504,12 @@ mod tests {
 
     use super::{
         CHUNK_SIZE, ColumnAcquireDisposition, ColumnCoordKey, ColumnGenerationDescriptor,
-        ColumnGenerationStageTimings, GeneratedColumn, GeneratedColumnCoordinator, WorldConfig,
+        ColumnGenerationStageTimings, GeneratedColumn, GeneratedColumnCoordinator, WORLD_MAX_Y,
+        WinterColumnPassStats, WorldConfig, apply_winter_surface_to_column,
         build_generated_section_snapshots, generate_streaming_column_for_test,
     };
     use crate::blocks::BlockId;
+    use crate::world::WorldEnvironment;
     use crate::world::fluids::{fluid_data_is_source_origin, fluid_data_is_worldgen_static};
     use crate::worldgen::ColumnBuffer;
     use crate::worldgen::WorldgenPreset;
@@ -2454,6 +2529,7 @@ mod tests {
                 descriptor,
                 &column,
                 &vec![0; descriptor.section_count()],
+                WinterColumnPassStats::default(),
             ),
             stage_timings: ColumnGenerationStageTimings::default(),
         }
@@ -2478,7 +2554,13 @@ mod tests {
             descriptor,
             min_chunk_y: descriptor.min_chunk_y(),
             max_chunk_y: descriptor.max_chunk_y(),
-            sections: build_generated_section_snapshots(coord, descriptor, &column, &[7, 11]),
+            sections: build_generated_section_snapshots(
+                coord,
+                descriptor,
+                &column,
+                &[7, 11],
+                WinterColumnPassStats::default(),
+            ),
             stage_timings: ColumnGenerationStageTimings::default(),
         };
 
@@ -2591,6 +2673,34 @@ mod tests {
         roots
     }
 
+    fn count_block(column: &ColumnBuffer, target: BlockId) -> u32 {
+        let mut count = 0u32;
+        for y in 0..=WORLD_MAX_Y {
+            for z in 0..CHUNK_SIZE {
+                for x in 0..CHUNK_SIZE {
+                    if column.get_block(x, y, z) == target {
+                        count = count.saturating_add(1);
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn winter_surface_pass_places_snow_and_freezes_exposed_water() {
+        let mut column = ColumnBuffer::new();
+        column.set_block(3, 64, 3, BlockId::Grass);
+        column.set_block(7, 62, 8, BlockId::WaterStill);
+
+        let stats = apply_winter_surface_to_column(&mut column);
+
+        assert_eq!(column.get_block(3, 65, 3), BlockId::Snow);
+        assert_eq!(column.get_block(7, 62, 8), BlockId::Ice);
+        assert_eq!(stats.snow_layers, 1);
+        assert_eq!(stats.ice_blocks, 1);
+    }
+
     #[test]
     fn trees_are_deterministic_for_same_seed_and_column() {
         let cfg = WorldConfig {
@@ -2601,6 +2711,38 @@ mod tests {
         let b = generate_streaming_column_for_test(cfg, WorldgenPreset::ClassicFlatter, 7, -4);
         assert_eq!(a.blocks, b.blocks);
         assert_eq!(a.data, b.data);
+    }
+
+    #[test]
+    fn winter_worldgen_adds_surface_snow_over_temperate_generation() {
+        let temperate_cfg = WorldConfig {
+            seed: 0xA110_1004_55AA_7711,
+            environment: WorldEnvironment::Temperate,
+            ..WorldConfig::default()
+        };
+        let winter_cfg = WorldConfig {
+            environment: WorldEnvironment::Winter,
+            ..temperate_cfg
+        };
+        let preset = WorldgenPreset::ClassicFlatter;
+        let mut winter_snow = 0u32;
+        let mut temperate_snow = 0u32;
+
+        for cz in -2..=2 {
+            for cx in -2..=2 {
+                let temperate = generate_streaming_column_for_test(temperate_cfg, preset, cx, cz);
+                let winter = generate_streaming_column_for_test(winter_cfg, preset, cx, cz);
+                temperate_snow =
+                    temperate_snow.saturating_add(count_block(&temperate, BlockId::Snow));
+                winter_snow = winter_snow.saturating_add(count_block(&winter, BlockId::Snow));
+            }
+        }
+
+        assert_eq!(temperate_snow, 0);
+        assert!(
+            winter_snow > 0,
+            "winter worldgen did not place any snow layers"
+        );
     }
 
     #[test]
@@ -2877,6 +3019,8 @@ pub(crate) struct GeneratedWorldgenDebugStats {
     pub(crate) worldgen_water_blocks: u32,
     pub(crate) worldgen_water_source_blocks: u32,
     pub(crate) shoreline_sand_blocks: u32,
+    pub(crate) winter_snow_blocks: u32,
+    pub(crate) winter_ice_blocks: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2945,6 +3089,8 @@ fn analyze_generated_section_buffers(
     let mut solid_voxel_count = 0u16;
     let mut worldgen_water_blocks = 0u32;
     let mut worldgen_water_source_blocks = 0u32;
+    let mut winter_snow_blocks = 0u32;
+    let mut winter_ice_blocks = 0u32;
 
     for local_y in 0..CHUNK_SIZE {
         for local_z in 0..CHUNK_SIZE {
@@ -2956,6 +3102,11 @@ fn analyze_generated_section_buffers(
                 }
                 if block.is_solid() {
                     solid_voxel_count = solid_voxel_count.saturating_add(1);
+                }
+                if block == BlockId::Snow {
+                    winter_snow_blocks = winter_snow_blocks.saturating_add(1);
+                } else if block == BlockId::Ice {
+                    winter_ice_blocks = winter_ice_blocks.saturating_add(1);
                 }
                 let Some(kind) = fluid_kind(block) else {
                     continue;
@@ -2994,6 +3145,8 @@ fn analyze_generated_section_buffers(
             worldgen_water_blocks,
             worldgen_water_source_blocks,
             shoreline_sand_blocks,
+            winter_snow_blocks,
+            winter_ice_blocks,
         },
         out,
     )

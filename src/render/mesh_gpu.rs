@@ -1,6 +1,44 @@
 use std::time::{Duration, Instant};
 
-use crate::meshing::{CpuMeshData, LayeredChunkGeometry, Vertex};
+use crate::blocks::RenderLayer;
+use crate::meshing::{
+    CpuMeshData, LayeredChunkGeometry, MeshLayerMask, Vertex, WorldCpuMeshData, WorldVertex,
+};
+
+impl WorldVertex {
+    pub(crate) fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<WorldVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                // @location(0) position: vec3<f32>   — offset  0, size 12
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                // @location(1) uv_raw: vec2<u32>      — offset 12, size  4
+                wgpu::VertexAttribute {
+                    offset: 12,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Uint16x2,
+                },
+                // @location(2) tex_layer: u32         — offset 16, size  4
+                wgpu::VertexAttribute {
+                    offset: 16,
+                    shader_location: 2,
+                    format: wgpu::VertexFormat::Uint32,
+                },
+                // @location(3) packed: vec4<u32>      — offset 20, size  4  (shade,tint,light,pad)
+                wgpu::VertexAttribute {
+                    offset: 20,
+                    shader_location: 3,
+                    format: wgpu::VertexFormat::Uint8x4,
+                },
+            ],
+        }
+    }
+}
 
 impl Vertex {
     pub(crate) fn layout() -> wgpu::VertexBufferLayout<'static> {
@@ -73,6 +111,22 @@ pub(crate) struct LayeredChunkMesh {
 impl LayeredChunkMesh {
     pub(crate) fn is_empty(&self) -> bool {
         self.opaque.is_none() && self.cutout.is_none() && self.transparent.is_none()
+    }
+
+    fn take_layer(&mut self, layer: RenderLayer) -> Option<ChunkMesh> {
+        match layer {
+            RenderLayer::Opaque => self.opaque.take(),
+            RenderLayer::Cutout => self.cutout.take(),
+            RenderLayer::Transparent => self.transparent.take(),
+        }
+    }
+
+    fn set_layer(&mut self, layer: RenderLayer, mesh: Option<ChunkMesh>) {
+        match layer {
+            RenderLayer::Opaque => self.opaque = mesh,
+            RenderLayer::Cutout => self.cutout = mesh,
+            RenderLayer::Transparent => self.transparent = mesh,
+        }
     }
 }
 
@@ -232,45 +286,123 @@ pub(crate) fn upload_cpu_mesh_to_gpu(
     upload_cpu_mesh_to_gpu_reuse(device, queue, label_prefix, mesh, None).0
 }
 
+pub(crate) fn upload_world_cpu_mesh_to_gpu_reuse(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label_prefix: &str,
+    mesh: WorldCpuMeshData,
+    existing: Option<ChunkMesh>,
+) -> (Option<ChunkMesh>, MeshUploadStats) {
+    let mut stats = MeshUploadStats::default();
+    if mesh.indices.is_empty() {
+        return (None, stats);
+    }
+
+    let vertex_bytes = bytemuck::cast_slice(&mesh.vertices);
+    let index_bytes = bytemuck::cast_slice(&mesh.indices);
+    let required_vertex_bytes = vertex_bytes.len() as u64;
+    let required_index_bytes = index_bytes.len() as u64;
+
+    let (mut vertex_buffer, vertex_capacity_bytes, vertex_reused) = if let Some(ref old) = existing
+    {
+        if old.vertex_capacity_bytes >= required_vertex_bytes {
+            (Some(old.vertex_buffer.clone()), old.vertex_capacity_bytes, true)
+        } else {
+            (None, grown_capacity(required_vertex_bytes), false)
+        }
+    } else {
+        (None, grown_capacity(required_vertex_bytes), false)
+    };
+    if vertex_buffer.is_none() {
+        vertex_buffer = Some(create_gpu_buffer(
+            device,
+            format!("{label_prefix} Vertex Buffer"),
+            wgpu::BufferUsages::VERTEX,
+            vertex_capacity_bytes,
+            &mut stats,
+        ));
+    }
+    let vertex_buffer = vertex_buffer.expect("vertex buffer must be allocated");
+    write_buffer_bytes(queue, &vertex_buffer, vertex_bytes, vertex_reused, &mut stats);
+
+    let (mut index_buffer, index_capacity_bytes, index_reused) = if let Some(ref old) = existing {
+        if old.index_capacity_bytes >= required_index_bytes {
+            (Some(old.index_buffer.clone()), old.index_capacity_bytes, true)
+        } else {
+            (None, grown_capacity(required_index_bytes), false)
+        }
+    } else {
+        (None, grown_capacity(required_index_bytes), false)
+    };
+    if index_buffer.is_none() {
+        index_buffer = Some(create_gpu_buffer(
+            device,
+            format!("{label_prefix} Index Buffer"),
+            wgpu::BufferUsages::INDEX,
+            index_capacity_bytes,
+            &mut stats,
+        ));
+    }
+    let index_buffer = index_buffer.expect("index buffer must be allocated");
+    write_buffer_bytes(queue, &index_buffer, index_bytes, index_reused, &mut stats);
+
+    (
+        Some(ChunkMesh {
+            vertex_buffer,
+            index_buffer,
+            index_count: mesh.indices.len() as u32,
+            vertex_capacity_bytes,
+            index_capacity_bytes,
+        }),
+        stats,
+    )
+}
+
 pub(crate) fn upload_layered_chunk_mesh_to_gpu_reuse(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     layered: LayeredChunkGeometry,
     existing: Option<LayeredChunkMesh>,
 ) -> (Option<LayeredChunkMesh>, MeshUploadStats) {
+    upload_layered_chunk_mesh_layers_to_gpu_reuse(
+        device,
+        queue,
+        layered,
+        MeshLayerMask::ALL,
+        existing,
+    )
+}
+
+pub(crate) fn upload_layered_chunk_mesh_layers_to_gpu_reuse(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    mut layered: LayeredChunkGeometry,
+    layer_mask: MeshLayerMask,
+    existing: Option<LayeredChunkMesh>,
+) -> (Option<LayeredChunkMesh>, MeshUploadStats) {
     let mut stats = MeshUploadStats::default();
     let mut existing = existing.unwrap_or_default();
 
-    let (opaque, opaque_stats) = upload_cpu_mesh_to_gpu_reuse(
-        device,
-        queue,
-        "Chunk Opaque",
-        layered.opaque,
-        existing.opaque.take(),
-    );
-    stats.add_assign(opaque_stats);
-    let (cutout, cutout_stats) = upload_cpu_mesh_to_gpu_reuse(
-        device,
-        queue,
-        "Chunk Cutout",
-        layered.cutout,
-        existing.cutout.take(),
-    );
-    stats.add_assign(cutout_stats);
-    let (transparent, transparent_stats) = upload_cpu_mesh_to_gpu_reuse(
-        device,
-        queue,
-        "Chunk Transparent",
-        layered.transparent,
-        existing.transparent.take(),
-    );
-    stats.add_assign(transparent_stats);
+    for (layer, label_prefix) in [
+        (RenderLayer::Opaque, "Chunk Opaque"),
+        (RenderLayer::Cutout, "Chunk Cutout"),
+        (RenderLayer::Transparent, "Chunk Transparent"),
+    ] {
+        if !layer_mask.contains_render_layer(layer) {
+            continue;
+        }
+        let (mesh, layer_stats) = upload_world_cpu_mesh_to_gpu_reuse(
+            device,
+            queue,
+            label_prefix,
+            layered.take_mesh(layer),
+            existing.take_layer(layer),
+        );
+        stats.add_assign(layer_stats);
+        existing.set_layer(layer, mesh);
+    }
 
-    let layered_mesh = LayeredChunkMesh {
-        opaque,
-        cutout,
-        transparent,
-    };
+    let layered_mesh = existing;
     if layered_mesh.is_empty() {
         (None, stats)
     } else {

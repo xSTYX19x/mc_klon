@@ -2,13 +2,13 @@ use crate::blocks::{BlockModel, BlockTextureLookup, Face, TINT_NONE};
 use crate::world::CHUNK_SIZE;
 use crate::world::chunk::Chunk;
 
-use super::{CpuMeshData, FULLBRIGHT_LIGHT_PACKED, Vertex};
+use super::{WorldCpuMeshData, WorldVertex, FULLBRIGHT_LIGHT_PACKED, pack_uv};
 
 pub(super) fn append_cross_plants_in_chunk(
     chunk: &Chunk,
     chunk_offset: [f32; 3],
     texture_lookup: &BlockTextureLookup,
-    cutout_mesh: &mut CpuMeshData,
+    cutout_mesh: &mut WorldCpuMeshData,
 ) {
     append_cross_plants_in_chunk_pooled(chunk, chunk_offset, texture_lookup, cutout_mesh, None)
 }
@@ -17,7 +17,7 @@ pub(super) fn append_cross_plants_in_chunk_pooled(
     chunk: &Chunk,
     chunk_offset: [f32; 3],
     texture_lookup: &BlockTextureLookup,
-    cutout_mesh: &mut CpuMeshData,
+    cutout_mesh: &mut WorldCpuMeshData,
     _pool: Option<&mut super::pool::MeshingPool>,
 ) {
     for y in 0..CHUNK_SIZE {
@@ -49,14 +49,13 @@ pub(super) fn append_cross_plants_in_chunk_pooled(
 fn push_cross_plant(
     base: [f32; 3],
     tex_layer: u32,
-    vertices: &mut Vec<Vertex>,
+    vertices: &mut Vec<WorldVertex>,
     indices: &mut Vec<u32>,
 ) {
     let x = base[0];
     let y = base[1];
     let z = base[2];
-    let color = [1.0, 1.0, 1.0];
-    let uv0 = [0.0, 1.0];
+    let uv0 = [0.0_f32, 1.0];
     let uv1 = [1.0, 1.0];
     let uv2 = [1.0, 0.0];
     let uv3 = [0.0, 0.0];
@@ -67,14 +66,7 @@ fn push_cross_plant(
         [x + 1.0, y + 1.0, z + 1.0],
         [x + 0.0, y + 1.0, z + 0.0],
     ];
-    push_double_sided_quad(
-        quad_a,
-        [uv0, uv1, uv2, uv3],
-        tex_layer,
-        color,
-        vertices,
-        indices,
-    );
+    push_double_sided_quad(quad_a, [uv0, uv1, uv2, uv3], tex_layer, vertices, indices);
 
     let quad_b = [
         [x + 1.0, y + 0.0, z + 0.0],
@@ -82,33 +74,26 @@ fn push_cross_plant(
         [x + 0.0, y + 1.0, z + 1.0],
         [x + 1.0, y + 1.0, z + 0.0],
     ];
-    push_double_sided_quad(
-        quad_b,
-        [uv0, uv1, uv2, uv3],
-        tex_layer,
-        color,
-        vertices,
-        indices,
-    );
+    push_double_sided_quad(quad_b, [uv0, uv1, uv2, uv3], tex_layer, vertices, indices);
 }
 
 fn push_double_sided_quad(
     positions: [[f32; 3]; 4],
     uvs: [[f32; 2]; 4],
     tex_layer: u32,
-    color: [f32; 3],
-    vertices: &mut Vec<Vertex>,
+    vertices: &mut Vec<WorldVertex>,
     indices: &mut Vec<u32>,
 ) {
     let base = vertices.len() as u32;
     for i in 0..4 {
-        vertices.push(Vertex {
+        vertices.push(WorldVertex {
             position: positions[i],
-            uv: uvs[i],
+            uv: pack_uv(uvs[i][0], uvs[i][1]),
             tex_layer,
-            color,
-            tint_kind: TINT_NONE,
-            light_packed: FULLBRIGHT_LIGHT_PACKED,
+            shade: 255,
+            tint_kind: TINT_NONE as u8,
+            light_packed: FULLBRIGHT_LIGHT_PACKED as u8,
+            _pad: 0,
         });
     }
     // Front

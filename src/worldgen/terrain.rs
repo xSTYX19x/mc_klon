@@ -9,7 +9,7 @@ pub enum WorldgenPreset {
     Hilly,
 }
 
-pub const DEFAULT_WORLDGEN_PRESET: WorldgenPreset = WorldgenPreset::Rd161348Like;
+pub const DEFAULT_WORLDGEN_PRESET: WorldgenPreset = WorldgenPreset::ClassicFlatter;
 
 /// Konfiguration fuer 2D-Heightmap Terrain.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -352,10 +352,10 @@ mod tests {
     }
 
     #[test]
-    fn default_profile_uses_rd161348_like_preset() {
+    fn default_profile_uses_classic_flatter_preset() {
         let expected = WorldGenConfig::from_preset(132_211, DEFAULT_WORLDGEN_PRESET);
         assert_eq!(expected, WorldGenConfig::default());
-        assert_eq!(DEFAULT_WORLDGEN_PRESET, WorldgenPreset::Rd161348Like);
+        assert_eq!(DEFAULT_WORLDGEN_PRESET, WorldgenPreset::ClassicFlatter);
     }
 
     #[test]

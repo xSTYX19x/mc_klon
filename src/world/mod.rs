@@ -17,6 +17,7 @@ pub(crate) mod block_entities_system;
 pub(crate) mod block_entity_types;
 pub(crate) mod chunk;
 pub(crate) mod config;
+pub(crate) mod environment;
 pub(crate) mod fluids;
 pub(crate) mod fluids_system;
 pub(crate) mod manifest;
@@ -28,6 +29,7 @@ pub(crate) mod time;
 pub(crate) use block_access::BlockAccess;
 pub(crate) use chunk::{Chunk, ChunkCoord, LightLevel};
 pub(crate) use config::WorldConfig;
+pub(crate) use environment::{PrecipitationKind, WorldEnvironment};
 pub(crate) use fluids::FluidKind;
 use fluids::fluid_kind;
 use manifest::{IdMapper, WorldManifest};
@@ -60,10 +62,13 @@ pub(crate) struct World {
 
 #[cfg(test)]
 mod tests {
-    use super::{CHUNK_SIZE, Chunk, ChunkCoord, IncrementalLightingStepLimits, World};
+    use super::{
+        CHUNK_SIZE, Chunk, ChunkCoord, IncrementalLightingStepLimits,
+        LocalizedLightingRepairStepLimits, World,
+    };
     use crate::blocks::BlockId;
     use glam::IVec3;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn incremental_chunk_add_matches_full_rebuild_across_chunk_edge() {
@@ -258,6 +263,136 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn localized_block_repair_matches_full_rebuild_across_edit_types() {
+        let mut incremental = World::new();
+        let mut baseline = World::new();
+        let coords = [
+            ChunkCoord { x: 0, y: 0, z: 0 },
+            ChunkCoord { x: 1, y: 0, z: 0 },
+        ];
+
+        for &coord in &coords {
+            incremental.chunks.insert(coord, Chunk::new_empty());
+            baseline.chunks.insert(coord, Chunk::new_empty());
+        }
+        let _ = incremental.lighting_on_chunks_added(&coords);
+        baseline.rebuild_loaded_lighting();
+
+        let edits = [
+            (
+                IVec3::new(CHUNK_SIZE - 1, 10, 8),
+                BlockId::Air,
+                BlockId::Cobblestone,
+            ),
+            (IVec3::new(1, 12, 1), BlockId::Air, BlockId::LavaStill),
+            (IVec3::new(2, 14, 2), BlockId::Air, BlockId::Dandelion),
+        ];
+
+        for &(pos, _old, new) in &edits {
+            let coord = World::world_to_chunk_coord(pos);
+            let local = World::world_to_local(pos);
+            incremental
+                .chunks
+                .get_mut(&coord)
+                .expect("incremental chunk missing for edit")
+                .set(local.x, local.y, local.z, new);
+            baseline
+                .chunks
+                .get_mut(&coord)
+                .expect("baseline chunk missing for edit")
+                .set(local.x, local.y, local.z, new);
+        }
+
+        let classified = edits
+            .iter()
+            .map(|&(pos, old, new)| incremental.classify_block_change_lighting(pos, old, new))
+            .filter(|change| !change.flags.is_geometry_only())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            classified.len(),
+            2,
+            "expected one geometry-only edit to skip lighting"
+        );
+
+        let enqueue_started = Instant::now();
+        let mut task = incremental
+            .begin_localized_block_lighting_repair_task(&classified)
+            .expect("expected localized repair task");
+        let enqueue_ms = enqueue_started.elapsed().as_secs_f64() * 1000.0;
+        let limits = LocalizedLightingRepairStepLimits {
+            max_voxels_visited: 64,
+            max_wall_clock: Duration::from_millis(1),
+        };
+        let repair_started = Instant::now();
+        let mut max_step_ms = 0.0f64;
+        let mut guard = 0usize;
+        while !task.is_complete() {
+            let step_started = Instant::now();
+            let step = incremental.step_localized_block_lighting_repair_task(&mut task, limits);
+            max_step_ms = max_step_ms.max(step_started.elapsed().as_secs_f64() * 1000.0);
+            guard += 1;
+            assert!(
+                step.stats.voxels_visited > 0 || step.complete,
+                "repair step should make progress"
+            );
+            assert!(guard < 2048, "localized repair failed to converge");
+        }
+        let repair_ms = repair_started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "[perf][lighting][localized_test] enqueue_ms={enqueue_ms:.3} total_ms={repair_ms:.3} max_step_ms={max_step_ms:.3} steps={guard}"
+        );
+
+        baseline.rebuild_loaded_lighting();
+        for &coord in &coords {
+            let incremental_light = incremental
+                .get_chunk(coord)
+                .expect("incremental chunk missing after repair")
+                .light
+                .as_slice();
+            let baseline_light = baseline
+                .get_chunk(coord)
+                .expect("baseline chunk missing after rebuild")
+                .light
+                .as_slice();
+            if incremental_light != baseline_light {
+                let first_diff = incremental_light
+                    .iter()
+                    .zip(baseline_light.iter())
+                    .enumerate()
+                    .find(|(_, (left, right))| left != right)
+                    .map(|(idx, (left, right))| (idx, *left, *right));
+                panic!(
+                    "lighting mismatch for chunk {:?}, first_diff={:?}",
+                    coord, first_diff
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn geometry_only_block_change_skips_localized_repair() {
+        let mut world = World::new();
+        let coord = ChunkCoord { x: 0, y: 0, z: 0 };
+        world.chunks.insert(coord, Chunk::new_empty());
+        let pos = IVec3::new(4, 10, 4);
+
+        world
+            .chunks
+            .get_mut(&coord)
+            .expect("chunk missing")
+            .set(4, 10, 4, BlockId::Dandelion);
+        let classified =
+            world.classify_block_change_lighting(pos, BlockId::Air, BlockId::Dandelion);
+        assert!(classified.flags.is_geometry_only());
+        assert!(
+            world
+                .begin_localized_block_lighting_repair_task(&[classified])
+                .is_none(),
+            "geometry-only edits should not enqueue lighting work"
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -364,6 +499,497 @@ pub(crate) struct LightingBlockChange {
     pub(crate) pos: IVec3,
     pub(crate) old: BlockId,
     pub(crate) new: BlockId,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct BlockChangeLightingFlags(u8);
+
+impl BlockChangeLightingFlags {
+    pub(crate) const NONE: Self = Self(0);
+    pub(crate) const OPACITY_CLASS: Self = Self(1 << 0);
+    pub(crate) const SKYLIGHT_COLUMN: Self = Self(1 << 1);
+    pub(crate) const BLOCK_LIGHT_SOURCE: Self = Self(1 << 2);
+
+    pub(crate) const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    pub(crate) const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub(crate) const fn is_geometry_only(self) -> bool {
+        self.is_empty()
+    }
+}
+
+impl std::ops::BitOr for BlockChangeLightingFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for BlockChangeLightingFlags {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClassifiedLightingBlockChange {
+    pub(crate) change: LightingBlockChange,
+    pub(crate) flags: BlockChangeLightingFlags,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LocalizedLightingRepairStats {
+    pub(crate) affected_chunks: usize,
+    pub(crate) voxels_visited: u64,
+    pub(crate) changed_voxels: u64,
+    pub(crate) sky_nodes_queued: u64,
+    pub(crate) block_nodes_queued: u64,
+    pub(crate) sky_queue_visits: u64,
+    pub(crate) block_queue_visits: u64,
+    pub(crate) skylight_columns_seeded: u64,
+    pub(crate) opacity_class_changes: u64,
+    pub(crate) skylight_column_changes: u64,
+    pub(crate) block_light_source_changes: u64,
+}
+
+impl LocalizedLightingRepairStats {
+    fn accumulate(&mut self, other: &Self) {
+        self.affected_chunks = self.affected_chunks.max(other.affected_chunks);
+        self.voxels_visited = self.voxels_visited.saturating_add(other.voxels_visited);
+        self.changed_voxels = self.changed_voxels.saturating_add(other.changed_voxels);
+        self.sky_nodes_queued = self.sky_nodes_queued.saturating_add(other.sky_nodes_queued);
+        self.block_nodes_queued = self
+            .block_nodes_queued
+            .saturating_add(other.block_nodes_queued);
+        self.sky_queue_visits = self.sky_queue_visits.saturating_add(other.sky_queue_visits);
+        self.block_queue_visits = self
+            .block_queue_visits
+            .saturating_add(other.block_queue_visits);
+        self.skylight_columns_seeded = self
+            .skylight_columns_seeded
+            .saturating_add(other.skylight_columns_seeded);
+        self.opacity_class_changes = self
+            .opacity_class_changes
+            .saturating_add(other.opacity_class_changes);
+        self.skylight_column_changes = self
+            .skylight_column_changes
+            .saturating_add(other.skylight_column_changes);
+        self.block_light_source_changes = self
+            .block_light_source_changes
+            .saturating_add(other.block_light_source_changes);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LocalizedLightingRepairStepLimits {
+    pub(crate) max_voxels_visited: u64,
+    pub(crate) max_wall_clock: Duration,
+}
+
+impl Default for LocalizedLightingRepairStepLimits {
+    fn default() -> Self {
+        Self {
+            max_voxels_visited: 8_192,
+            max_wall_clock: Duration::from_millis(1),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LocalizedLightingRepairStepResult {
+    pub(crate) complete: bool,
+    pub(crate) stats: LocalizedLightingRepairStats,
+}
+
+#[derive(Debug)]
+pub(crate) struct LocalizedLightingRepairTask {
+    sky_queue: VecDeque<IVec3>,
+    block_queue: VecDeque<IVec3>,
+    queued_sky: HashSet<IVec3>,
+    queued_block: HashSet<IVec3>,
+    affected_chunks: HashSet<ChunkCoord>,
+    total_stats: LocalizedLightingRepairStats,
+}
+
+impl LocalizedLightingRepairTask {
+    fn new(world: &World, changes: &[ClassifiedLightingBlockChange]) -> Option<Self> {
+        let mut task = Self {
+            sky_queue: VecDeque::new(),
+            block_queue: VecDeque::new(),
+            queued_sky: HashSet::new(),
+            queued_block: HashSet::new(),
+            affected_chunks: HashSet::new(),
+            total_stats: LocalizedLightingRepairStats::default(),
+        };
+        let mut seeded_any = false;
+        for change in changes {
+            let pos = change.change.pos;
+            if change
+                .flags
+                .contains(BlockChangeLightingFlags::OPACITY_CLASS)
+            {
+                task.total_stats.opacity_class_changes =
+                    task.total_stats.opacity_class_changes.saturating_add(1);
+                seeded_any |= task.seed_local_neighborhood(world, pos, true, true);
+            }
+            if change
+                .flags
+                .contains(BlockChangeLightingFlags::SKYLIGHT_COLUMN)
+            {
+                task.total_stats.skylight_column_changes =
+                    task.total_stats.skylight_column_changes.saturating_add(1);
+                seeded_any |= task.seed_skylight_column(world, pos.x, pos.z);
+            }
+            if change
+                .flags
+                .contains(BlockChangeLightingFlags::BLOCK_LIGHT_SOURCE)
+            {
+                task.total_stats.block_light_source_changes = task
+                    .total_stats
+                    .block_light_source_changes
+                    .saturating_add(1);
+                seeded_any |= task.seed_local_neighborhood(world, pos, false, true);
+            }
+        }
+        if seeded_any { Some(task) } else { None }
+    }
+
+    pub(crate) fn pending_queue_len(&self) -> usize {
+        self.sky_queue.len() + self.block_queue.len()
+    }
+
+    pub(crate) fn total_stats(&self) -> LocalizedLightingRepairStats {
+        self.total_stats
+    }
+
+    pub(crate) fn is_complete(&self) -> bool {
+        self.sky_queue.is_empty() && self.block_queue.is_empty()
+    }
+
+    pub(crate) fn affected_chunks(&self) -> Vec<ChunkCoord> {
+        self.affected_chunks.iter().copied().collect()
+    }
+
+    fn step(
+        &mut self,
+        world: &mut World,
+        limits: LocalizedLightingRepairStepLimits,
+    ) -> LocalizedLightingRepairStepResult {
+        let started = Instant::now();
+        let max_voxels_visited = limits.max_voxels_visited.max(1);
+        let max_wall_clock = if limits.max_wall_clock.is_zero() {
+            Duration::from_micros(1)
+        } else {
+            limits.max_wall_clock
+        };
+        let mut step_stats = LocalizedLightingRepairStats::default();
+
+        while started.elapsed() < max_wall_clock && step_stats.voxels_visited < max_voxels_visited {
+            let next = if let Some(pos) = self.sky_queue.pop_front() {
+                self.queued_sky.remove(&pos);
+                Some((pos, true))
+            } else if let Some(pos) = self.block_queue.pop_front() {
+                self.queued_block.remove(&pos);
+                Some((pos, false))
+            } else {
+                None
+            };
+
+            let Some((pos, sky)) = next else {
+                break;
+            };
+            if sky {
+                step_stats.sky_queue_visits = step_stats.sky_queue_visits.saturating_add(1);
+                self.recompute_skylight_at(world, pos, &mut step_stats);
+            } else {
+                step_stats.block_queue_visits = step_stats.block_queue_visits.saturating_add(1);
+                self.recompute_blocklight_at(world, pos, &mut step_stats);
+            }
+        }
+
+        step_stats.affected_chunks = self.affected_chunks.len();
+        self.total_stats.accumulate(&step_stats);
+        self.total_stats.affected_chunks = self.affected_chunks.len();
+        LocalizedLightingRepairStepResult {
+            complete: self.is_complete(),
+            stats: step_stats,
+        }
+    }
+
+    fn seed_local_neighborhood(
+        &mut self,
+        world: &World,
+        pos: IVec3,
+        sky: bool,
+        block: bool,
+    ) -> bool {
+        const DIRS: [IVec3; 7] = [
+            IVec3::new(0, 0, 0),
+            IVec3::new(1, 0, 0),
+            IVec3::new(-1, 0, 0),
+            IVec3::new(0, 1, 0),
+            IVec3::new(0, -1, 0),
+            IVec3::new(0, 0, 1),
+            IVec3::new(0, 0, -1),
+        ];
+        let mut seeded = false;
+        for dir in DIRS {
+            let sample = pos + dir;
+            if sky {
+                seeded |= self.enqueue_sky(world, sample);
+            }
+            if block {
+                seeded |= self.enqueue_block(world, sample);
+            }
+        }
+        seeded
+    }
+
+    fn seed_skylight_column(&mut self, world: &World, wx: i32, wz: i32) -> bool {
+        let mut seeded = false;
+        for chunk_y in world.min_chunk_y()..=world.max_chunk_y() {
+            let coord = ChunkCoord {
+                x: wx.div_euclid(CHUNK_SIZE),
+                y: chunk_y,
+                z: wz.div_euclid(CHUNK_SIZE),
+            };
+            if !world.chunks.contains_key(&coord) {
+                continue;
+            }
+            let local_x = wx.rem_euclid(CHUNK_SIZE);
+            let local_z = wz.rem_euclid(CHUNK_SIZE);
+            let base_y = coord.y * CHUNK_SIZE;
+            for local_y in 0..CHUNK_SIZE {
+                seeded |= self.enqueue_sky(world, IVec3::new(wx, base_y + local_y, wz));
+                // Seed horizontal neighbors so reopened/closed shafts repair edge bleed promptly.
+                seeded |= self.enqueue_sky(world, IVec3::new(wx - 1, base_y + local_y, wz));
+                seeded |= self.enqueue_sky(world, IVec3::new(wx + 1, base_y + local_y, wz));
+                seeded |= self.enqueue_sky(world, IVec3::new(wx, base_y + local_y, wz - 1));
+                seeded |= self.enqueue_sky(world, IVec3::new(wx, base_y + local_y, wz + 1));
+            }
+            let _ = (local_x, local_z);
+        }
+        if seeded {
+            self.total_stats.skylight_columns_seeded =
+                self.total_stats.skylight_columns_seeded.saturating_add(1);
+        }
+        seeded
+    }
+
+    fn enqueue_sky(&mut self, world: &World, pos: IVec3) -> bool {
+        if !World::in_bounds(pos) {
+            return false;
+        }
+        let coord = World::world_to_chunk_coord(pos);
+        if !world.chunks.contains_key(&coord) {
+            return false;
+        }
+        if self.queued_sky.insert(pos) {
+            self.sky_queue.push_back(pos);
+            self.total_stats.sky_nodes_queued = self.total_stats.sky_nodes_queued.saturating_add(1);
+            return true;
+        }
+        false
+    }
+
+    fn enqueue_block(&mut self, world: &World, pos: IVec3) -> bool {
+        if !World::in_bounds(pos) {
+            return false;
+        }
+        let coord = World::world_to_chunk_coord(pos);
+        if !world.chunks.contains_key(&coord) {
+            return false;
+        }
+        if self.queued_block.insert(pos) {
+            self.block_queue.push_back(pos);
+            self.total_stats.block_nodes_queued =
+                self.total_stats.block_nodes_queued.saturating_add(1);
+            return true;
+        }
+        false
+    }
+
+    fn recompute_skylight_at(
+        &mut self,
+        world: &mut World,
+        pos: IVec3,
+        stats: &mut LocalizedLightingRepairStats,
+    ) {
+        let Some(current) = Self::loaded_light(world, pos) else {
+            return;
+        };
+        let desired = Self::desired_skylight(world, pos);
+        stats.voxels_visited = stats.voxels_visited.saturating_add(1);
+        if current.sky == desired {
+            return;
+        }
+        world.set_light_packed(pos, LightLevel::new(desired, current.block).pack());
+        stats.changed_voxels = stats.changed_voxels.saturating_add(1);
+        self.affected_chunks
+            .insert(World::world_to_chunk_coord(pos));
+        self.enqueue_sky_neighbors(world, pos);
+    }
+
+    fn recompute_blocklight_at(
+        &mut self,
+        world: &mut World,
+        pos: IVec3,
+        stats: &mut LocalizedLightingRepairStats,
+    ) {
+        let Some(current) = Self::loaded_light(world, pos) else {
+            return;
+        };
+        let desired = Self::desired_blocklight(world, pos);
+        stats.voxels_visited = stats.voxels_visited.saturating_add(1);
+        if current.block == desired {
+            return;
+        }
+        world.set_light_packed(pos, LightLevel::new(current.sky, desired).pack());
+        stats.changed_voxels = stats.changed_voxels.saturating_add(1);
+        self.affected_chunks
+            .insert(World::world_to_chunk_coord(pos));
+        self.enqueue_block_neighbors(world, pos);
+    }
+
+    fn enqueue_sky_neighbors(&mut self, world: &World, pos: IVec3) {
+        for dir in [
+            IVec3::new(1, 0, 0),
+            IVec3::new(-1, 0, 0),
+            IVec3::new(0, 1, 0),
+            IVec3::new(0, -1, 0),
+            IVec3::new(0, 0, 1),
+            IVec3::new(0, 0, -1),
+        ] {
+            let _ = self.enqueue_sky(world, pos + dir);
+        }
+    }
+
+    fn enqueue_block_neighbors(&mut self, world: &World, pos: IVec3) {
+        for dir in [
+            IVec3::new(1, 0, 0),
+            IVec3::new(-1, 0, 0),
+            IVec3::new(0, 1, 0),
+            IVec3::new(0, -1, 0),
+            IVec3::new(0, 0, 1),
+            IVec3::new(0, 0, -1),
+        ] {
+            let _ = self.enqueue_block(world, pos + dir);
+        }
+    }
+
+    fn loaded_light(world: &World, pos: IVec3) -> Option<LightLevel> {
+        if !World::in_bounds(pos) {
+            return None;
+        }
+        let coord = World::world_to_chunk_coord(pos);
+        let local = World::world_to_local(pos);
+        world
+            .chunks
+            .get(&coord)
+            .map(|chunk| chunk.get_light(local.x, local.y, local.z))
+    }
+
+    fn desired_skylight(world: &World, pos: IVec3) -> u8 {
+        let block = world.get_block(pos);
+        if block.blocks_skylight() {
+            return 0;
+        }
+
+        let mut best = 0;
+        if Self::loaded_skylight_seed_y(world, pos.x, pos.z).is_some_and(|seed_y| seed_y == pos.y) {
+            best = 15;
+        }
+        let above = pos + IVec3::Y;
+        if let Some(light) = Self::loaded_light(world, above) {
+            best = best.max(light.sky);
+        }
+
+        for dir in [
+            IVec3::new(1, 0, 0),
+            IVec3::new(-1, 0, 0),
+            IVec3::new(0, -1, 0),
+            IVec3::new(0, 0, 1),
+            IVec3::new(0, 0, -1),
+        ] {
+            let npos = pos + dir;
+            if npos.y < 0 || npos.y > WORLD_MAX_Y {
+                continue;
+            }
+            let Some(light) = Self::loaded_light(world, npos) else {
+                continue;
+            };
+            best = best.max(light.sky.saturating_sub(1));
+        }
+        best
+    }
+
+    fn loaded_skylight_seed_y(world: &World, wx: i32, wz: i32) -> Option<i32> {
+        let chunk_x = wx.div_euclid(CHUNK_SIZE);
+        let chunk_z = wz.div_euclid(CHUNK_SIZE);
+        let local_x = wx.rem_euclid(CHUNK_SIZE);
+        let local_z = wz.rem_euclid(CHUNK_SIZE);
+        let mut top_loaded_chunk_y: Option<i32> = None;
+        let mut top_blocker_world_y = i32::MIN;
+
+        for chunk_y in world.min_chunk_y()..=world.max_chunk_y() {
+            let coord = ChunkCoord {
+                x: chunk_x,
+                y: chunk_y,
+                z: chunk_z,
+            };
+            let Some(chunk) = world.chunks.get(&coord) else {
+                continue;
+            };
+            top_loaded_chunk_y = Some(top_loaded_chunk_y.map_or(chunk_y, |top| top.max(chunk_y)));
+            for local_y in (0..CHUNK_SIZE).rev() {
+                if chunk.get(local_x, local_y, local_z).blocks_skylight() {
+                    top_blocker_world_y = top_blocker_world_y.max(chunk_y * CHUNK_SIZE + local_y);
+                    break;
+                }
+            }
+        }
+
+        let top_loaded_chunk_y = top_loaded_chunk_y?;
+        Some(if top_blocker_world_y == i32::MIN {
+            top_loaded_chunk_y * CHUNK_SIZE + (CHUNK_SIZE - 1)
+        } else {
+            top_blocker_world_y + 1
+        })
+    }
+
+    fn desired_blocklight(world: &World, pos: IVec3) -> u8 {
+        let block = world.get_block(pos);
+        let emitted = block.emitted_light();
+        if block.blocks_skylight() {
+            return emitted;
+        }
+
+        let mut best = emitted;
+        for dir in [
+            IVec3::new(1, 0, 0),
+            IVec3::new(-1, 0, 0),
+            IVec3::new(0, 1, 0),
+            IVec3::new(0, -1, 0),
+            IVec3::new(0, 0, 1),
+            IVec3::new(0, 0, -1),
+        ] {
+            let npos = pos + dir;
+            if npos.y < 0 || npos.y > WORLD_MAX_Y {
+                continue;
+            }
+            let Some(light) = Self::loaded_light(world, npos) else {
+                continue;
+            };
+            best = best.max(light.block.saturating_sub(1));
+        }
+        best
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2173,6 +2799,63 @@ impl World {
         task: &mut IncrementalLightingTask,
         limits: IncrementalLightingStepLimits,
     ) -> IncrementalLightingStepResult {
+        task.step(self, limits)
+    }
+
+    fn column_open_to_sky_with_override(&self, pos: IVec3, override_block: BlockId) -> bool {
+        if !World::in_bounds(pos) {
+            return false;
+        }
+        for y in pos.y..=WORLD_MAX_Y {
+            let sample_pos = IVec3::new(pos.x, y, pos.z);
+            let block = if y == pos.y {
+                override_block
+            } else {
+                self.get_block(sample_pos)
+            };
+            if block.blocks_skylight() {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub(crate) fn classify_block_change_lighting(
+        &self,
+        pos: IVec3,
+        old: BlockId,
+        new: BlockId,
+    ) -> ClassifiedLightingBlockChange {
+        let mut flags = BlockChangeLightingFlags::NONE;
+        if old != new && old.blocks_skylight() != new.blocks_skylight() {
+            flags |= BlockChangeLightingFlags::OPACITY_CLASS;
+            let before_open = self.column_open_to_sky_with_override(pos, old);
+            let after_open = self.column_open_to_sky_with_override(pos, new);
+            if before_open != after_open {
+                flags |= BlockChangeLightingFlags::SKYLIGHT_COLUMN;
+            }
+        }
+        if old.emitted_light() != new.emitted_light() {
+            flags |= BlockChangeLightingFlags::BLOCK_LIGHT_SOURCE;
+        }
+        ClassifiedLightingBlockChange {
+            change: LightingBlockChange { pos, old, new },
+            flags,
+        }
+    }
+
+    pub(crate) fn begin_localized_block_lighting_repair_task(
+        &self,
+        changes: &[ClassifiedLightingBlockChange],
+    ) -> Option<LocalizedLightingRepairTask> {
+        LocalizedLightingRepairTask::new(self, changes)
+    }
+
+    pub(crate) fn step_localized_block_lighting_repair_task(
+        &mut self,
+        task: &mut LocalizedLightingRepairTask,
+        limits: LocalizedLightingRepairStepLimits,
+    ) -> LocalizedLightingRepairStepResult {
         task.step(self, limits)
     }
 

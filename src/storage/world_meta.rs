@@ -8,6 +8,7 @@ use crate::storage::format::{
     BLOCK_ID_MAPPING_VERSION, WORLD_META_FORMAT_VERSION, WORLD_META_MAGIC,
 };
 use crate::world::CHUNK_SIZE;
+use crate::world::WorldEnvironment;
 use crate::worldgen::WorldgenPreset;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,6 +22,7 @@ pub(crate) struct WorldMeta {
     pub(crate) chunk_size: i32,
     pub(crate) boundary_ocean: bool,
     pub(crate) boundary_radius_chunks: i32,
+    pub(crate) environment: WorldEnvironment,
     pub(crate) block_id_version: u16,
     pub(crate) save_format_version: u16,
     pub(crate) block_registry_hash: Option<String>,
@@ -36,6 +38,7 @@ impl WorldMeta {
         chunk_size: i32,
         boundary_ocean: bool,
         boundary_radius_chunks: i32,
+        environment: WorldEnvironment,
     ) -> io::Result<Self> {
         let meta = Self {
             format_version: WORLD_META_FORMAT_VERSION,
@@ -47,6 +50,7 @@ impl WorldMeta {
             chunk_size,
             boundary_ocean,
             boundary_radius_chunks,
+            environment,
             block_id_version: BLOCK_ID_MAPPING_VERSION,
             save_format_version: 2,
             block_registry_hash: None,
@@ -71,6 +75,8 @@ struct WorldMetaWire {
     boundary_ocean: bool,
     #[serde(default = "default_boundary_radius_chunks")]
     boundary_radius_chunks: i32,
+    #[serde(default = "default_world_environment")]
+    environment: String,
     block_id_version: u16,
     #[serde(default = "default_save_format_version")]
     save_format_version: u16,
@@ -96,6 +102,7 @@ pub(crate) fn save_atomic(path: &Path, meta: &WorldMeta) -> io::Result<()> {
         chunk_size: meta.chunk_size,
         boundary_ocean: meta.boundary_ocean,
         boundary_radius_chunks: meta.boundary_radius_chunks,
+        environment: meta.environment.meta_key().to_string(),
         block_id_version: meta.block_id_version,
         save_format_version: meta.save_format_version,
         block_registry_hash: meta.block_registry_hash.clone(),
@@ -148,6 +155,12 @@ pub(crate) fn load(path: &Path) -> io::Result<Option<WorldMeta>> {
             format!("unsupported world.meta preset '{}'", wire.preset),
         )
     })?;
+    let environment = WorldEnvironment::from_meta_key(&wire.environment).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported world.meta environment '{}'", wire.environment),
+        )
+    })?;
 
     let meta = WorldMeta {
         format_version: wire.format_version,
@@ -159,6 +172,7 @@ pub(crate) fn load(path: &Path) -> io::Result<Option<WorldMeta>> {
         chunk_size: wire.chunk_size,
         boundary_ocean: wire.boundary_ocean,
         boundary_radius_chunks: wire.boundary_radius_chunks,
+        environment,
         block_id_version: wire.block_id_version,
         save_format_version: wire.save_format_version,
         block_registry_hash: wire.block_registry_hash,
@@ -260,6 +274,10 @@ fn default_boundary_radius_chunks() -> i32 {
     128
 }
 
+fn default_world_environment() -> String {
+    WorldEnvironment::Temperate.meta_key().to_string()
+}
+
 fn tmp_path_for(path: &Path) -> io::Result<PathBuf> {
     let file_name = path.file_name().ok_or_else(|| {
         io::Error::new(
@@ -294,6 +312,7 @@ fn preset_from_str(value: &str) -> Option<WorldgenPreset> {
 #[cfg(test)]
 mod tests {
     use super::{WorldMeta, load, save_atomic};
+    use crate::world::WorldEnvironment;
     use crate::worldgen::WorldgenPreset;
     use std::fs;
     use std::io;
@@ -310,7 +329,18 @@ mod tests {
     #[test]
     fn roundtrips_world_meta() {
         let path = temp_meta_path();
-        let meta = WorldMeta::new(1234, WorldgenPreset::Hilly, 64, 0, 255, 16, false, 128).unwrap();
+        let meta = WorldMeta::new(
+            1234,
+            WorldgenPreset::Hilly,
+            64,
+            0,
+            255,
+            16,
+            false,
+            128,
+            WorldEnvironment::Temperate,
+        )
+        .unwrap();
         save_atomic(&path, &meta).unwrap();
         let loaded = load(&path).unwrap().unwrap();
         assert_eq!(loaded, meta);
@@ -341,6 +371,33 @@ mod tests {
 
         let err = load(&path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_world_meta_defaults_environment_to_temperate() {
+        let path = temp_meta_path();
+        fs::write(
+            &path,
+            r#"{
+  "magic":"MKWM",
+  "format_version":1,
+  "world_seed":99,
+  "preset":"classic_flatter",
+  "sea_level":64,
+  "min_y":0,
+  "max_y":255,
+  "chunk_size":16,
+  "boundary_ocean":true,
+  "boundary_radius_chunks":16,
+  "block_id_version":1,
+  "save_format_version":1
+}"#,
+        )
+        .unwrap();
+
+        let loaded = load(&path).unwrap().unwrap();
+        assert_eq!(loaded.environment, WorldEnvironment::Temperate);
         let _ = fs::remove_file(path);
     }
 }

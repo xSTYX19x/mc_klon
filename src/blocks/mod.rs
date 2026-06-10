@@ -27,6 +27,8 @@ pub(crate) const TEX_OAK_LOG_SIDE: &str = "minecraft:textures/block/oak_log.png"
 pub(crate) const TEX_OAK_LOG_TOP: &str = "minecraft:textures/block/oak_log_top.png";
 pub(crate) const TEX_OAK_LEAVES: &str = "minecraft:textures/block/oak_leaves.png";
 pub(crate) const TEX_GLASS: &str = "minecraft:textures/block/glass.png";
+pub(crate) const TEX_ICE: &str = "minecraft:textures/block/ice.png";
+pub(crate) const TEX_SNOW: &str = "minecraft:textures/block/snow.png";
 pub(crate) const TEX_STONE_SLAB_TOP: &str = "minecraft:textures/block/smooth_stone.png";
 pub(crate) const TEX_STONE_SLAB_SIDE: &str = "minecraft:textures/block/smooth_stone_slab_side.png";
 pub(crate) const TEX_MOSSY_COBBLESTONE: &str = "minecraft:textures/block/mossy_cobblestone.png";
@@ -130,6 +132,8 @@ pub(crate) enum BlockId {
     GreenWool = 46,
     RedWool = 47,
     BlackWool = 48,
+    Ice = 49,
+    Snow = 50,
 }
 
 pub(crate) const HOTBAR: [BlockId; 9] = [
@@ -253,6 +257,7 @@ pub(crate) enum BlockModel {
     Cube,
     CrossPlant,
     SlabBottom,
+    LayerBottom { height_px: u8 },
     Liquid { kind: FluidKind },
 }
 
@@ -288,6 +293,7 @@ impl BlockAabb {
 
 const FULL_CUBE_AABB: BlockAabb = BlockAabb::from_pixels([0, 0, 0], [16, 16, 16]);
 const LOWER_SLAB_AABB: BlockAabb = BlockAabb::from_pixels([0, 0, 0], [16, 8, 16]);
+const SNOW_LAYER_AABB: BlockAabb = BlockAabb::from_pixels([0, 0, 0], [16, 2, 16]);
 // Shared plant selection box: slightly inset from the block edges and one pixel shy of full height.
 const CROSS_PLANT_SELECTION_AABB: BlockAabb = BlockAabb::from_pixels([1, 0, 1], [15, 15, 15]);
 
@@ -427,6 +433,12 @@ enum BlockModelSpec {
         side: TextureKey,
         bottom: TextureKey,
     },
+    LayerBottomTopSideBottom {
+        height_px: u8,
+        top: TextureKey,
+        side: TextureKey,
+        bottom: TextureKey,
+    },
     GrassTopSideBottom {
         top: TextureKey,
         side: TextureKey,
@@ -501,6 +513,13 @@ impl BlockSpec {
         }
         match self.model {
             BlockModelSpec::SlabBottomTopSideBottom { .. } => CollisionShape::SlabBottom,
+            BlockModelSpec::LayerBottomTopSideBottom { height_px, .. } => {
+                if height_px == 2 {
+                    CollisionShape::Aabb(SNOW_LAYER_AABB)
+                } else {
+                    CollisionShape::Aabb(BlockAabb::from_pixels([0, 0, 0], [16, height_px, 16]))
+                }
+            }
             _ => CollisionShape::FullCube,
         }
     }
@@ -509,6 +528,13 @@ impl BlockSpec {
         match self.model {
             BlockModelSpec::None => CollisionShape::Empty,
             BlockModelSpec::SlabBottomTopSideBottom { .. } => CollisionShape::SlabBottom,
+            BlockModelSpec::LayerBottomTopSideBottom { height_px, .. } => {
+                if height_px == 2 {
+                    CollisionShape::Aabb(SNOW_LAYER_AABB)
+                } else {
+                    CollisionShape::Aabb(BlockAabb::from_pixels([0, 0, 0], [16, height_px, 16]))
+                }
+            }
             BlockModelSpec::PlantCross { .. } => CollisionShape::Aabb(CROSS_PLANT_SELECTION_AABB),
             _ => CollisionShape::FullCube,
         }
@@ -576,6 +602,22 @@ impl BlockSpec {
                     cull_group,
                 )
             }
+            BlockModelSpec::LayerBottomTopSideBottom {
+                height_px,
+                top,
+                side,
+                bottom,
+            } => BlockDef::layer_bottom_top_side_bottom(
+                height_px,
+                top,
+                side,
+                bottom,
+                self.solid,
+                self.breakable,
+                self.face_occluding,
+                self.render_layer,
+                cull_group,
+            ),
             BlockModelSpec::LiquidTopSideBottom {
                 kind,
                 top,
@@ -626,7 +668,7 @@ const COBBLESTONE_KEY_ALIASES: [&str; 1] = ["core:cobblestone"];
 const OBSIDIAN_KEY_ALIASES: [&str; 1] = ["core:obsidian"];
 const SAND_KEY_ALIASES: [&str; 1] = ["core:sand"];
 
-const BLOCK_SPECS: [BlockSpec; 49] = [
+const BLOCK_SPECS: [BlockSpec; 51] = [
     BlockSpec {
         id: 0,
         variant: BlockId::Air,
@@ -1642,6 +1684,49 @@ const BLOCK_SPECS: [BlockSpec; 49] = [
         block_entity: None,
         random_tick: None,
     },
+    BlockSpec {
+        id: 49,
+        variant: BlockId::Ice,
+        key: "minecraft:ice",
+        key_aliases: &[],
+        display_name: "Ice",
+        model: BlockModelSpec::CubeAll { all: TEX_ICE },
+        render_layer: RenderLayer::Transparent,
+        cull_group: CullGroupSpec::SelfBlock,
+        face_occluding: false,
+        solid: true,
+        blocks_skylight: false,
+        breakable: true,
+        emitted_light: 0,
+        particle_color: [0.74, 0.86, 0.96],
+        face_tint: FaceTintSpec::None,
+        block_entity: None,
+        random_tick: None,
+    },
+    BlockSpec {
+        id: 50,
+        variant: BlockId::Snow,
+        key: "minecraft:snow",
+        key_aliases: &[],
+        display_name: "Snow",
+        model: BlockModelSpec::LayerBottomTopSideBottom {
+            height_px: 2,
+            top: TEX_SNOW,
+            side: TEX_SNOW,
+            bottom: TEX_SNOW,
+        },
+        render_layer: RenderLayer::Opaque,
+        cull_group: CullGroupSpec::SelfBlock,
+        face_occluding: false,
+        solid: true,
+        blocks_skylight: false,
+        breakable: true,
+        emitted_light: 0,
+        particle_color: [0.96, 0.97, 1.0],
+        face_tint: FaceTintSpec::None,
+        block_entity: None,
+        random_tick: None,
+    },
 ];
 
 #[inline(always)]
@@ -1810,6 +1895,36 @@ impl BlockDef {
         }
     }
 
+    const fn layer_bottom_top_side_bottom(
+        height_px: u8,
+        top: TextureKey,
+        side: TextureKey,
+        bottom: TextureKey,
+        solid: bool,
+        breakable: bool,
+        face_occluding: bool,
+        render_layer: RenderLayer,
+        cull_group: CullGroup,
+    ) -> Self {
+        let mut textures = [side; 6];
+        textures[Face::Up.as_usize()] = top;
+        textures[Face::Down.as_usize()] = bottom;
+        Self {
+            model: BlockModel::LayerBottom { height_px },
+            textures,
+            face_tint_kinds: [TINT_NONE; 6],
+            plant_texture: None,
+            occlusion_shape: OcclusionShape::Decorative,
+            block_entity: None,
+            random_tick: None,
+            solid,
+            breakable,
+            face_occluding,
+            render_layer,
+            cull_group,
+        }
+    }
+
     const fn plant_cross(key: TextureKey) -> Self {
         Self {
             model: BlockModel::CrossPlant,
@@ -1877,9 +1992,10 @@ impl BlockDef {
 
     fn texture_for(&self, face: Face) -> TextureKey {
         match self.model {
-            BlockModel::Cube | BlockModel::SlabBottom | BlockModel::Liquid { .. } => {
-                self.textures[face.as_usize()]
-            }
+            BlockModel::Cube
+            | BlockModel::SlabBottom
+            | BlockModel::LayerBottom { .. }
+            | BlockModel::Liquid { .. } => self.textures[face.as_usize()],
             BlockModel::CrossPlant => self
                 .plant_texture
                 .expect("CrossPlant BlockDef missing plant texture"),
@@ -1888,9 +2004,10 @@ impl BlockDef {
 
     fn tint_kind_for(&self, face: Face) -> u32 {
         match self.model {
-            BlockModel::Cube | BlockModel::SlabBottom | BlockModel::Liquid { .. } => {
-                self.face_tint_kinds[face.as_usize()]
-            }
+            BlockModel::Cube
+            | BlockModel::SlabBottom
+            | BlockModel::LayerBottom { .. }
+            | BlockModel::Liquid { .. } => self.face_tint_kinds[face.as_usize()],
             BlockModel::CrossPlant => TINT_NONE,
         }
     }
@@ -2023,7 +2140,10 @@ impl BlockRegistry {
         let mut keys: HashSet<String> = HashSet::new();
         for def in self.defs.values() {
             match def.model {
-                BlockModel::Cube | BlockModel::SlabBottom | BlockModel::Liquid { .. } => {
+                BlockModel::Cube
+                | BlockModel::SlabBottom
+                | BlockModel::LayerBottom { .. }
+                | BlockModel::Liquid { .. } => {
                     for key in def.textures {
                         keys.insert(key.to_string());
                     }
@@ -2150,9 +2270,10 @@ impl BlockTextureLookup {
     #[inline(always)]
     pub(crate) fn layer_for_info(&self, info: BlockTextureInfo, face: Face) -> u32 {
         match info.model {
-            BlockModel::Cube | BlockModel::SlabBottom | BlockModel::Liquid { .. } => {
-                info.cube_layers.layer_for_face(face)
-            }
+            BlockModel::Cube
+            | BlockModel::SlabBottom
+            | BlockModel::LayerBottom { .. }
+            | BlockModel::Liquid { .. } => info.cube_layers.layer_for_face(face),
             BlockModel::CrossPlant => info.plant_layer.unwrap_or(self.missing_layer),
         }
     }
@@ -2160,9 +2281,10 @@ impl BlockTextureLookup {
     #[inline(always)]
     pub(crate) fn tint_kind_for_info(&self, info: BlockTextureInfo, face: Face) -> u32 {
         match info.model {
-            BlockModel::Cube | BlockModel::SlabBottom | BlockModel::Liquid { .. } => {
-                info.face_tint_kinds[face.as_usize()]
-            }
+            BlockModel::Cube
+            | BlockModel::SlabBottom
+            | BlockModel::LayerBottom { .. }
+            | BlockModel::Liquid { .. } => info.face_tint_kinds[face.as_usize()],
             BlockModel::CrossPlant => TINT_NONE,
         }
     }
@@ -2516,6 +2638,7 @@ fn can_replace_trunk_block(block: BlockId) -> bool {
         block,
         BlockId::Air
             | BlockId::OakLeaves
+            | BlockId::Snow
             | BlockId::Sapling
             | BlockId::Dandelion
             | BlockId::Poppy
@@ -2529,6 +2652,7 @@ fn can_replace_leaf_block(block: BlockId) -> bool {
         block,
         BlockId::Air
             | BlockId::OakLeaves
+            | BlockId::Snow
             | BlockId::Sapling
             | BlockId::Dandelion
             | BlockId::Poppy

@@ -4,7 +4,7 @@ use std::thread;
 use crossbeam_channel::{Receiver, Sender, select};
 
 use crate::blocks::BlockTextureLookup;
-use crate::meshing::{LayeredChunkGeometry, MeshingNeighborhoodScratch};
+use crate::meshing::{LayeredChunkGeometry, MeshLayerMask, MeshingNeighborhoodScratch};
 use crate::perf::trace as perf_trace;
 use crate::world::ChunkCoord;
 
@@ -16,13 +16,19 @@ pub(crate) struct MeshJob {
     pub(crate) mesh_debug_epoch: u32,
     pub(crate) snapshot: NeighborhoodSnapshot,
     pub(crate) use_greedy: bool,
+    pub(crate) layer_mask: MeshLayerMask,
+    pub(crate) reason_labels: &'static str,
+    pub(crate) merged_edits: u32,
 }
 
 pub(crate) struct MeshResult {
     pub(crate) coord: ChunkCoord,
     pub(crate) revision: u64,
     pub(crate) mesh_debug_epoch: u32,
-    pub(crate) geometry: Option<LayeredChunkGeometry>,
+    pub(crate) geometry: LayeredChunkGeometry,
+    pub(crate) layer_mask: MeshLayerMask,
+    pub(crate) reason_labels: &'static str,
+    pub(crate) merged_edits: u32,
 }
 
 pub(crate) struct MeshWorkerPool {
@@ -66,18 +72,13 @@ impl MeshWorkerPool {
                             let geometry_started = std::time::Instant::now();
                             let (geometry, mesh_stats) = crate::meshing::pool::with_meshing_pool(|pool| {
                                 if job.use_greedy {
-                                    crate::meshing::greedy::build_chunk_mesh_greedy_layered_dense_pooled(&neighborhood, job.coord, texture_lookup.as_ref(), pool)
+                                    crate::meshing::greedy::build_chunk_mesh_greedy_layered_dense_pooled(&neighborhood, job.coord, texture_lookup.as_ref(), pool, job.layer_mask)
                                 } else {
-                                    crate::meshing::greedy::build_chunk_mesh_layered_naive_dense_pooled(&neighborhood, job.coord, texture_lookup.as_ref(), pool)
+                                    crate::meshing::greedy::build_chunk_mesh_layered_naive_dense_pooled(&neighborhood, job.coord, texture_lookup.as_ref(), pool, job.layer_mask)
                                 }
                             });
                             let geometry_elapsed = geometry_started.elapsed();
-                            let geometry = if geometry.total_index_count() == 0 {
-                                None
-                            } else {
-                                Some(geometry)
-                            };
-                            let has_geom = geometry.is_some();
+                            let has_geom = geometry.total_index_count() > 0;
 
                             perf_trace::record_duration(
                                 "mesh_worker.neighborhood_build",
@@ -95,10 +96,14 @@ impl MeshWorkerPool {
                                 "mesh_worker.mesh_generate",
                                 geometry_elapsed,
                                 &format!(
-                                    "coord=({}, {}, {}) voxels={} faces_tested={} faces_emitted={} quads={} opaque_quads={} cutout_quads={} transparent_quads={} scratch_reused={} hint_reuses={} growths={}",
+                                    "coord=({}, {}, {}) layers={} layer_bits={} reasons={} merged_edits={} voxels={} faces_tested={} faces_emitted={} quads={} opaque_quads={} cutout_quads={} transparent_quads={} scratch_reused={} hint_reuses={} growths={}",
                                     job.coord.x,
                                     job.coord.y,
                                     job.coord.z,
+                                    job.layer_mask.labels(),
+                                    job.layer_mask.bits(),
+                                    job.reason_labels,
+                                    job.merged_edits,
                                     mesh_stats.voxels_visited,
                                     mesh_stats.cube_faces_considered,
                                     mesh_stats.cube_faces_emitted,
@@ -118,6 +123,9 @@ impl MeshWorkerPool {
                                     revision: job.revision,
                                     mesh_debug_epoch: job.mesh_debug_epoch,
                                     geometry,
+                                    layer_mask: job.layer_mask,
+                                    reason_labels: job.reason_labels,
+                                    merged_edits: job.merged_edits,
                                 })
                                 .is_err()
                             {
@@ -127,12 +135,16 @@ impl MeshWorkerPool {
                                 "mesh_worker.job",
                                 started.elapsed(),
                                 &format!(
-                                    "coord=({}, {}, {}) rev={} has_geom={} neighborhood_ms={:.2} mesh_ms={:.2} alloc_avoided={} voxels={} faces_tested={} faces_emitted={} quads={} opaque_quads={} cutout_quads={} transparent_quads={} scratch_reused={} hint_reuses={} growths={}",
+                                    "coord=({}, {}, {}) rev={} has_geom={} layers={} layer_bits={} reasons={} merged_edits={} neighborhood_ms={:.2} mesh_ms={:.2} alloc_avoided={} voxels={} faces_tested={} faces_emitted={} quads={} opaque_quads={} cutout_quads={} transparent_quads={} scratch_reused={} hint_reuses={} growths={}",
                                     job.coord.x,
                                     job.coord.y,
                                     job.coord.z,
                                     job.revision,
                                     has_geom,
+                                    job.layer_mask.labels(),
+                                    job.layer_mask.bits(),
+                                    job.reason_labels,
+                                    job.merged_edits,
                                     neighborhood_elapsed.as_secs_f32() * 1000.0,
                                     geometry_elapsed.as_secs_f32() * 1000.0,
                                     neighborhood_stats.allocations_avoided,
@@ -181,7 +193,8 @@ mod tests {
     use super::*;
     use crate::blocks::{BlockId, BlockRegistry, BlockTextureLookup};
     use crate::meshing::{
-        build_chunk_mesh_greedy_layered, build_chunk_mesh_layered_naive, flatten_layered_geometry,
+        MeshLayerMask, build_chunk_mesh_greedy_layered, build_chunk_mesh_layered_naive,
+        flatten_layered_geometry,
     };
     use crate::world::{Chunk, World};
 
@@ -262,6 +275,7 @@ mod tests {
         center.set(15, 9, 8, BlockId::Stone);
         center.set(4, 4, 4, BlockId::Glass);
         center.set(5, 4, 4, BlockId::WaterStill);
+        center.set(6, 4, 4, BlockId::Sapling);
         world.chunks.insert(coord, center);
 
         let mut east_chunk = Chunk::new_empty();
@@ -286,6 +300,7 @@ mod tests {
                 coord,
                 &texture_lookup,
                 pool,
+                MeshLayerMask::ALL,
             )
             .0
         });
@@ -295,6 +310,7 @@ mod tests {
                 coord,
                 &texture_lookup,
                 pool,
+                MeshLayerMask::ALL,
             )
             .0
         });
@@ -317,5 +333,65 @@ mod tests {
             cast_slice::<_, u8>(&dense_naive_vertices),
             cast_slice::<_, u8>(&world_naive_vertices)
         );
+    }
+
+    #[test]
+    fn dense_meshing_layer_mask_builds_only_requested_layers() {
+        let mut world = World::new();
+        let coord = ChunkCoord { x: 0, y: 0, z: 0 };
+        let mut center = Chunk::new_empty();
+        center.set(4, 4, 4, BlockId::Stone);
+        center.set(5, 4, 4, BlockId::Glass);
+        center.set(6, 4, 4, BlockId::Sapling);
+        center.set(7, 4, 4, BlockId::WaterStill);
+        world.chunks.insert(coord, center);
+        world.rebuild_loaded_lighting();
+
+        let texture_lookup = test_texture_lookup();
+        let snapshot = snapshot_for(&world, coord);
+        let mut scratch = MeshingNeighborhoodScratch::new();
+        let (dense_neighborhood, _) = scratch.build(coord, snapshot);
+
+        let opaque = crate::meshing::pool::with_meshing_pool(|pool| {
+            crate::meshing::greedy::build_chunk_mesh_greedy_layered_dense_pooled(
+                &dense_neighborhood,
+                coord,
+                &texture_lookup,
+                pool,
+                MeshLayerMask::OPAQUE,
+            )
+            .0
+        });
+        assert!(!opaque.opaque.indices.is_empty());
+        assert!(opaque.cutout.indices.is_empty());
+        assert!(opaque.transparent.indices.is_empty());
+
+        let cutout = crate::meshing::pool::with_meshing_pool(|pool| {
+            crate::meshing::greedy::build_chunk_mesh_greedy_layered_dense_pooled(
+                &dense_neighborhood,
+                coord,
+                &texture_lookup,
+                pool,
+                MeshLayerMask::CUTOUT,
+            )
+            .0
+        });
+        assert!(cutout.opaque.indices.is_empty());
+        assert!(!cutout.cutout.indices.is_empty());
+        assert!(cutout.transparent.indices.is_empty());
+
+        let transparent = crate::meshing::pool::with_meshing_pool(|pool| {
+            crate::meshing::greedy::build_chunk_mesh_greedy_layered_dense_pooled(
+                &dense_neighborhood,
+                coord,
+                &texture_lookup,
+                pool,
+                MeshLayerMask::TRANSPARENT,
+            )
+            .0
+        });
+        assert!(transparent.opaque.indices.is_empty());
+        assert!(transparent.cutout.indices.is_empty());
+        assert!(!transparent.transparent.indices.is_empty());
     }
 }

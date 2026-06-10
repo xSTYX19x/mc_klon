@@ -63,6 +63,7 @@ pub(crate) fn migrate_save_v1_to_v2(save_root: &Path) -> io::Result<SaveMigratio
             chunk_size: meta.chunk_size,
             boundary_ocean: meta.boundary_ocean,
             boundary_radius_chunks: meta.boundary_radius_chunks,
+            environment: meta.environment,
         },
         meta.preset,
     );
@@ -78,6 +79,7 @@ pub(crate) fn migrate_save_v1_to_v2(save_root: &Path) -> io::Result<SaveMigratio
             chunk_size: meta.chunk_size,
             boundary_ocean: meta.boundary_ocean,
             boundary_radius_chunks: meta.boundary_radius_chunks,
+            environment: meta.environment,
         },
         meta.preset,
     );

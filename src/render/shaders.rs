@@ -26,11 +26,9 @@ var<uniform> camera: Camera;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
-    @location(1) uv: vec2<f32>,
+    @location(1) uv_raw: vec2<u32>,    // Uint16x2: fixed-point UVs (÷ 4096)
     @location(2) tex_layer: u32,
-    @location(3) color: vec3<f32>,
-    @location(4) tint_kind: u32,
-    @location(5) light_packed: u32,
+    @location(3) packed: vec4<u32>,    // Uint8x4: x=shade, y=tint_kind, z=light_packed, w=pad
 };
 
 struct VsOut {
@@ -47,12 +45,13 @@ struct VsOut {
 fn vs_main(input: VsIn) -> VsOut {
     var out: VsOut;
     out.clip_pos = camera.view_proj * vec4<f32>(input.position, 1.0);
-    out.color = input.color;
-    out.uv = input.uv;
+    let shade = f32(input.packed.x) / 255.0;
+    out.color = vec3<f32>(shade, shade, shade);
+    out.uv = vec2<f32>(f32(input.uv_raw.x), f32(input.uv_raw.y)) / 4096.0;
     out.tex_layer = input.tex_layer;
     out.world_pos = input.position;
-    out.tint_kind = input.tint_kind;
-    out.light_packed = input.light_packed;
+    out.tint_kind = input.packed.y;
+    out.light_packed = input.packed.z;
     return out;
 }
 
@@ -370,5 +369,73 @@ fn vs_main(input: VsIn) -> VsOut {
 @fragment
 fn fs_main() -> @location(0) vec4<f32> {
     return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+}
+"#;
+
+pub(crate) const RAIN_SHADER_WGSL: &str = r#"
+struct Camera {
+    view_proj: mat4x4<f32>,
+    camera_pos: vec3<f32>,
+    _pad0: f32,
+    fog_params: vec4<f32>,
+    fog_color: vec4<f32>,
+    sky_params: vec4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> camera: Camera;
+
+struct VsIn {
+    @location(0) position: vec3<f32>,
+};
+
+struct VsOut {
+    @builtin(position) clip_pos: vec4<f32>,
+};
+
+@vertex
+fn vs_main(input: VsIn) -> VsOut {
+    var out: VsOut;
+    out.clip_pos = camera.view_proj * vec4<f32>(input.position, 1.0);
+    return out;
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.67, 0.74, 0.82, 0.58);
+}
+"#;
+
+pub(crate) const SNOW_SHADER_WGSL: &str = r#"
+struct Camera {
+    view_proj: mat4x4<f32>,
+    camera_pos: vec3<f32>,
+    _pad0: f32,
+    fog_params: vec4<f32>,
+    fog_color: vec4<f32>,
+    sky_params: vec4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> camera: Camera;
+
+struct VsIn {
+    @location(0) position: vec3<f32>,
+};
+
+struct VsOut {
+    @builtin(position) clip_pos: vec4<f32>,
+};
+
+@vertex
+fn vs_main(input: VsIn) -> VsOut {
+    var out: VsOut;
+    out.clip_pos = camera.view_proj * vec4<f32>(input.position, 1.0);
+    return out;
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.95, 0.97, 1.0, 0.76);
 }
 "#;

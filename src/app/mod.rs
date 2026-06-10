@@ -25,10 +25,12 @@ use crate::player::*;
 use crate::render::State;
 use crate::render::state::{
     ChatOverlay, ChatOverlayLine, DebugOverlay, GenerationOverlay, HitchCounters, InventoryOverlay,
-    MenuOverlay, WorldGenParams, WorldGenRequest, WorldLoadStageStats, pause_menu_item_at_pos_px,
+    MenuOverlay, SavedWorldSummary, WorldGenParams, WorldGenRequest, WorldLoadStageStats,
+    pause_menu_item_at_pos_px,
 };
 use crate::settings::{AppSettings, InputAction, keycode_label};
-use crate::world::{FluidKind, World};
+use crate::world::{FluidKind, World, WorldEnvironment};
+use crate::worldgen::ClassicLevelSize;
 
 const BLOCK_ACTION_REPEAT_COOLDOWN_TICKS: f32 = 4.0;
 const DOUBLE_FORWARD_TAP_WINDOW: f32 = 0.25;
@@ -47,12 +49,13 @@ const CHAT_VISIBLE_LINES: usize = 16;
 const CHAT_SENT_HISTORY_MAX: usize = 64;
 const CHAT_PLAYER_NAME: &str = "Player";
 const HITCH_LOG_THRESHOLD_MS: f32 = 25.0;
-const MAIN_MENU_ITEMS: [&str; 3] = ["Play", "Options", "Exit game"];
-const PAUSE_MENU_ITEMS: [&str; 5] = [
-    "Return to game",
-    "Options",
+const MAIN_MENU_ITEMS: [&str; 4] = ["Generate new level", "Load level", "Options", "Exit game"];
+const PAUSE_MENU_ITEMS: [&str; 6] = [
+    "Back to game",
     "Generate new level",
+    "Load level",
     "Save level",
+    "Options",
     "Exit to main menu",
 ];
 const OPTIONS_ROOT_ITEMS: [&str; 4] =
@@ -75,9 +78,29 @@ struct PendingChatTextDedup {
     text: String,
 }
 
+#[derive(Clone)]
+struct SavedWorldMenuEntry {
+    summary: SavedWorldSummary,
+    label: String,
+}
+
+struct MenuScreenContent {
+    title: String,
+    items: Vec<String>,
+    footer: Option<String>,
+    selected: usize,
+    enabled: Vec<bool>,
+    show_panorama: bool,
+}
+
 enum GameState {
     MainMenu {
         selected: usize,
+    },
+    LoadLevelMenu {
+        origin: MenuOrigin,
+        selected: usize,
+        worlds: Vec<SavedWorldMenuEntry>,
     },
     InGame,
     GeneratingWorld {
@@ -131,7 +154,6 @@ pub(crate) struct App {
     selected_slot: usize,
     hotbar: [Option<BlockId>; HOTBAR_SLOT_COUNT],
     simulation_distance: SimulationDistance,
-    world_session_started: bool,
     view_bobbing: ViewBobbing,
     game_state: GameState,
     last_space_tap: Option<Instant>,
@@ -181,7 +203,6 @@ impl Default for App {
             selected_slot: 0,
             hotbar: [None; HOTBAR_SLOT_COUNT],
             simulation_distance: SimulationDistance::default(),
-            world_session_started: false,
             view_bobbing: ViewBobbing::default(),
             game_state: GameState::MainMenu { selected: 0 },
             last_space_tap: None,
@@ -283,11 +304,25 @@ impl App {
     }
 
     fn is_main_menu(&self) -> bool {
-        matches!(self.game_state, GameState::MainMenu { .. })
+        matches!(
+            self.game_state,
+            GameState::MainMenu { .. }
+                | GameState::LoadLevelMenu {
+                    origin: MenuOrigin::MainMenu,
+                    ..
+                }
+        )
     }
 
     fn is_paused(&self) -> bool {
-        matches!(self.game_state, GameState::Paused { .. })
+        matches!(
+            self.game_state,
+            GameState::Paused { .. }
+                | GameState::LoadLevelMenu {
+                    origin: MenuOrigin::PauseMenu,
+                    ..
+                }
+        )
     }
 
     fn is_options_open(&self) -> bool {
@@ -687,6 +722,9 @@ impl App {
         self.clear_menu_press();
         self.game_state = GameState::Paused { selected: 0 };
         self.clear_action_state();
+        if let Some(state) = self.state.as_mut() {
+            state.set_world_session_paused(true, "pause_menu_opened");
+        }
         if let Some(window) = self.window.as_ref() {
             self.controller.set_mouse_capture(window, false);
         }
@@ -696,6 +734,9 @@ impl App {
         self.clear_menu_press();
         self.game_state = GameState::InGame;
         self.clear_action_state();
+        if let Some(state) = self.state.as_mut() {
+            state.set_world_session_paused(false, "pause_menu_closed");
+        }
         if let Some(window) = self.window.as_ref() {
             self.controller.set_mouse_capture(window, true);
         }
@@ -757,10 +798,45 @@ impl App {
         }
     }
 
+    fn enter_load_level_menu(&mut self, origin: MenuOrigin) {
+        self.reset_chat_state();
+        self.clear_menu_press();
+        let worlds = self
+            .state
+            .as_ref()
+            .map(|state| {
+                state
+                    .list_saved_worlds()
+                    .into_iter()
+                    .map(|summary| {
+                        let active = if summary.is_active { " [active]" } else { "" };
+                        SavedWorldMenuEntry {
+                            label: format!(
+                                "{}{} | {}",
+                                summary.display_name, active, summary.details
+                            ),
+                            summary,
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.game_state = GameState::LoadLevelMenu {
+            origin,
+            selected: 0,
+            worlds,
+        };
+        self.clear_action_state();
+        if let Some(window) = self.window.as_ref() {
+            self.controller.set_mouse_capture(window, false);
+        }
+    }
+
     fn menu_item_count(&self) -> usize {
         match &self.game_state {
             GameState::MainMenu { .. } => MAIN_MENU_ITEMS.len(),
             GameState::Paused { .. } => PAUSE_MENU_ITEMS.len(),
+            GameState::LoadLevelMenu { worlds, .. } => worlds.len().max(1) + 1,
             GameState::Options(options) => match options.screen {
                 OptionsScreen::Root => OPTIONS_ROOT_ITEMS.len(),
                 OptionsScreen::Gameplay => 2,
@@ -775,6 +851,7 @@ impl App {
         match &self.game_state {
             GameState::MainMenu { selected } => Some(*selected),
             GameState::Paused { selected } => Some(*selected),
+            GameState::LoadLevelMenu { selected, .. } => Some(*selected),
             GameState::Options(options) => Some(options.selected),
             _ => None,
         }
@@ -784,6 +861,9 @@ impl App {
         match &mut self.game_state {
             GameState::MainMenu { selected: current } => *current = selected,
             GameState::Paused { selected: current } => *current = selected,
+            GameState::LoadLevelMenu {
+                selected: current, ..
+            } => *current = selected,
             GameState::Options(options) => options.selected = selected,
             _ => {}
         }
@@ -816,24 +896,14 @@ impl App {
         }
     }
 
-    fn start_startup_loading(&mut self) -> bool {
-        let started = if let Some(state) = self.state.as_mut() {
-            state.begin_startup_loading();
-            state.is_world_startup_loading()
-        } else {
-            false
-        };
-
-        if started {
-            self.enter_world_loading_screen("Loading world", "Preparing spawn area");
-        }
-
-        started
-    }
-
     fn start_new_level_generation(&mut self, request: WorldGenRequest) -> bool {
         let started = if let Some(state) = self.state.as_mut() {
-            state.begin_new_world(request.seed, request.params.preset);
+            state.begin_new_world(
+                request.seed,
+                request.params.preset,
+                request.params.classic_size,
+                request.params.environment,
+            );
             state.is_world_startup_loading()
         } else {
             false
@@ -846,16 +916,12 @@ impl App {
         started
     }
 
-    fn play_or_resume_world(&mut self) {
-        self.clear_menu_press();
-        if self.world_session_started {
-            self.game_state = GameState::InGame;
-            if let Some(window) = self.window.as_ref() {
-                self.controller.set_mouse_capture(window, true);
-            }
-            return;
+    fn start_new_default_level_generation(&mut self) {
+        let request =
+            self.make_worldgen_request(ClassicLevelSize::Normal, WorldEnvironment::Temperate);
+        if !self.start_new_level_generation(request) {
+            crate::console_info!("new level generation is already running");
         }
-        let _ = self.start_startup_loading();
     }
 
     fn menu_item_at_cursor(&self) -> Option<usize> {
@@ -938,8 +1004,10 @@ impl App {
             if !self.settings.gameplay.view_bobbing {
                 self.reset_view_bobbing();
             }
-            self.persist_settings();
-            self.apply_settings_to_state();
+            if matches!(self.game_state, GameState::Options(_)) {
+                self.persist_settings();
+                self.apply_settings_to_state();
+            }
         }
         changed
     }
@@ -950,9 +1018,10 @@ impl App {
             _ => return,
         };
         match selected {
-            0 => self.play_or_resume_world(),
-            1 => self.open_options_menu(MenuOrigin::MainMenu),
-            2 => event_loop.exit(),
+            0 => self.start_new_default_level_generation(),
+            1 => self.enter_load_level_menu(MenuOrigin::MainMenu),
+            2 => self.open_options_menu(MenuOrigin::MainMenu),
+            3 => event_loop.exit(),
             _ => {}
         }
     }
@@ -965,26 +1034,61 @@ impl App {
 
         match selected {
             0 => self.leave_pause(),
-            1 => self.open_options_menu(MenuOrigin::PauseMenu),
-            2 => {
-                let request = self.make_worldgen_request();
-                if !self.start_new_level_generation(request) {
-                    crate::console_info!("new level generation is already running");
-                }
-            }
+            1 => self.start_new_default_level_generation(),
+            2 => self.enter_load_level_menu(MenuOrigin::PauseMenu),
             3 => {
                 if let Some(state) = self.state.as_mut() {
                     state.save_world();
                     crate::console_info!("Saved.");
                 }
             }
-            4 => {
+            4 => self.open_options_menu(MenuOrigin::PauseMenu),
+            5 => {
                 if let Some(state) = self.state.as_mut() {
                     state.save_world();
+                    state.shutdown_world_session("exit_to_main_menu");
                 }
                 self.enter_main_menu();
             }
             _ => {}
+        }
+    }
+
+    fn activate_load_level_menu_selected(&mut self) {
+        let (origin, save_root) = match &self.game_state {
+            GameState::LoadLevelMenu {
+                origin,
+                selected,
+                worlds,
+            } => {
+                if *selected >= worlds.len() {
+                    (*origin, None)
+                } else {
+                    (
+                        *origin,
+                        worlds
+                            .get(*selected)
+                            .map(|entry| entry.summary.save_root.clone()),
+                    )
+                }
+            }
+            _ => return,
+        };
+
+        if save_root.is_none() {
+            match origin {
+                MenuOrigin::MainMenu => self.enter_main_menu(),
+                MenuOrigin::PauseMenu => self.enter_pause(),
+            }
+            return;
+        }
+
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        match state.begin_load_world(save_root.expect("save_root already checked")) {
+            Ok(()) => self.enter_world_loading_screen("Loading level", "Preparing spawn area"),
+            Err(err) => crate::console_error!("load level failed: {}", err),
         }
     }
 
@@ -1167,8 +1271,27 @@ impl App {
                 .unwrap_or("Empty")
         ));
         if let Some(state) = self.state.as_ref() {
+            lines.push(format!(
+                "Weather: {} {} (F5)",
+                state
+                    .active_precipitation_kind()
+                    .map(|kind| kind.label())
+                    .unwrap_or_else(|| {
+                        state
+                            .world_environment()
+                            .default_precipitation()
+                            .map_or("weather", |kind| kind.label())
+                    }),
+                if state.precipitation_enabled() {
+                    "On"
+                } else {
+                    "Off"
+                }
+            ));
+            lines.push(state.world_session_debug_line());
             lines.push(state.simulation_debug_line());
             lines.push(state.worldgen_features_debug_line());
+            lines.push(state.winter_debug_line());
             lines.push(state.ticking_areas_debug_line());
             lines.push(state.sim_systems_debug_line());
             lines.push(state.block_entities_debug_line());
@@ -1187,26 +1310,59 @@ impl App {
         lines
     }
 
-    fn menu_overlay_content(&self) -> Option<(String, Vec<String>, Option<String>, usize)> {
+    fn menu_overlay_content(&self) -> Option<MenuScreenContent> {
         match &self.game_state {
-            GameState::MainMenu { selected } => Some((
-                "Minecraft Klon".to_string(),
-                MAIN_MENU_ITEMS
+            GameState::MainMenu { selected } => Some(MenuScreenContent {
+                title: "Minecraft Klon".to_string(),
+                items: MAIN_MENU_ITEMS
                     .iter()
                     .map(|item| (*item).to_string())
                     .collect(),
-                Some("Enter starts. Escape closes rebinding screens.".to_string()),
-                *selected,
-            )),
-            GameState::Paused { selected } => Some((
-                "Game menu".to_string(),
-                PAUSE_MENU_ITEMS
+                footer: Some("Classic parity flow: generate, load, options.".to_string()),
+                selected: *selected,
+                enabled: vec![true; MAIN_MENU_ITEMS.len()],
+                show_panorama: true,
+            }),
+            GameState::LoadLevelMenu {
+                origin,
+                selected,
+                worlds,
+            } => {
+                let mut items = if worlds.is_empty() {
+                    vec!["No saved levels found".to_string()]
+                } else {
+                    worlds.iter().map(|entry| entry.label.clone()).collect()
+                };
+                items.push("Back".to_string());
+                let mut enabled = vec![!worlds.is_empty(); items.len().saturating_sub(1)];
+                enabled.push(true);
+                let footer = if *selected < worlds.len() {
+                    worlds
+                        .get(*selected)
+                        .map(|entry| entry.summary.save_root.display().to_string())
+                } else {
+                    Some("Saved worlds live under save/worlds.".to_string())
+                };
+                Some(MenuScreenContent {
+                    title: "Load level".to_string(),
+                    items,
+                    footer,
+                    selected: *selected,
+                    enabled,
+                    show_panorama: matches!(origin, MenuOrigin::MainMenu),
+                })
+            }
+            GameState::Paused { selected } => Some(MenuScreenContent {
+                title: "Game menu".to_string(),
+                items: PAUSE_MENU_ITEMS
                     .iter()
                     .map(|item| (*item).to_string())
                     .collect(),
-                None,
-                *selected,
-            )),
+                footer: None,
+                selected: *selected,
+                enabled: vec![true; PAUSE_MENU_ITEMS.len()],
+                show_panorama: false,
+            }),
             GameState::Options(options) => {
                 let (title, items) = match options.screen {
                     OptionsScreen::Root => (
@@ -1281,9 +1437,26 @@ impl App {
                 } else {
                     options.status_line.clone()
                 };
-                Some((title, items, footer, options.selected))
+                Some(MenuScreenContent {
+                    title,
+                    selected: options.selected,
+                    enabled: vec![true; items.len()],
+                    items,
+                    footer,
+                    show_panorama: matches!(options.origin, MenuOrigin::MainMenu),
+                })
             }
             _ => None,
+        }
+    }
+
+    fn activate_current_menu_selected(&mut self, event_loop: &ActiveEventLoop) {
+        match self.game_state {
+            GameState::MainMenu { .. } => self.activate_main_menu_selected(event_loop),
+            GameState::Paused { .. } => self.activate_pause_menu_selected(event_loop),
+            GameState::LoadLevelMenu { .. } => self.activate_load_level_menu_selected(),
+            GameState::Options(_) => self.activate_options_selected(),
+            _ => {}
         }
     }
 
@@ -1393,14 +1566,22 @@ impl App {
         self.sync_camera_to_player_eye(true);
     }
 
-    fn make_worldgen_request(&self) -> WorldGenRequest {
+    fn make_worldgen_request(
+        &self,
+        classic_size: ClassicLevelSize,
+        environment: WorldEnvironment,
+    ) -> WorldGenRequest {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
         let nanos = now.as_nanos() as u64;
         WorldGenRequest {
             seed: nanos ^ (nanos.rotate_left(23)),
-            params: WorldGenParams::default(),
+            params: WorldGenParams {
+                classic_size,
+                environment,
+                ..WorldGenParams::default()
+            },
         }
     }
 
@@ -1746,6 +1927,11 @@ impl ApplicationHandler for App {
                         }
                         if inventory_open {
                             self.leave_inventory();
+                        } else if let GameState::LoadLevelMenu { origin, .. } = &self.game_state {
+                            match origin {
+                                MenuOrigin::MainMenu => self.enter_main_menu(),
+                                MenuOrigin::PauseMenu => self.enter_pause(),
+                            }
                         } else if options_open {
                             self.handle_options_back();
                         } else if paused {
@@ -1789,13 +1975,7 @@ impl ApplicationHandler for App {
                                     self.apply_selected_option_step(1);
                                 }
                                 KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space => {
-                                    if self.is_main_menu() {
-                                        self.activate_main_menu_selected(event_loop);
-                                    } else if self.is_paused() {
-                                        self.activate_pause_menu_selected(event_loop);
-                                    } else {
-                                        self.activate_options_selected();
-                                    }
+                                    self.activate_current_menu_selected(event_loop);
                                 }
                                 _ => {}
                             }
@@ -1875,12 +2055,7 @@ impl ApplicationHandler for App {
                         }
 
                         if code == KeyCode::KeyN && !event.repeat {
-                            if generating {
-                                crate::console_info!("new level generation is already running");
-                            } else {
-                                let request = self.make_worldgen_request();
-                                self.start_new_level_generation(request);
-                            }
+                            self.start_new_default_level_generation();
                         }
 
                         if !generating && code == jump_key && !event.repeat {
@@ -1894,6 +2069,12 @@ impl ApplicationHandler for App {
                         if !generating && code == KeyCode::F4 && !event.repeat {
                             if let Some(state) = self.state.as_mut() {
                                 state.toggle_debug_depth_test();
+                            }
+                        }
+
+                        if !generating && code == KeyCode::F5 && !event.repeat {
+                            if let Some(state) = self.state.as_mut() {
+                                state.toggle_precipitation();
                             }
                         }
 
@@ -2057,13 +2238,7 @@ impl ApplicationHandler for App {
                                 if let Some(index) = pressed_index
                                     && released_index == Some(index)
                                 {
-                                    if self.is_main_menu() {
-                                        self.activate_main_menu_selected(event_loop);
-                                    } else if self.is_paused() {
-                                        self.activate_pause_menu_selected(event_loop);
-                                    } else {
-                                        self.activate_options_selected();
-                                    }
+                                    self.activate_current_menu_selected(event_loop);
                                 }
                             }
                         }
@@ -2256,7 +2431,6 @@ impl ApplicationHandler for App {
                             &self.camera,
                         );
                     }
-                    self.world_session_started = true;
                     self.game_state = GameState::InGame;
                     if let Some(window) = self.window.as_ref() {
                         self.controller.set_mouse_capture(window, true);
@@ -2270,7 +2444,6 @@ impl ApplicationHandler for App {
                         .is_some_and(|state| !state.is_world_startup_loading())
                 {
                     self.game_state = GameState::InGame;
-                    self.world_session_started = true;
                     if let Some(window) = self.window.as_ref() {
                         self.controller.set_mouse_capture(window, true);
                     }
@@ -2286,8 +2459,10 @@ impl ApplicationHandler for App {
                 ));
                 let in_game = self.is_in_game();
                 let gameplay_active = in_game && !self.chat_open;
-                let world_processing_active =
-                    gameplay_active || self.is_generating_world() || self.world_session_started;
+                let world_processing_active = self
+                    .state
+                    .as_ref()
+                    .is_some_and(|state| state.world_runtime_processing_enabled());
                 let debug_lines_owned = if self.show_debug_overlay && in_game {
                     Some(self.build_debug_overlay_lines())
                 } else {
@@ -2316,11 +2491,20 @@ impl ApplicationHandler for App {
                 };
                 drop(frame_input_trace);
                 let menu_overlay_owned = self.menu_overlay_content();
-                let menu_item_refs = menu_overlay_owned.as_ref().map(|(_, items, _, _)| {
-                    items.iter().map(|item| item.as_str()).collect::<Vec<_>>()
+                let menu_item_refs = menu_overlay_owned.as_ref().map(|content| {
+                    content
+                        .items
+                        .iter()
+                        .map(|item| item.as_str())
+                        .collect::<Vec<_>>()
                 });
+                let menu_enabled_owned = menu_overlay_owned
+                    .as_ref()
+                    .map(|content| content.enabled.clone());
                 let menu_open_for_render = self.is_menu_open();
-                let show_menu_panorama = matches!(&self.game_state, GameState::MainMenu { .. });
+                let show_menu_panorama = menu_overlay_owned
+                    .as_ref()
+                    .is_some_and(|content| content.show_panorama);
                 let inventory_open_for_render = self.is_inventory_open();
                 if let Some(state) = self.state.as_mut() {
                     let _update_trace = perf_trace::scope("app.update");
@@ -2334,6 +2518,7 @@ impl ApplicationHandler for App {
                     if world_processing_active {
                         state.begin_frame_profiling(dt * 1000.0);
                         state.world_time.advance(dt);
+                        state.advance_weather(dt);
                     }
 
                     if gameplay_active {
@@ -2576,6 +2761,7 @@ impl ApplicationHandler for App {
                         } => Some((title.clone(), *progress, phase.clone(), *stats)),
                         GameState::InGame
                         | GameState::MainMenu { .. }
+                        | GameState::LoadLevelMenu { .. }
                         | GameState::Paused { .. }
                         | GameState::Options(_)
                         | GameState::Inventory { .. } => None,
@@ -2589,24 +2775,19 @@ impl ApplicationHandler for App {
                                 phase: phase.as_str(),
                                 stats: *stats,
                             });
-                    let menu_enabled_owned = menu_overlay_owned
-                        .as_ref()
-                        .map(|(_, items, _, _)| vec![true; items.len()]);
                     let menu_overlay = menu_overlay_owned
                         .as_ref()
                         .zip(menu_item_refs.as_ref())
                         .zip(menu_enabled_owned.as_ref())
-                        .map(
-                            |(((title, _, footer, selected), items), enabled)| MenuOverlay {
-                                title: title.as_str(),
-                                selected: *selected,
-                                pressed: self.menu_pressed_index,
-                                items: items.as_slice(),
-                                enabled: Some(enabled.as_slice()),
-                                footer: footer.as_deref(),
-                                show_panorama: show_menu_panorama,
-                            },
-                        );
+                        .map(|((content, items), enabled)| MenuOverlay {
+                            title: content.title.as_str(),
+                            selected: content.selected,
+                            pressed: self.menu_pressed_index,
+                            items: items.as_slice(),
+                            enabled: Some(enabled.as_slice()),
+                            footer: content.footer.as_deref(),
+                            show_panorama: show_menu_panorama,
+                        });
                     let inventory_overlay_owned = match &self.game_state {
                         GameState::Inventory {
                             selected_palette,

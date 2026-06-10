@@ -25,13 +25,14 @@ use super::depth::DepthTexture;
 use super::lighting_worker::{LightingJob, LightingResult, LightingWorkerPool};
 use super::mesh_gpu::{
     ChunkMesh, LayeredChunkMesh, MeshUploadStats, upload_cpu_mesh_to_gpu_reuse,
-    upload_layered_chunk_mesh_to_gpu_reuse,
+    upload_layered_chunk_mesh_layers_to_gpu_reuse,
 };
 use super::mesh_worker::{
     ChunkSnapshot, MeshJob, MeshResult, MeshWorkerPool, NeighborhoodSnapshot,
 };
 use super::shaders::{
-    COLOR_SHADER_WGSL, OUTLINE_SHADER_WGSL, SKY_SHADER_WGSL, UI_SHADER_WGSL, WORLD_SHADER_WGSL,
+    COLOR_SHADER_WGSL, OUTLINE_SHADER_WGSL, RAIN_SHADER_WGSL, SKY_SHADER_WGSL, SNOW_SHADER_WGSL,
+    UI_SHADER_WGSL, WORLD_SHADER_WGSL,
 };
 use super::texture_anim::{
     AnimAxis, AnimGpu, AnimMeta, AnimState, TextureAnimTrack, decode_texture_frames,
@@ -39,10 +40,10 @@ use super::texture_anim::{
     resize_rgba_nearest,
 };
 use crate::blocks::{
-    BlockId, BlockModel, BlockRegistry, BlockTextureLookup, Face, REQUIRED_OVERLAY_TEXTURE_KEYS,
-    RenderLayer, TEX_BEDROCK, TEX_DIRT, TEX_GRASS_SIDE, TEX_GRASS_TOP, TEX_OAK_PLANKS, TEX_SAPLING,
-    TEX_STONE, TEX_WATER_OVERLAY, TEXTURE_SELF_TEST_KEYS, TINT_NONE,
-    debug_assert_block_blueprint_integrity,
+    BlockId, BlockModel, BlockRegistry, BlockTextureLookup, CullGroup, Face, FaceCoverage,
+    REQUIRED_OVERLAY_TEXTURE_KEYS, RenderLayer, TEX_BEDROCK, TEX_DIRT, TEX_GRASS_SIDE,
+    TEX_GRASS_TOP, TEX_OAK_PLANKS, TEX_SAPLING, TEX_STONE, TEX_WATER_OVERLAY,
+    TEXTURE_SELF_TEST_KEYS, TINT_NONE, debug_assert_block_blueprint_integrity,
 };
 use crate::camera::{
     Camera, CameraUniform, Frustum, build_view_proj_wgpu, chunk_in_frustum, sphere_in_frustum,
@@ -63,7 +64,7 @@ use crate::config::render::{
     UI_MODE_WATER_OVERLAY, USE_GREEDY_MESHING, WATER_OVERLAY_TINT, WATER_OVERLAY_UV_TILE,
 };
 use crate::config::sim::RANDOM_TICK_SPEED_DEFAULT;
-use crate::meshing::{CpuMeshData, FULLBRIGHT_LIGHT_PACKED, Vertex};
+use crate::meshing::{CpuMeshData, FULLBRIGHT_LIGHT_PACKED, MeshLayerMask, Vertex, WorldVertex};
 use crate::perf::trace as perf_trace;
 use crate::player::PlayerMode;
 use crate::sim::{ActiveSimColumns, ColumnCoord, SimSystem};
@@ -95,11 +96,12 @@ use crate::world::raycast::{RAYCAST_MAX_DISTANCE, raycast_world};
 use crate::world::ticking_areas::{self, TickingArea, TickingFlags};
 use crate::world::time::WorldTime;
 use crate::world::{
-    CHUNK_SIZE, Chunk, ChunkCoord, IncrementalLightingResult, IncrementalLightingStepLimits,
-    IncrementalLightingTask, LightLevel, LightingBlockChange, SetBlockError, WORLD_MAX_Y, World,
-    WorldConfig,
+    CHUNK_SIZE, Chunk, ChunkCoord, ClassifiedLightingBlockChange, IncrementalLightingResult,
+    IncrementalLightingStepLimits, IncrementalLightingTask, LightLevel,
+    LocalizedLightingRepairStats, LocalizedLightingRepairStepLimits, LocalizedLightingRepairTask,
+    PrecipitationKind, SetBlockError, WORLD_MAX_Y, World, WorldConfig, WorldEnvironment,
 };
-use crate::worldgen::{DEFAULT_WORLDGEN_PRESET, WorldgenPreset};
+use crate::worldgen::{ClassicLevelSize, DEFAULT_WORLDGEN_PRESET, WorldgenPreset};
 
 struct Particle {
     pos: Vec3,
@@ -107,6 +109,15 @@ struct Particle {
     life: f32,
     color: [f32; 3],
 }
+
+const CLASSIC_RAIN_RADIUS_BLOCKS: i32 = 10;
+const CLASSIC_RAIN_GRID_STEP: i32 = 2;
+const CLASSIC_RAIN_TOP_OFFSET: f32 = 10.0;
+const CLASSIC_RAIN_BOTTOM_OFFSET: f32 = 8.0;
+const CLASSIC_RAIN_MIN_LENGTH: f32 = 4.0;
+const CLASSIC_RAIN_MAX_LENGTH: f32 = 9.0;
+const WINTER_SURFACE_COLUMNS_PER_TICK: usize = 8;
+const WINTER_SURFACE_MAX_CHANGES_PER_TICK: usize = 2;
 
 #[derive(Clone, Copy, Debug)]
 struct PendingBlockEdit {
@@ -358,6 +369,44 @@ struct RemovedLightingBatch {
     enqueued_at: Instant,
 }
 
+#[derive(Debug)]
+struct BlockEditLightingBatch {
+    id: u64,
+    changes: Vec<ClassifiedLightingBlockChange>,
+    merge_chunks: HashSet<ChunkCoord>,
+    primary_chunks: HashSet<ChunkCoord>,
+    merged_batches: usize,
+    merged_changes: usize,
+    enqueued_at: Instant,
+    ready_at: Instant,
+}
+
+impl BlockEditLightingBatch {
+    fn new(id: u64, now: Instant) -> Self {
+        Self {
+            id,
+            changes: Vec::new(),
+            merge_chunks: HashSet::new(),
+            primary_chunks: HashSet::new(),
+            merged_batches: 0,
+            merged_changes: 0,
+            enqueued_at: now,
+            ready_at: now,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BlockEditLightingJob {
+    batch_id: u64,
+    primary_chunks: Vec<ChunkCoord>,
+    merged_batches: usize,
+    merged_changes: usize,
+    enqueued_at: Instant,
+    cpu_ms_accum: f32,
+    task: LocalizedLightingRepairTask,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ChunkGenApplyFollowUpPhase {
     BoundaryDirty,
@@ -427,7 +476,6 @@ struct ChunkGenDrainLimits {
 struct MeshDirtyReasons(u8);
 
 impl MeshDirtyReasons {
-    const NONE: Self = Self(0);
     const GEOMETRY: Self = Self(1 << 0);
     const LIGHTING: Self = Self(1 << 1);
     const BOUNDARY: Self = Self(1 << 2);
@@ -481,6 +529,39 @@ impl std::ops::BitOrAssign for MeshDirtyReasons {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ChunkMeshDirtySet {
+    reasons: MeshDirtyReasons,
+    layers: MeshLayerMask,
+    merged_edits: u32,
+}
+
+impl ChunkMeshDirtySet {
+    const fn new(reasons: MeshDirtyReasons, layers: MeshLayerMask, merged_edits: u32) -> Self {
+        Self {
+            reasons,
+            layers,
+            merged_edits,
+        }
+    }
+
+    const fn is_empty(self) -> bool {
+        self.reasons.is_empty() || self.layers.is_empty()
+    }
+
+    fn merge_assign(&mut self, other: Self) {
+        self.reasons |= other.reasons;
+        self.layers |= other.layers;
+        self.merged_edits = self.merged_edits.saturating_add(other.merged_edits);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BlockEditMeshInvalidation {
+    coord: ChunkCoord,
+    dirty: ChunkMeshDirtySet,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ChunkMeshState {
     CleanReady,
@@ -511,18 +592,18 @@ impl ChunkMeshState {
 #[derive(Clone, Copy, Debug)]
 struct ChunkMeshSchedule {
     state: ChunkMeshState,
-    queued_reasons: MeshDirtyReasons,
-    pending_reasons: MeshDirtyReasons,
-    inflight_reasons: MeshDirtyReasons,
+    queued: ChunkMeshDirtySet,
+    pending: ChunkMeshDirtySet,
+    inflight: ChunkMeshDirtySet,
 }
 
 impl Default for ChunkMeshSchedule {
     fn default() -> Self {
         Self {
             state: ChunkMeshState::CleanReady,
-            queued_reasons: MeshDirtyReasons::NONE,
-            pending_reasons: MeshDirtyReasons::NONE,
-            inflight_reasons: MeshDirtyReasons::NONE,
+            queued: ChunkMeshDirtySet::default(),
+            pending: ChunkMeshDirtySet::default(),
+            inflight: ChunkMeshDirtySet::default(),
         }
     }
 }
@@ -579,9 +660,25 @@ struct WorldgenFeatureDebugCounts {
     total_worldgen_water_blocks: u64,
     total_worldgen_water_source_blocks: u64,
     total_shoreline_sand_blocks: u64,
+    total_winter_snow_blocks: u64,
+    total_winter_ice_blocks: u64,
     last_worldgen_water_blocks: u32,
     last_worldgen_water_source_blocks: u32,
     last_shoreline_sand_blocks: u32,
+    last_winter_snow_blocks: u32,
+    last_winter_ice_blocks: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct WinterSurfaceDebugCounts {
+    ticks: u64,
+    columns_sampled: u64,
+    snow_placed: u64,
+    water_frozen: u64,
+    last_tick_columns: u32,
+    last_tick_snow: u32,
+    last_tick_ice: u32,
+    last_tick_ms: f32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1096,6 +1193,11 @@ const BLOCK_EDIT_SIDEFX_BUDGET_MS: f32 = 1.5;
 const BLOCK_EDIT_SIDEFX_MAX_EDITS_PER_FRAME: usize = 8;
 const BLOCK_EDIT_PARTICLES_MAX_SPAWN_PER_FRAME: usize = 64;
 const BLOCK_EDIT_SAND_SCAN_STEPS_PER_FRAME: usize = 32;
+const BLOCK_EDIT_LIGHTING_MAX_VOXELS_PER_STEP: u64 = 4_096;
+const BLOCK_EDIT_LIGHTING_STEP_BUDGET_MS: f32 = 0.75;
+const BLOCK_EDIT_LIGHTING_FRAME_BUDGET_MS: f32 = 1.5;
+const BLOCK_EDIT_LIGHTING_MAX_STEPS_PER_FRAME: usize = 4;
+const BLOCK_EDIT_LIGHTING_COALESCE_DELAY_MS: u64 = 12;
 const DEFERRED_EDITS_PER_CHUNK_CAP: usize = 4096;
 const DEFERRED_EDITS_GLOBAL_CAP: usize = 200_000;
 const PLACEHOLDER_SALVAGE_NON_AIR_CAP: usize = 20_000;
@@ -1180,6 +1282,35 @@ impl LightingDebugView {
             Self::SkyLightHeatmap => "skylight_heatmap",
             Self::BlockLightHeatmap => "blocklight_heatmap",
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorldSessionState {
+    Unloaded,
+    Generating,
+    Active,
+    Paused,
+    Suspended,
+}
+
+impl WorldSessionState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unloaded => "unloaded",
+            Self::Generating => "generating",
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Suspended => "suspended",
+        }
+    }
+
+    fn allows_runtime_processing(self) -> bool {
+        matches!(self, Self::Generating | Self::Active)
+    }
+
+    fn allows_simulation(self) -> bool {
+        matches!(self, Self::Active)
     }
 }
 
@@ -1312,6 +1443,18 @@ pub(crate) struct StateFramePerf {
     pub(crate) lighting_incremental_voxels_visited: u64,
     pub(crate) lighting_incremental_chunks_touched: usize,
     pub(crate) lighting_incremental_boundary_propagations: u64,
+    pub(crate) lighting_block_edit_batches_enqueued: usize,
+    pub(crate) lighting_block_edit_batches_merged: usize,
+    pub(crate) lighting_block_edit_enqueue_ms: f32,
+    pub(crate) lighting_block_edit_process_ms: f32,
+    pub(crate) lighting_block_edit_budget_used_ms: f32,
+    pub(crate) lighting_block_edit_steps: usize,
+    pub(crate) lighting_block_edit_backlog_depth: usize,
+    pub(crate) lighting_block_edit_voxels_visited: u64,
+    pub(crate) lighting_block_edit_changed_voxels: u64,
+    pub(crate) lighting_block_edit_chunks_touched: usize,
+    pub(crate) lighting_block_edit_skylight_columns: u64,
+    pub(crate) lighting_block_edit_coalesced_changes: usize,
 
     pub(crate) saved_column_load_attempts: usize,
     pub(crate) saved_column_load_hits: usize,
@@ -1492,6 +1635,18 @@ impl StateFramePerf {
             lighting_incremental_voxels_visited: 0,
             lighting_incremental_chunks_touched: 0,
             lighting_incremental_boundary_propagations: 0,
+            lighting_block_edit_batches_enqueued: 0,
+            lighting_block_edit_batches_merged: 0,
+            lighting_block_edit_enqueue_ms: 0.0,
+            lighting_block_edit_process_ms: 0.0,
+            lighting_block_edit_budget_used_ms: 0.0,
+            lighting_block_edit_steps: 0,
+            lighting_block_edit_backlog_depth: 0,
+            lighting_block_edit_voxels_visited: 0,
+            lighting_block_edit_changed_voxels: 0,
+            lighting_block_edit_chunks_touched: 0,
+            lighting_block_edit_skylight_columns: 0,
+            lighting_block_edit_coalesced_changes: 0,
             saved_column_load_attempts: 0,
             saved_column_load_hits: 0,
             saved_column_load_misses: 0,
@@ -2172,12 +2327,16 @@ fn build_menu_button_atlas(
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WorldGenParams {
     pub preset: WorldgenPreset,
+    pub classic_size: ClassicLevelSize,
+    pub environment: WorldEnvironment,
 }
 
 impl Default for WorldGenParams {
     fn default() -> Self {
         Self {
             preset: DEFAULT_WORLDGEN_PRESET,
+            classic_size: ClassicLevelSize::Normal,
+            environment: WorldEnvironment::Temperate,
         }
     }
 }
@@ -2186,6 +2345,14 @@ impl Default for WorldGenParams {
 pub(crate) struct WorldGenRequest {
     pub seed: u64,
     pub params: WorldGenParams,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SavedWorldSummary {
+    pub save_root: PathBuf,
+    pub display_name: String,
+    pub details: String,
+    pub is_active: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -3046,7 +3213,12 @@ fn build_block_preview_mesh_3d(
                 FULLBRIGHT_LIGHT_PACKED,
             );
         }
-        BlockModel::SlabBottom => {
+        BlockModel::SlabBottom | BlockModel::LayerBottom { .. } => {
+            let layer_height = match block_texture_lookup.model_for(block) {
+                BlockModel::SlabBottom => 0.5,
+                BlockModel::LayerBottom { height_px } => height_px as f32 / 16.0,
+                _ => 1.0,
+            };
             let faces = [
                 (Face::South, [[0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]]),
                 (Face::North, [[1, 0, 0], [0, 0, 0], [0, 1, 0], [1, 1, 0]]),
@@ -3059,14 +3231,14 @@ fn build_block_preview_mesh_3d(
                 let corners_f32 = corners.map(|p| {
                     [
                         p[0] as f32 - 0.5,
-                        -0.5 + (p[1] as f32 * 0.5),
+                        -0.5 + (p[1] as f32 * layer_height),
                         p[2] as f32 - 0.5,
                     ]
                 });
                 let mut quad_uvs = preview_face_uvs_for_quad(face, corners);
                 if matches!(face, Face::North | Face::South | Face::East | Face::West) {
                     for uv in &mut quad_uvs {
-                        uv[1] *= 0.5;
+                        uv[1] *= layer_height;
                     }
                 }
                 append_preview_textured_quad(
@@ -5081,6 +5253,8 @@ pub(crate) struct State {
     render_pipeline_transparent_no_depth: wgpu::RenderPipeline,
     render_pipeline_lod: wgpu::RenderPipeline,
     sky_pipeline: wgpu::RenderPipeline,
+    rain_pipeline: wgpu::RenderPipeline,
+    snow_pipeline: wgpu::RenderPipeline,
     highlight_pipeline: wgpu::RenderPipeline,
     outline_pipeline: wgpu::RenderPipeline,
     ui_pipeline: wgpu::RenderPipeline,
@@ -5097,8 +5271,13 @@ pub(crate) struct State {
     mesh_schedule: HashMap<ChunkCoord, ChunkMeshSchedule>,
     deferred_mesh_until_frame: HashMap<ChunkCoord, u64>,
     pending_block_edits: VecDeque<PendingBlockEdit>,
-    pending_block_edit_dirty_chunks: HashSet<ChunkCoord>,
+    pending_block_edit_dirty_chunks: HashMap<ChunkCoord, ChunkMeshDirtySet>,
     pending_block_edit_dirty_columns: HashSet<(i32, i32)>,
+    pending_block_edit_lighting_batches: HashMap<u64, BlockEditLightingBatch>,
+    pending_block_edit_lighting_order: VecDeque<u64>,
+    pending_block_edit_lighting_chunk_batches: HashMap<ChunkCoord, u64>,
+    active_block_edit_lighting_job: Option<BlockEditLightingJob>,
+    next_block_edit_lighting_batch_id: u64,
     deferred_block_edits: HashMap<ChunkCoord, Vec<DeferredBlockEdit>>,
     deferred_block_edits_total: usize,
     pending_sand_gravity_checks: VecDeque<PendingSandGravityCheck>,
@@ -5176,6 +5355,7 @@ pub(crate) struct State {
     sim_system_last_frame_ticks: Vec<u32>,
     fluid_debug_counts: FluidDebugCounts,
     worldgen_feature_debug_counts: WorldgenFeatureDebugCounts,
+    winter_surface_debug_counts: WinterSurfaceDebugCounts,
     chunk_lighting_progress: HashMap<ChunkCoord, ChunkLightingProgress>,
     frame_index: u64,
     // Frustum culling performance counters
@@ -5187,6 +5367,9 @@ pub(crate) struct State {
     fluid_dirty_due_to_fluids: HashSet<ChunkCoord>,
     particles: Vec<Particle>,
     particle_rng: u32,
+    precipitation_enabled: bool,
+    precipitation_visual_intensity: f32,
+    precipitation_phase_seconds: f32,
     render_distance: RenderDistance,
     view_distance_chunks: i32,
     simulation_distance: SimulationDistance,
@@ -5196,6 +5379,8 @@ pub(crate) struct State {
     sim_columns_entered: Vec<ColumnCoord>,
     sim_columns_exited: Vec<ColumnCoord>,
     worldgen_preset: WorldgenPreset,
+    world_session_state: WorldSessionState,
+    world_session_id: u64,
     world_generation_task: Option<WorldGenerationTask>,
     uploaded_final_lighting_chunks: HashSet<ChunkCoord>,
     last_stream_center: Option<(i32, i32, i32)>,
@@ -5409,6 +5594,7 @@ impl State {
             world.chunk_size(),
             cfg.boundary_ocean(),
             cfg.boundary_radius_chunks(),
+            cfg.environment(),
         )
         .unwrap_or_else(|err| {
             panic!(
@@ -5436,6 +5622,7 @@ impl State {
             chunk_size: meta.chunk_size,
             boundary_ocean: meta.boundary_ocean,
             boundary_radius_chunks: meta.boundary_radius_chunks,
+            environment: meta.environment,
         }
     }
 
@@ -5475,6 +5662,51 @@ impl State {
         Ok((storage_reader, storage_loader, storage_writer))
     }
 
+    fn create_runtime_worker_services(
+        block_texture_lookup: &Arc<BlockTextureLookup>,
+    ) -> (
+        MeshWorkerPool,
+        CrossbeamSender<MeshJob>,
+        CrossbeamReceiver<MeshResult>,
+        ChunkGenWorkerPool,
+        CrossbeamSender<ChunkGenJob>,
+        CrossbeamReceiver<ChunkGenResult>,
+        LightingWorkerPool,
+        CrossbeamSender<LightingJob>,
+        CrossbeamReceiver<LightingResult>,
+    ) {
+        let (mesh_jobs_tx, mesh_jobs_rx) = crossbeam_channel::unbounded::<MeshJob>();
+        let (mesh_results_tx, mesh_results_rx) = crossbeam_channel::unbounded::<MeshResult>();
+        let mesh_pool = MeshWorkerPool::new(
+            Arc::clone(block_texture_lookup),
+            mesh_jobs_rx,
+            mesh_results_tx,
+        );
+
+        let (chunkgen_jobs_tx, chunkgen_jobs_rx) =
+            crossbeam_channel::bounded::<ChunkGenJob>(CHUNKGEN_JOB_QUEUE_CAPACITY);
+        let (chunkgen_results_tx, chunkgen_results_rx) =
+            crossbeam_channel::bounded::<ChunkGenResult>(CHUNKGEN_RESULT_QUEUE_CAPACITY);
+        let chunkgen_pool = ChunkGenWorkerPool::new(chunkgen_jobs_rx, chunkgen_results_tx);
+
+        let (lighting_jobs_tx, lighting_jobs_rx) = crossbeam_channel::unbounded::<LightingJob>();
+        let (lighting_results_tx, lighting_results_rx) =
+            crossbeam_channel::unbounded::<LightingResult>();
+        let lighting_pool = LightingWorkerPool::new(lighting_jobs_rx, lighting_results_tx);
+
+        (
+            mesh_pool,
+            mesh_jobs_tx,
+            mesh_results_rx,
+            chunkgen_pool,
+            chunkgen_jobs_tx,
+            chunkgen_results_rx,
+            lighting_pool,
+            lighting_jobs_tx,
+            lighting_results_rx,
+        )
+    }
+
     fn switch_save_root(&mut self, save_root: PathBuf) {
         let (storage_reader, storage_loader, storage_writer) =
             Self::create_storage_services(&save_root).unwrap_or_else(|err| {
@@ -5497,8 +5729,503 @@ impl State {
         }
     }
 
+    fn restart_runtime_worker_services(&mut self) {
+        let (
+            mesh_pool,
+            mesh_jobs,
+            mesh_results,
+            chunkgen_pool,
+            chunkgen_jobs,
+            chunkgen_results,
+            lighting_pool,
+            lighting_jobs,
+            lighting_results,
+        ) = Self::create_runtime_worker_services(&self.block_texture_lookup);
+        self.mesh_jobs = mesh_jobs;
+        self.mesh_results = mesh_results;
+        self.chunkgen_jobs = chunkgen_jobs;
+        self.chunkgen_results = chunkgen_results;
+        self.lighting_jobs = lighting_jobs;
+        self.lighting_results = lighting_results;
+        self._mesh_pool = mesh_pool;
+        self._chunkgen_pool = chunkgen_pool;
+        self._lighting_pool = lighting_pool;
+    }
+
+    fn restart_storage_services_for_current_save_root(&mut self) {
+        let save_root = self.save_root.clone();
+        self.switch_save_root(save_root);
+    }
+
+    fn next_world_session_id(&mut self) -> u64 {
+        self.world_session_id = self.world_session_id.wrapping_add(1).max(1);
+        self.world_session_id
+    }
+
+    fn log_world_session_transition(
+        &self,
+        previous: WorldSessionState,
+        next: WorldSessionState,
+        reason: &str,
+    ) {
+        crate::console_info!(
+            "[world_session] id={} {} -> {} reason={} chunks={} meshes={} chunkgen_q={} mesh_q={} light_q={} save_load_q={} save_ack_q={}",
+            self.world_session_id,
+            previous.label(),
+            next.label(),
+            reason,
+            self.world.chunks.len(),
+            self.chunk_meshes.len(),
+            self.chunkgen_results.len()
+                + self.chunkgen_pending_set.len()
+                + self.chunkgen_inflight.len(),
+            self.mesh_results.len() + self.mesh_upload_queue.len() + self.inflight.len(),
+            self.lighting_results.len()
+                + usize::from(self.lighting_job_inflight)
+                + usize::from(self.lighting_request_pending)
+                + self.pending_removed_lighting_batches.len()
+                + self.pending_chunk_added_lighting_jobs.len()
+                + self.pending_block_edit_lighting_batches.len()
+                + usize::from(self.active_block_edit_lighting_job.is_some()),
+            self.storage_loader.queue_len_approx() + self.saved_column_loads_inflight.len(),
+            self.storage_loader.result_queue_len_approx()
+        );
+    }
+
+    fn transition_world_session(&mut self, next: WorldSessionState, reason: &str) {
+        let previous = self.world_session_state;
+        if previous == next {
+            crate::console_info!(
+                "[world_session] id={} stays {} reason={}",
+                self.world_session_id,
+                next.label(),
+                reason
+            );
+            return;
+        }
+        self.world_session_state = next;
+        self.log_world_session_transition(previous, next, reason);
+    }
+
+    fn reset_world_runtime_state_for_session_shutdown(&mut self, clear_world_data: bool) {
+        self.world_generation_task = None;
+        self.world_session_id = self.world_session_id.max(1);
+        self.mesh_debug_epoch = self.mesh_debug_epoch.wrapping_add(1);
+        self.chunkgen_priority_epoch = self.chunkgen_priority_epoch.wrapping_add(1).max(1);
+        self.chunkgen_stream_epoch = self.chunkgen_stream_epoch.wrapping_add(1).max(1);
+        self.lighting_generation = self.lighting_generation.wrapping_add(1).max(1);
+        self.save_epoch = self.save_epoch.wrapping_add(1).max(1);
+
+        if clear_world_data {
+            self.world.chunks.clear();
+            self.chunk_meshes.clear();
+            self.lod_meshes.clear();
+            self.generated_empty_chunks.clear();
+            self.chunk_origin.clear();
+            self.full_solid_mesh_skip_set.clear();
+            self.highlight_mesh = None;
+            self.outline_target = None;
+        }
+
+        self.dirty_chunk_queue.clear();
+        self.dirty_chunk_set.clear();
+        self.mesh_schedule.clear();
+        self.deferred_mesh_until_frame.clear();
+        self.pending_block_edits.clear();
+        self.pending_block_edit_dirty_chunks.clear();
+        self.pending_block_edit_dirty_columns.clear();
+        self.pending_block_edit_lighting_batches.clear();
+        self.pending_block_edit_lighting_order.clear();
+        self.pending_block_edit_lighting_chunk_batches.clear();
+        self.active_block_edit_lighting_job = None;
+        self.next_block_edit_lighting_batch_id = 1;
+        self.deferred_block_edits.clear();
+        self.deferred_block_edits_total = 0;
+        self.pending_sand_gravity_checks.clear();
+        self.pending_sand_gravity_check_set.clear();
+        self.mesh_upload_queue.clear();
+        self.inflight.clear();
+        self.chunkgen_inflight.clear();
+        self.lod_chunkgen_inflight.clear();
+        self.pending_lod_mesh_uploads.clear();
+        self.chunkgen_pending_set.clear();
+        self.chunkgen_pending_enqueued_frame.clear();
+        self.chunkgen_pending_priority.clear();
+        self.chunkgen_pending_round_robin.clear();
+        self.chunkgen_pending_heap.clear();
+        self.chunkgen_pending_scan_cursor = 0;
+        self.chunkgen_pending_refresh_cursor = 0;
+        self.chunkgen_heap_valid_for_center = None;
+        self.chunkgen_heap_valid_for_radius = -1;
+        self.chunkgen_heap_last_rebuild_frame = 0;
+        self.chunkgen_priority_context_stamp = None;
+        self.stream_horizon_has_data = false;
+        self.stream_horizon_built_frame = u64::MAX;
+        self.stream_horizon_cache_key = None;
+        self.stream_horizon_mesh_count = 0;
+        self.stream_horizon_seen_columns.clear();
+        self.invalidate_stream_planning_cache("session_shutdown");
+        self.stream_scheduler_cached_frame = u64::MAX;
+        self.stream_scheduler_cached_frustum = None;
+        self.stream_scheduler_cached_forward_xz = None;
+        self.stream_scheduler_cached_forward_bucket = 0;
+        self.last_stream_center = None;
+        self.last_stream_radius = -1;
+        self.last_lod_stream_center = None;
+        self.lod_request_cursor = 0;
+        self.chunk_lighting_progress.clear();
+        self.uploaded_final_lighting_chunks.clear();
+        self.lighting_job_inflight = false;
+        self.lighting_request_pending = false;
+        self.lighting_rebuild_not_before = None;
+        self.pending_chunkgen_apply_followups.clear();
+        self.pending_removed_lighting_batches.clear();
+        self.pending_chunk_added_lighting_jobs.clear();
+        self.pending_chunk_added_lighting_coords.clear();
+        self.startup_deferred_chunk_added_lighting_coords.clear();
+        self.next_chunk_added_lighting_batch_id = 1;
+        self.pending_lighting_dirty_chunks.clear();
+        self.pending_lighting_dirty_set.clear();
+        self.saved_revision.clear();
+        self.saved_column_missing_cache.clear();
+        self.saved_column_loads_inflight.clear();
+        self.saved_loads_paused = true;
+        self.startup_saved_load_bypass_logged = false;
+        self.saved_load_apply_queue.clear();
+        self.saved_load_apply_active = None;
+        self.saved_load_request_cursor = 0;
+        self.saved_load_requests_in_window = 0;
+        self.saved_load_requests_window_started = Instant::now();
+        self.dirty_columns.clear();
+        self.dirty_column_queue.clear();
+        self.dirty_column_generation.clear();
+        self.next_dirty_column_generation = 1;
+        self.save_columns_inflight.clear();
+        self.pending_unload_columns.clear();
+        self.pending_unload_queue.clear();
+        self.pending_unload_chunks.clear();
+        self.unload_scan_keys.clear();
+        self.unload_scan_cursor = 0;
+        self.unload_scan_last_refresh_frame = 0;
+        self.prune_mesh_keys.clear();
+        self.prune_mesh_cursor = 0;
+        self.prune_mesh_last_target = None;
+        self.prune_mesh_last_scan_frame = 0;
+        self.autosave_sweep_active = false;
+        self.last_autosave_at = Instant::now();
+        self.frame_index = 0;
+        self.frustum_culled_chunks_total = 0;
+        self.meshes_skipped_due_to_frustum = 0;
+        self.fluid_mesh_coalesce.clear();
+        self.fluid_dirty_due_to_fluids.clear();
+        self.stream_last_camera_pos = None;
+        self.stream_camera_speed_blocks_per_sec = 0.0;
+        self.stream_last_camera_y = None;
+        self.stream_recent_descend_frames = 0;
+        self.stream_recent_mining_frames = 0;
+        self.active_sim_columns.clear();
+        self.last_sim_center = None;
+        self.sim_columns_entered.clear();
+        self.sim_columns_exited.clear();
+        self.particles.clear();
+        self.precipitation_enabled = false;
+        self.precipitation_visual_intensity = 0.0;
+        self.precipitation_phase_seconds = 0.0;
+        let _ = self.with_fluids_system(|fluids| {
+            fluids.reset();
+        });
+        let _ = self.with_block_entities_system_mut(|block_entities, world| {
+            block_entities.reset(world);
+        });
+        self.fluid_accum = 0.0;
+        self.sim_tick_index = 0;
+        self.fluid_debug_counts = FluidDebugCounts::default();
+        self.worldgen_feature_debug_counts = WorldgenFeatureDebugCounts::default();
+        self.winter_surface_debug_counts = WinterSurfaceDebugCounts::default();
+        self.perf_summary_window.reset();
+
+        self.restart_runtime_worker_services();
+        self.restart_storage_services_for_current_save_root();
+    }
+
+    pub(crate) fn world_session_state(&self) -> WorldSessionState {
+        self.world_session_state
+    }
+
+    pub(crate) fn world_session_debug_line(&self) -> String {
+        format!(
+            "World session: id={} state={} runtime={} sim={} save_root={}",
+            self.world_session_id,
+            self.world_session_state.label(),
+            self.world_session_state.allows_runtime_processing() as u8,
+            self.world_session_state.allows_simulation() as u8,
+            self.save_root.display()
+        )
+    }
+
+    pub(crate) fn world_runtime_processing_enabled(&self) -> bool {
+        self.world_session_state.allows_runtime_processing()
+    }
+
+    pub(crate) fn world_environment(&self) -> WorldEnvironment {
+        self.world.config().environment()
+    }
+
+    pub(crate) fn active_precipitation_kind(&self) -> Option<PrecipitationKind> {
+        if !self.precipitation_enabled {
+            return None;
+        }
+        self.world_environment().default_precipitation()
+    }
+
+    pub(crate) fn precipitation_enabled(&self) -> bool {
+        self.active_precipitation_kind().is_some()
+    }
+
+    fn reset_weather_for_environment(&mut self) {
+        self.precipitation_enabled = self.world_environment().enables_winter_surface_rules();
+        self.precipitation_visual_intensity = if self.precipitation_enabled { 1.0 } else { 0.0 };
+        self.precipitation_phase_seconds = 0.0;
+    }
+
+    pub(crate) fn toggle_precipitation(&mut self) {
+        self.precipitation_enabled = !self.precipitation_enabled;
+        let kind = self
+            .world_environment()
+            .default_precipitation()
+            .map(PrecipitationKind::label)
+            .unwrap_or("precipitation");
+        crate::console_info!(
+            "[weather] {}={} intensity_target={:.1} environment={}",
+            kind,
+            if self.precipitation_enabled {
+                "on"
+            } else {
+                "off"
+            },
+            if self.precipitation_enabled { 1.0 } else { 0.0 },
+            self.world_environment().label()
+        );
+    }
+
+    pub(crate) fn advance_weather(&mut self, dt: f32) {
+        let target = if self.precipitation_enabled { 1.0 } else { 0.0 };
+        let response = (dt.max(0.0) * 2.8).clamp(0.0, 1.0);
+        self.precipitation_visual_intensity +=
+            (target - self.precipitation_visual_intensity) * response;
+        self.precipitation_visual_intensity = self.precipitation_visual_intensity.clamp(0.0, 1.0);
+        self.precipitation_phase_seconds = (self.precipitation_phase_seconds + dt.max(0.0)).fract();
+    }
+
+    pub(crate) fn list_saved_worlds(&self) -> Vec<SavedWorldSummary> {
+        let default_root = Self::default_save_root();
+        let worlds_root = default_root.join("worlds");
+        let mut roots = vec![default_root.clone()];
+        if let Ok(entries) = fs::read_dir(&worlds_root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    roots.push(path);
+                }
+            }
+        }
+
+        let mut worlds = roots
+            .into_iter()
+            .filter_map(|save_root| {
+                let meta_path = Self::world_meta_path_for(&save_root);
+                let meta = match world_meta::load(&meta_path) {
+                    Ok(Some(meta)) => meta,
+                    Ok(None) => return None,
+                    Err(err) => {
+                        crate::console_error!(
+                            "[storage][saved_worlds] failed to load {}: {}",
+                            meta_path.display(),
+                            err
+                        );
+                        return None;
+                    }
+                };
+                let modified = fs::metadata(&meta_path)
+                    .and_then(|meta| meta.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                let display_name = if save_root == default_root {
+                    "Current world".to_string()
+                } else {
+                    save_root
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| save_root.display().to_string())
+                };
+                let size_label = ClassicLevelSize::infer_from_boundary_radius_chunks(
+                    meta.boundary_radius_chunks,
+                )
+                .map(ClassicLevelSize::label)
+                .unwrap_or("Custom");
+                let details = format!(
+                    "seed={} preset={:?} size={} env={}",
+                    meta.world_seed,
+                    meta.preset,
+                    size_label,
+                    meta.environment.label()
+                );
+                Some((
+                    modified,
+                    SavedWorldSummary {
+                        is_active: save_root == self.save_root,
+                        save_root,
+                        display_name,
+                        details,
+                    },
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        worlds.sort_by(|(modified_a, world_a), (modified_b, world_b)| {
+            world_b
+                .is_active
+                .cmp(&world_a.is_active)
+                .then_with(|| modified_b.cmp(modified_a))
+                .then_with(|| world_a.display_name.cmp(&world_b.display_name))
+        });
+        worlds.into_iter().map(|(_, world)| world).collect()
+    }
+
+    fn restore_world_definition_from_save_root(&mut self, save_root: &Path) -> io::Result<()> {
+        let meta_path = Self::world_meta_path_for(save_root);
+        let meta = world_meta::load(&meta_path)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("missing world meta at {}", meta_path.display()),
+            )
+        })?;
+        let cfg = Self::world_config_from_meta(&meta);
+        self.world.configure_world_config(cfg, meta.preset);
+        self.reset_weather_for_environment();
+        self.worldgen_preset = meta.preset;
+        crate::console_info!(
+            "[storage][saved_load] restored world definition seed={} preset={:?} environment={} save_root={}",
+            meta.world_seed,
+            meta.preset,
+            meta.environment.label(),
+            save_root.display()
+        );
+        self.rebuild_boundary_ocean_mesh();
+        self.world.replace_ticking_areas(Vec::new());
+        Self::load_ticking_areas_into_world(save_root, &mut self.world);
+
+        let world_manifest_path = Self::world_manifest_path_for(save_root);
+        let block_registry = BlockRegistry::new();
+        let runtime_manifest = WorldManifest::build_from_registry(&block_registry);
+        let manifest = if world_manifest_path.exists() {
+            WorldManifest::load(&world_manifest_path)?
+        } else {
+            runtime_manifest.clone()
+        };
+        let id_mapper = IdMapper::from_manifest_and_registry(&manifest, &block_registry);
+        let signature_changed = manifest.content_signature != runtime_manifest.content_signature;
+        let missing_blocks_count = id_mapper.missing_blocks_count();
+        if signature_changed || missing_blocks_count > 0 {
+            let first_missing = id_mapper
+                .missing_block_keys()
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            crate::console_error!(
+                "[world_manifest] save_root={} signature_changed={} saved={} runtime={} missing_blocks={}{}",
+                save_root.display(),
+                signature_changed,
+                manifest.content_signature,
+                runtime_manifest.content_signature,
+                missing_blocks_count,
+                if first_missing.is_empty() {
+                    "".to_string()
+                } else {
+                    format!(" first_missing=[{}]", first_missing)
+                }
+            );
+        }
+        self.world.set_manifest_and_mapper(manifest, id_mapper);
+        Ok(())
+    }
+
+    pub(crate) fn begin_load_world(&mut self, save_root: PathBuf) -> io::Result<()> {
+        if self.world_generation_task.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "world generation is already running",
+            ));
+        }
+        self.saved_loads_paused = true;
+        self.startup_saved_load_bypass_logged = false;
+        if let Err(err) = self.storage_writer.flush() {
+            crate::console_error!("[storage][save] flush before load level failed: {err}");
+        }
+        self.pump_storage_save_results();
+        self.drain_saved_load_pipeline_for_startup_transition();
+        self.save_epoch = self.save_epoch.wrapping_add(1);
+        let previous_save_root = self.save_root.clone();
+        self.switch_save_root(save_root.clone());
+        self.restore_world_definition_from_save_root(&save_root)?;
+        if self.world_session_state != WorldSessionState::Unloaded {
+            self.transition_world_session(WorldSessionState::Suspended, "begin_load_world");
+        }
+        self.reset_world_runtime_state_for_session_shutdown(true);
+        self.transition_world_session(WorldSessionState::Unloaded, "begin_load_world_reset");
+
+        let (warmup_center_x, warmup_center_z) = self.startup_spawn_chunk_center();
+        self.begin_world_startup_task(
+            WorldGenerationKind::StartupLoad,
+            warmup_center_x,
+            warmup_center_z,
+        );
+        crate::console_info!(
+            "[storage][saved_load] selected world {} -> {}",
+            previous_save_root.display(),
+            save_root.display()
+        );
+        Ok(())
+    }
+
+    pub(crate) fn set_world_session_active(&mut self, reason: &str) {
+        if self.world_session_state == WorldSessionState::Unloaded {
+            self.next_world_session_id();
+        }
+        self.saved_loads_paused = false;
+        self.startup_saved_load_bypass_logged = false;
+        self.transition_world_session(WorldSessionState::Active, reason);
+    }
+
+    pub(crate) fn set_world_session_paused(&mut self, paused: bool, reason: &str) {
+        let next = if paused {
+            WorldSessionState::Paused
+        } else {
+            WorldSessionState::Active
+        };
+        self.transition_world_session(next, reason);
+    }
+
+    pub(crate) fn shutdown_world_session(&mut self, reason: &str) {
+        if self.world_session_state == WorldSessionState::Unloaded {
+            self.transition_world_session(WorldSessionState::Unloaded, reason);
+            return;
+        }
+        self.transition_world_session(WorldSessionState::Suspended, reason);
+        self.reset_world_runtime_state_for_session_shutdown(true);
+        self.transition_world_session(WorldSessionState::Unloaded, "shutdown_complete");
+    }
+
     fn saved_loads_suspended(&self) -> bool {
-        self.saved_loads_paused || self.world_generation_task.is_some()
+        self.saved_loads_paused
+            || self.world_generation_task.is_some()
+            || matches!(
+                self.world_session_state,
+                WorldSessionState::Paused
+                    | WorldSessionState::Suspended
+                    | WorldSessionState::Unloaded
+            )
     }
 
     fn clear_saved_load_apply_backlog(&mut self) -> usize {
@@ -7049,7 +7776,7 @@ impl State {
                 module: world_shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[Vertex::layout()],
+                buffers: &[WorldVertex::layout()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: world_shader,
@@ -7424,7 +8151,7 @@ impl State {
             .join(",");
 
         format!(
-            "[perf][stall] frame={:.1}ms tops=[{}] process_dirty_chunk_meshes(ms={:.1},tops=[{}]) chunkgen(ms={:.1},drain={},q={}=>{},applied={},pure_ms={:.1},sidefx_ms={:.1},sidefx_q={}=>{},queued={},done={},light[a={},r={}],fluid_cells={},fluid_scans={},overshoot={},sched[pend={},heap={},reprio={},rebuild={}@{:.1}ms,fcache={}/{}@{:.1}ms,hcache={}/{}@{:.1}ms],lod_results={},lod_req={},lod_up={},lod_up_q={},lod_gpu_ms={:.1}) mesh(ms={:.1},drain={},q={}=>{},up_q={}=>{},uploads={},gpu_up_ms={:.1},wait_avg/max_ms={:.2}/{:.2},near_first={}@{:.2}/{:.2}ms,near_final={}@{:.2}/{:.2}ms,final_upgrades={},budget_boost_ms={:.2},dirty[g={},l={},b={}],coalesced={},avoided={},dispatch[b={},l={}]) storage(ms={:.1},drain={},q={}=>{},ok={},fail={},autosave_q={}) lighting(ms={:.1},drain={},q={}=>{},changed={},inc_jobs={},steps={},primary={},region={},inc_chunks={},voxels={},boundary={},split_jobs={},step_max_ms={:.2},backlog={}) stream(ms={:.1},far_lod={},lod_center={:?},lod_center_changes={},lod_cpu_skip={},lod_backlog_skip={}) coverage(near={},lod={},lod_dc={},near_mem_mb={:.2},lod_mem_mb={:.2}) saved_load(ms={:.1},attempts={},hits={},misses={},drain={},applied={},discarded={},failed={},rx_q={}=>{},apply_q={}=>{},work[sec={}=>{},edits={},chunks={},boundary={},steps={},done={},yield={},resume={},cps={:.1}],phase_ms=[{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}],step_max=[{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}],worst_ms={:.1}) deferred(pending={},applied={},chunks_touched={},dropped_caps={}) salvage(chunks={},edits={},skipped_dense={}) view={} inflight(mesh={},chunkgen={},lod={}) backlogs(mesh_rx={},chunkgen_rx={},light_rx={},save_rx={},save_ack_rx={},mesh_up_q={},lod_up_q={})",
+            "[perf][stall] frame={:.1}ms tops=[{}] process_dirty_chunk_meshes(ms={:.1},tops=[{}]) chunkgen(ms={:.1},drain={},q={}=>{},applied={},pure_ms={:.1},sidefx_ms={:.1},sidefx_q={}=>{},queued={},done={},light[a={},r={}],fluid_cells={},fluid_scans={},overshoot={},sched[pend={},heap={},reprio={},rebuild={}@{:.1}ms,fcache={}/{}@{:.1}ms,hcache={}/{}@{:.1}ms],lod_results={},lod_req={},lod_up={},lod_up_q={},lod_gpu_ms={:.1}) mesh(ms={:.1},drain={},q={}=>{},up_q={}=>{},uploads={},gpu_up_ms={:.1},wait_avg/max_ms={:.2}/{:.2},near_first={}@{:.2}/{:.2}ms,near_final={}@{:.2}/{:.2}ms,final_upgrades={},budget_boost_ms={:.2},dirty[g={},l={},b={}],coalesced={},avoided={},dispatch[b={},l={}]) storage(ms={:.1},drain={},q={}=>{},ok={},fail={},autosave_q={}) lighting(ms={:.1},drain={},q={}=>{},changed={},inc_jobs={},steps={},primary={},region={},inc_chunks={},voxels={},boundary={},split_jobs={},step_max_ms={:.2},backlog={},edit[batches={},merged={},enqueue_ms={:.2},proc_ms={:.2},steps={},voxels={},changed={},chunks={},budget_ms={:.2}]) stream(ms={:.1},far_lod={},lod_center={:?},lod_center_changes={},lod_cpu_skip={},lod_backlog_skip={}) coverage(near={},lod={},lod_dc={},near_mem_mb={:.2},lod_mem_mb={:.2}) saved_load(ms={:.1},attempts={},hits={},misses={},drain={},applied={},discarded={},failed={},rx_q={}=>{},apply_q={}=>{},work[sec={}=>{},edits={},chunks={},boundary={},steps={},done={},yield={},resume={},cps={:.1}],phase_ms=[{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}],step_max=[{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}],worst_ms={:.1}) deferred(pending={},applied={},chunks_touched={},dropped_caps={}) salvage(chunks={},edits={},skipped_dense={}) view={} inflight(mesh={},chunkgen={},lod={}) backlogs(mesh_rx={},chunkgen_rx={},light_rx={},save_rx={},save_ack_rx={},mesh_up_q={},lod_up_q={})",
             frame_dt_ms,
             top_scopes,
             self.frame_perf.process_dirty_chunk_meshes_ms,
@@ -7523,6 +8250,15 @@ impl State {
             self.frame_perf.lighting_incremental_split_jobs,
             self.frame_perf.lighting_incremental_step_max_ms,
             self.frame_perf.lighting_incremental_backlog_depth,
+            self.frame_perf.lighting_block_edit_batches_enqueued,
+            self.frame_perf.lighting_block_edit_batches_merged,
+            self.frame_perf.lighting_block_edit_enqueue_ms,
+            self.frame_perf.lighting_block_edit_process_ms,
+            self.frame_perf.lighting_block_edit_steps,
+            self.frame_perf.lighting_block_edit_voxels_visited,
+            self.frame_perf.lighting_block_edit_changed_voxels,
+            self.frame_perf.lighting_block_edit_chunks_touched,
+            self.frame_perf.lighting_block_edit_budget_used_ms,
             self.frame_perf.enqueue_chunks_within_view_ms,
             self.far_lod_enabled,
             self.last_lod_stream_center,
@@ -8319,6 +9055,10 @@ impl State {
         let sky_shader = Self::create_shader_module_traced(&device, "Sky Shader", SKY_SHADER_WGSL);
         let outline_shader =
             Self::create_shader_module_traced(&device, "Outline Shader", OUTLINE_SHADER_WGSL);
+        let rain_shader =
+            Self::create_shader_module_traced(&device, "Rain Shader", RAIN_SHADER_WGSL);
+        let snow_shader =
+            Self::create_shader_module_traced(&device, "Snow Shader", SNOW_SHADER_WGSL);
 
         // World-Pipeline verwendet Textur + Kamera.
         let world_pipeline_layout =
@@ -8568,6 +9308,84 @@ impl State {
                 cache: None,
             },
         );
+        let rain_pipeline = Self::create_render_pipeline_traced(
+            &device,
+            &wgpu::RenderPipelineDescriptor {
+                label: Some("Rain Pipeline"),
+                layout: Some(&color_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &rain_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[OutlineVertex::layout()],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &rain_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::LineList,
+                    cull_mode: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: depth.format,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            },
+        );
+        let snow_pipeline = Self::create_render_pipeline_traced(
+            &device,
+            &wgpu::RenderPipelineDescriptor {
+                label: Some("Snow Pipeline"),
+                layout: Some(&color_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &snow_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[OutlineVertex::layout()],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &snow_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::LineList,
+                    cull_mode: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: depth.format,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            },
+        );
 
         // 2D-UI Pipeline in NDC: unabhängig von Kamera/View-Matrix.
         let ui_shader = Self::create_shader_module_traced(&device, "UI Shader", UI_SHADER_WGSL);
@@ -8769,6 +9587,7 @@ impl State {
             Ok(Some(meta)) => {
                 let cfg = Self::world_config_from_meta(&meta);
                 world.configure_world_config(cfg, meta.preset);
+                // Startup should inherit the persisted climate before any warmup work begins.
                 startup_worldgen_preset = meta.preset;
                 crate::console_info!(
                     "startup world: loaded {} (seed={}, preset={:?}, sea_level={}, min_y={}, max_y={}, chunk_size={}, boundary_ocean={}, boundary_radius_chunks={})",
@@ -8920,6 +9739,8 @@ impl State {
             render_pipeline_transparent_no_depth,
             render_pipeline_lod,
             sky_pipeline,
+            rain_pipeline,
+            snow_pipeline,
             highlight_pipeline,
             outline_pipeline,
             ui_pipeline,
@@ -8936,8 +9757,13 @@ impl State {
             mesh_schedule: HashMap::new(),
             deferred_mesh_until_frame: HashMap::new(),
             pending_block_edits: VecDeque::new(),
-            pending_block_edit_dirty_chunks: HashSet::new(),
+            pending_block_edit_dirty_chunks: HashMap::new(),
             pending_block_edit_dirty_columns: HashSet::new(),
+            pending_block_edit_lighting_batches: HashMap::new(),
+            pending_block_edit_lighting_order: VecDeque::new(),
+            pending_block_edit_lighting_chunk_batches: HashMap::new(),
+            active_block_edit_lighting_job: None,
+            next_block_edit_lighting_batch_id: 1,
             deferred_block_edits: HashMap::new(),
             deferred_block_edits_total: 0,
             pending_sand_gravity_checks: VecDeque::new(),
@@ -9015,6 +9841,7 @@ impl State {
             sim_system_last_frame_ticks: Vec::new(),
             fluid_debug_counts: FluidDebugCounts::default(),
             worldgen_feature_debug_counts: WorldgenFeatureDebugCounts::default(),
+            winter_surface_debug_counts: WinterSurfaceDebugCounts::default(),
             chunk_lighting_progress: HashMap::new(),
             frame_index: 0,
             frustum_culled_chunks_total: 0,
@@ -9023,6 +9850,9 @@ impl State {
             fluid_dirty_due_to_fluids: HashSet::new(),
             particles: Vec::with_capacity(2048),
             particle_rng: 0x7A11_9F3D,
+            precipitation_enabled: false,
+            precipitation_visual_intensity: 0.0,
+            precipitation_phase_seconds: 0.0,
             render_distance,
             view_distance_chunks,
             simulation_distance,
@@ -9032,6 +9862,8 @@ impl State {
             sim_columns_entered: Vec::new(),
             sim_columns_exited: Vec::new(),
             worldgen_preset: startup_worldgen_preset,
+            world_session_state: WorldSessionState::Unloaded,
+            world_session_id: 0,
             world_generation_task: None,
             uploaded_final_lighting_chunks: HashSet::new(),
             last_stream_center: None,
@@ -9140,6 +9972,7 @@ impl State {
 
             depth,
         };
+        state.reset_weather_for_environment();
         state.register_sim_system(Box::new(fluids_runtime));
         state.register_sim_system(Box::new(BlockEntitiesSystem::new()));
         state.register_sim_system(Box::new(RandomTicksSystem::new(RANDOM_TICK_SPEED_DEFAULT)));
@@ -10049,6 +10882,28 @@ impl State {
             .max(0)
     }
 
+    fn startup_radius_chunks_for(&self, kind: WorldGenerationKind) -> i32 {
+        match kind {
+            WorldGenerationKind::StartupLoad => {
+                let cfg = self.world.config();
+                let normal_radius = ClassicLevelSize::Normal.boundary_radius_chunks();
+                let mut radius = self.startup_radius_chunks().min(normal_radius);
+                if cfg.boundary_ocean() && cfg.boundary_radius_chunks() > 0 {
+                    radius = radius.min(cfg.boundary_radius_chunks());
+                }
+                radius.max(0)
+            }
+            WorldGenerationKind::NewWorld => {
+                let cfg = self.world.config();
+                if cfg.boundary_ocean() && cfg.boundary_radius_chunks() > 0 {
+                    cfg.boundary_radius_chunks()
+                } else {
+                    self.startup_radius_chunks()
+                }
+            }
+        }
+    }
+
     fn startup_column_order(
         &self,
         center_chunk_x: i32,
@@ -10100,11 +10955,11 @@ impl State {
         center_chunk_x: i32,
         center_chunk_y: i32,
         center_chunk_z: i32,
+        radius: i32,
     ) -> HashSet<ChunkCoord> {
         let mut coords = HashSet::new();
         let min_chunk_y = self.world.min_chunk_y();
         let max_chunk_y = self.world.max_chunk_y();
-        let radius = self.startup_radius_chunks();
         for col in self.startup_column_order(center_chunk_x, center_chunk_z, radius) {
             let plan = self.build_startup_column_stream_plan(
                 col.x,
@@ -10128,8 +10983,9 @@ impl State {
         &self,
         center_chunk_x: i32,
         center_chunk_z: i32,
+        radius: i32,
     ) -> HashSet<ColumnCoord> {
-        self.startup_column_order(center_chunk_x, center_chunk_z, self.startup_radius_chunks())
+        self.startup_column_order(center_chunk_x, center_chunk_z, radius)
             .into_iter()
             .collect()
     }
@@ -11439,12 +12295,22 @@ impl State {
             .worldgen_feature_debug_counts
             .total_shoreline_sand_blocks
             .saturating_add(stats.shoreline_sand_blocks as u64);
+        self.worldgen_feature_debug_counts.total_winter_snow_blocks = self
+            .worldgen_feature_debug_counts
+            .total_winter_snow_blocks
+            .saturating_add(stats.winter_snow_blocks as u64);
+        self.worldgen_feature_debug_counts.total_winter_ice_blocks = self
+            .worldgen_feature_debug_counts
+            .total_winter_ice_blocks
+            .saturating_add(stats.winter_ice_blocks as u64);
         self.worldgen_feature_debug_counts
             .last_worldgen_water_blocks = stats.worldgen_water_blocks;
         self.worldgen_feature_debug_counts
             .last_worldgen_water_source_blocks = stats.worldgen_water_source_blocks;
         self.worldgen_feature_debug_counts
             .last_shoreline_sand_blocks = stats.shoreline_sand_blocks;
+        self.worldgen_feature_debug_counts.last_winter_snow_blocks = stats.winter_snow_blocks;
+        self.worldgen_feature_debug_counts.last_winter_ice_blocks = stats.winter_ice_blocks;
     }
 
     fn chunkgen_apply_followup_backlog_len(&self) -> usize {
@@ -12587,6 +13453,9 @@ impl State {
     }
 
     fn enqueue_chunks_within_view(&mut self, camera: &Camera) {
+        if !self.world_session_state.allows_runtime_processing() {
+            return;
+        }
         let _trace_scope = perf_trace::scope("state.enqueue_chunks_within_view");
         let started = Instant::now();
         let (chunk_x, chunk_y, chunk_z, radius) =
@@ -12740,8 +13609,10 @@ impl State {
             let dz = coord.z - chunk_z;
             dx * dx + dz * dz <= radius_sq
         });
-        self.prune_chunk_meshes_outside_view(camera);
-        self.enqueue_chunks_within_view(camera);
+        if self.world_session_state.allows_runtime_processing() {
+            self.prune_chunk_meshes_outside_view(camera);
+            self.enqueue_chunks_within_view(camera);
+        }
     }
 
     pub(crate) fn is_sim_column_active(&self, x: i32, z: i32) -> bool {
@@ -12904,6 +13775,13 @@ impl State {
     }
 
     pub(crate) fn update_simulation_activation(&mut self, camera: &Camera) {
+        if !self.world_session_state.allows_simulation() {
+            self.active_sim_columns.clear();
+            self.last_sim_center = None;
+            self.sim_columns_entered.clear();
+            self.sim_columns_exited.clear();
+            return;
+        }
         let (entered, exited) = self.recompute_active_sim_columns(camera);
         self.sim_columns_entered = entered;
         self.sim_columns_exited = exited;
@@ -12988,11 +13866,14 @@ impl State {
             .distance_chunks()
             .min(self.view_distance_chunks);
         self.last_sim_center = None;
-        self.update_simulation_activation(camera);
+        if self.world_session_state.allows_simulation() {
+            self.update_simulation_activation(camera);
+        }
     }
 
     pub(crate) fn is_world_startup_loading(&self) -> bool {
-        self.world_generation_task.is_some()
+        self.world_session_state == WorldSessionState::Generating
+            && self.world_generation_task.is_some()
     }
 
     fn startup_spawn_chunk_center(&self) -> (i32, i32) {
@@ -13011,11 +13892,21 @@ impl State {
             return;
         }
 
+        self.next_world_session_id();
+        self.saved_loads_paused = true;
+        self.startup_saved_load_bypass_logged = false;
+        self.transition_world_session(WorldSessionState::Generating, kind.overlay_title());
+
         let center_chunk_y = (self.world.sea_level() + 16).div_euclid(CHUNK_SIZE);
-        let warmup_columns = self.build_worldgen_warmup_columns(warmup_center_x, warmup_center_z);
-        let warmup_coords =
-            self.build_worldgen_warmup_coords(warmup_center_x, center_chunk_y, warmup_center_z);
-        let startup_radius = self.startup_radius_chunks();
+        let startup_radius = self.startup_radius_chunks_for(kind);
+        let warmup_columns =
+            self.build_worldgen_warmup_columns(warmup_center_x, warmup_center_z, startup_radius);
+        let warmup_coords = self.build_worldgen_warmup_coords(
+            warmup_center_x,
+            center_chunk_y,
+            warmup_center_z,
+            startup_radius,
+        );
         let startup_column_order =
             self.startup_column_order(warmup_center_x, warmup_center_z, startup_radius);
         let warmup_target = warmup_coords.len().max(1);
@@ -13066,6 +13957,9 @@ impl State {
     }
 
     pub(crate) fn begin_startup_loading(&mut self) {
+        if self.world_session_state != WorldSessionState::Unloaded {
+            self.shutdown_world_session("begin_startup_loading");
+        }
         let (warmup_center_x, warmup_center_z) = self.startup_spawn_chunk_center();
         self.begin_world_startup_task(
             WorldGenerationKind::StartupLoad,
@@ -13074,7 +13968,13 @@ impl State {
         );
     }
 
-    pub(crate) fn begin_new_world(&mut self, seed: u64, preset: WorldgenPreset) {
+    pub(crate) fn begin_new_world(
+        &mut self,
+        seed: u64,
+        preset: WorldgenPreset,
+        classic_size: ClassicLevelSize,
+        environment: WorldEnvironment,
+    ) {
         if self.world_generation_task.is_some() {
             return;
         }
@@ -13100,11 +14000,11 @@ impl State {
 
         let mut cfg = self.world.config();
         cfg.seed = seed;
-        let (boundary_ocean, boundary_radius_chunks) =
-            Self::boundary_ocean_defaults_for_preset(preset);
-        cfg.boundary_ocean = boundary_ocean;
-        cfg.boundary_radius_chunks = boundary_radius_chunks;
+        cfg.boundary_ocean = true;
+        cfg.boundary_radius_chunks = classic_size.boundary_radius_chunks();
+        cfg.environment = environment;
         self.world.configure_world_config(cfg, preset);
+        self.reset_weather_for_environment();
         self.rebuild_boundary_ocean_mesh();
         self.world.replace_ticking_areas(Vec::new());
         self.worldgen_preset = preset;
@@ -13140,125 +14040,11 @@ impl State {
                 err
             );
         }
-        self.world.chunks.clear();
-        self.chunk_meshes.clear();
-        self.full_solid_mesh_skip_set.clear();
-        self.lod_meshes.clear();
-        self.dirty_chunk_queue.clear();
-        self.dirty_chunk_set.clear();
-        self.deferred_mesh_until_frame.clear();
-        self.inflight.clear();
-        self.mesh_schedule.clear();
-        self.chunkgen_inflight.clear();
-        self.lod_chunkgen_inflight.clear();
-        self.generated_empty_chunks.clear();
-        self.chunk_origin.clear();
-        self.deferred_block_edits.clear();
-        self.deferred_block_edits_total = 0;
-        self.mesh_upload_queue.clear();
-        while self.mesh_results.try_recv().is_ok() {}
-        while self.chunkgen_results.try_recv().is_ok() {}
-        while self.lighting_results.try_recv().is_ok() {}
-        self.discard_ready_saved_load_results();
-        self.clear_saved_load_apply_backlog();
-        self.highlight_mesh = None;
-        self.outline_target = None;
-        self.particles.clear();
-        let _ = self.with_fluids_system(|fluids| {
-            fluids.reset();
-        });
-        let _ = self.with_block_entities_system_mut(|block_entities, world| {
-            block_entities.reset(world);
-        });
-        self.fluid_accum = 0.0;
-        self.sim_tick_index = 0;
-        self.fluid_debug_counts = FluidDebugCounts::default();
-        self.worldgen_feature_debug_counts = WorldgenFeatureDebugCounts::default();
-        self.chunk_lighting_progress.clear();
-        self.uploaded_final_lighting_chunks.clear();
-        self.pending_chunkgen_apply_followups.clear();
-        self.pending_removed_lighting_batches.clear();
-        self.pending_chunk_added_lighting_jobs.clear();
-        self.pending_chunk_added_lighting_coords.clear();
-        self.startup_deferred_chunk_added_lighting_coords.clear();
-        self.next_chunk_added_lighting_batch_id = 1;
-        self.frame_index = 0;
-        self.frustum_culled_chunks_total = 0;
-        self.meshes_skipped_due_to_frustum = 0;
-        self.fluid_mesh_coalesce.clear();
-        self.fluid_dirty_due_to_fluids.clear();
-        self.stream_last_camera_pos = None;
-        self.stream_camera_speed_blocks_per_sec = 0.0;
-        self.stream_last_camera_y = None;
-        self.stream_recent_descend_frames = 0;
-        self.stream_recent_mining_frames = 0;
-        self.last_stream_center = None;
-        self.last_stream_radius = -1;
-        self.radius_offsets_cache.clear();
-        self.last_lod_stream_center = None;
-        self.lod_ring_offsets_cache.clear();
-        self.lod_request_cursor = 0;
-        self.chunkgen_pending_set.clear();
-        self.chunkgen_pending_enqueued_frame.clear();
-        self.chunkgen_pending_priority.clear();
-        self.chunkgen_pending_round_robin.clear();
-        self.chunkgen_pending_heap.clear();
-        self.chunkgen_pending_scan_cursor = 0;
-        self.chunkgen_pending_refresh_cursor = 0;
-        self.chunkgen_heap_valid_for_center = None;
-        self.chunkgen_heap_valid_for_radius = -1;
-        self.chunkgen_heap_last_rebuild_frame = 0;
-        self.chunkgen_priority_epoch = 1;
-        self.chunkgen_priority_context_stamp = None;
-        self.chunkgen_stream_epoch = self.chunkgen_stream_epoch.wrapping_add(1);
-        self.stream_horizon_has_data = false;
-        self.stream_horizon_built_frame = u64::MAX;
-        self.stream_horizon_cache_key = None;
-        self.stream_horizon_mesh_count = 0;
-        self.stream_horizon_seen_columns.clear();
-        self.invalidate_stream_planning_cache("begin_new_world");
-        self.stream_scheduler_cached_frame = u64::MAX;
-        self.stream_scheduler_cached_frustum = None;
-        self.stream_scheduler_cached_forward_xz = None;
-        self.stream_scheduler_cached_forward_bucket = 0;
-        self.lod_cached_near_radius = -1;
-        self.lod_cached_far_radius = -1;
-        self.lighting_job_inflight = false;
-        self.lighting_request_pending = false;
-        self.lighting_rebuild_not_before = None;
-        self.pending_chunkgen_apply_followups.clear();
-        self.pending_removed_lighting_batches.clear();
-        self.pending_chunk_added_lighting_jobs.clear();
-        self.pending_chunk_added_lighting_coords.clear();
-        self.startup_deferred_chunk_added_lighting_coords.clear();
-        self.pending_lighting_dirty_chunks.clear();
-        self.pending_lighting_dirty_set.clear();
-        self.saved_revision.clear();
-        self.saved_column_missing_cache.clear();
-        self.saved_column_loads_inflight.clear();
-        self.saved_loads_paused = true;
-        self.startup_saved_load_bypass_logged = false;
-        self.saved_load_request_cursor = 0;
-        self.saved_load_requests_in_window = 0;
-        self.saved_load_requests_window_started = Instant::now();
-        self.perf_summary_window.reset();
-        self.dirty_columns.clear();
-        self.dirty_column_queue.clear();
-        self.dirty_column_generation.clear();
-        self.next_dirty_column_generation = 1;
-        self.save_columns_inflight.clear();
-        self.pending_unload_columns.clear();
-        self.pending_unload_queue.clear();
-        self.pending_unload_chunks.clear();
-        self.unload_scan_keys.clear();
-        self.unload_scan_cursor = 0;
-        self.unload_scan_last_refresh_frame = 0;
-        self.prune_mesh_keys.clear();
-        self.prune_mesh_cursor = 0;
-        self.prune_mesh_last_target = None;
-        self.prune_mesh_last_scan_frame = 0;
-        self.autosave_sweep_active = false;
-        self.last_autosave_at = Instant::now();
+        if self.world_session_state != WorldSessionState::Unloaded {
+            self.transition_world_session(WorldSessionState::Suspended, "begin_new_world");
+        }
+        self.reset_world_runtime_state_for_session_shutdown(true);
+        self.transition_world_session(WorldSessionState::Unloaded, "begin_new_world_reset");
 
         let (warmup_center_x, warmup_center_z) = self.startup_spawn_chunk_center();
         self.begin_world_startup_task(
@@ -13267,15 +14053,21 @@ impl State {
             warmup_center_z,
         );
         crate::console_info!(
-            "new level generation: seed={} preset={:?} warmup_center=({}, {})",
+            "new level generation: seed={} preset={:?} environment={} classic_size={} boundary_radius_chunks={} warmup_center=({}, {})",
             seed,
             preset,
+            environment.label(),
+            classic_size.label(),
+            classic_size.boundary_radius_chunks(),
             warmup_center_x,
             warmup_center_z
         );
     }
 
     pub(crate) fn poll_worldgen_progress(&mut self) -> Option<WorldGenProgress> {
+        if self.world_session_state != WorldSessionState::Generating {
+            return None;
+        }
         if let Some(task) = self.world_generation_task.as_ref() {
             let center_chunk_y = (self.world.sea_level() + 16).div_euclid(CHUNK_SIZE);
             self.ensure_chunks_in_radius(
@@ -13295,6 +14087,9 @@ impl State {
     }
 
     pub(crate) fn try_finish_world_startup_loading(&mut self, camera: &Camera) -> Option<Vec3> {
+        if self.world_session_state != WorldSessionState::Generating {
+            return None;
+        }
         if let Some(task) = self.world_generation_task.as_ref() {
             let center_chunk_y = (self.world.sea_level() + 16).div_euclid(CHUNK_SIZE);
             self.ensure_chunks_in_radius(
@@ -13336,6 +14131,7 @@ impl State {
         self.world_generation_task = None;
         self.saved_loads_paused = false;
         self.startup_saved_load_bypass_logged = false;
+        self.transition_world_session(WorldSessionState::Active, "startup_ready");
         self.enqueue_chunks_within_view(camera);
         Some(spawn)
     }
@@ -13682,6 +14478,225 @@ impl State {
         affected
     }
 
+    fn mesh_layer_mask_for_block(&self, block: BlockId) -> MeshLayerMask {
+        if !block.is_voxel_filled() {
+            return MeshLayerMask::NONE;
+        }
+        MeshLayerMask::for_render_layer(self.block_texture_lookup.render_layer_for(block))
+    }
+
+    fn face_sensitive_mesh_layer_mask_for_block(&self, block: BlockId) -> MeshLayerMask {
+        if !block.is_voxel_filled() {
+            return MeshLayerMask::NONE;
+        }
+        match self.block_texture_lookup.model_for(block) {
+            BlockModel::Cube
+            | BlockModel::SlabBottom
+            | BlockModel::LayerBottom { .. }
+            | BlockModel::Liquid { .. } => self.mesh_layer_mask_for_block(block),
+            BlockModel::CrossPlant => MeshLayerMask::NONE,
+        }
+    }
+
+    fn neighbor_covers_boundary(
+        &self,
+        neighbor: BlockId,
+        neighbor_face: Face,
+        requested: FaceCoverage,
+    ) -> bool {
+        self.block_texture_lookup
+            .occlusion_shape_for(neighbor)
+            .boundary_coverage(neighbor_face)
+            .covers(requested)
+    }
+
+    fn cube_face_mesh_visible(&self, current: BlockId, neighbor: BlockId, face: Face) -> bool {
+        if !current.is_voxel_filled() {
+            return false;
+        }
+        if !neighbor.is_voxel_filled() {
+            return true;
+        }
+        let current_info = self.block_texture_lookup.info_for(current);
+        let neighbor_info = self.block_texture_lookup.info_for(neighbor);
+        if current_info.cull_group != CullGroup::None
+            && current_info.cull_group == neighbor_info.cull_group
+            && self.neighbor_covers_boundary(neighbor, face.opposite(), FaceCoverage::Full)
+        {
+            return false;
+        }
+        !self.neighbor_covers_boundary(neighbor, face.opposite(), FaceCoverage::Full)
+    }
+
+    fn slab_face_mesh_visible(&self, current: BlockId, neighbor: BlockId, face: Face) -> bool {
+        if !current.is_voxel_filled() {
+            return false;
+        }
+        if face == Face::Up {
+            return true;
+        }
+        if !neighbor.is_voxel_filled() {
+            return true;
+        }
+        if matches!(
+            self.block_texture_lookup.model_for(current),
+            BlockModel::LayerBottom { .. }
+        ) && current == neighbor
+            && matches!(face, Face::North | Face::South | Face::East | Face::West)
+        {
+            return false;
+        }
+        let required = match face {
+            Face::Down => FaceCoverage::Full,
+            Face::North | Face::South | Face::East | Face::West => FaceCoverage::LowerHalf,
+            Face::Up => FaceCoverage::None,
+        };
+        let current_group = self.block_texture_lookup.cull_group_for(current);
+        let neighbor_group = self.block_texture_lookup.cull_group_for(neighbor);
+        if current_group != CullGroup::None
+            && current_group == neighbor_group
+            && self.neighbor_covers_boundary(neighbor, face.opposite(), required)
+        {
+            return false;
+        }
+        !self.neighbor_covers_boundary(neighbor, face.opposite(), required)
+    }
+
+    fn liquid_face_mesh_visible(&self, current: BlockId, neighbor: BlockId, face: Face) -> bool {
+        let Some(kind) = fluid_kind(current) else {
+            return false;
+        };
+        match face {
+            Face::Up => fluid_kind(neighbor) != Some(kind),
+            Face::Down => false,
+            Face::North | Face::South | Face::East | Face::West => {
+                fluid_kind(neighbor) != Some(kind)
+                    && (!neighbor.is_voxel_filled()
+                        || !self.block_texture_lookup.face_occluding_for(neighbor))
+            }
+        }
+    }
+
+    fn block_face_mesh_visible(&self, current: BlockId, neighbor: BlockId, face: Face) -> bool {
+        if !current.is_voxel_filled() {
+            return false;
+        }
+        match self.block_texture_lookup.model_for(current) {
+            BlockModel::Cube => self.cube_face_mesh_visible(current, neighbor, face),
+            BlockModel::SlabBottom => self.slab_face_mesh_visible(current, neighbor, face),
+            BlockModel::LayerBottom { .. } => self.slab_face_mesh_visible(current, neighbor, face),
+            BlockModel::Liquid { .. } => self.liquid_face_mesh_visible(current, neighbor, face),
+            BlockModel::CrossPlant => false,
+        }
+    }
+
+    fn boundary_face_mesh_signature(
+        &self,
+        changed_block: BlockId,
+        neighbor: BlockId,
+        face: Face,
+    ) -> (bool, bool) {
+        (
+            self.block_face_mesh_visible(changed_block, neighbor, face),
+            self.block_face_mesh_visible(neighbor, changed_block, face.opposite()),
+        )
+    }
+
+    fn classify_block_edit_mesh_invalidation(
+        &self,
+        world_pos: IVec3,
+        old_block: BlockId,
+        new_block: BlockId,
+    ) -> Vec<BlockEditMeshInvalidation> {
+        if old_block == new_block {
+            return Vec::new();
+        }
+
+        let center_coord = World::world_to_chunk_coord(world_pos);
+        let local = World::world_to_local(world_pos);
+        let mut center_layers =
+            self.mesh_layer_mask_for_block(old_block) | self.mesh_layer_mask_for_block(new_block);
+        let mut invalidations = Vec::with_capacity(4);
+
+        for face in [
+            Face::Up,
+            Face::Down,
+            Face::North,
+            Face::South,
+            Face::East,
+            Face::West,
+        ] {
+            let normal = face.normal_i32();
+            let neighbor_pos = world_pos + IVec3::new(normal[0], normal[1], normal[2]);
+            if !World::in_bounds(neighbor_pos) {
+                continue;
+            }
+            let neighbor_block = self.world.get_block(neighbor_pos);
+            let before = self.boundary_face_mesh_signature(old_block, neighbor_block, face);
+            let after = self.boundary_face_mesh_signature(new_block, neighbor_block, face);
+            if before == after {
+                continue;
+            }
+
+            let neighbor_coord = World::world_to_chunk_coord(neighbor_pos);
+            let neighbor_layers = self.face_sensitive_mesh_layer_mask_for_block(neighbor_block);
+            if neighbor_coord == center_coord {
+                center_layers |= neighbor_layers;
+            } else if !neighbor_layers.is_empty() {
+                invalidations.push(BlockEditMeshInvalidation {
+                    coord: neighbor_coord,
+                    dirty: ChunkMeshDirtySet::new(MeshDirtyReasons::BOUNDARY, neighbor_layers, 1),
+                });
+            }
+        }
+
+        if !center_layers.is_empty() {
+            invalidations.push(BlockEditMeshInvalidation {
+                coord: center_coord,
+                dirty: ChunkMeshDirtySet::new(MeshDirtyReasons::GEOMETRY, center_layers, 1),
+            });
+        }
+
+        if !invalidations.is_empty() {
+            let mut new_scope = String::new();
+            for (index, invalidation) in invalidations.iter().enumerate() {
+                if index > 0 {
+                    new_scope.push(';');
+                }
+                let _ = std::fmt::Write::write_fmt(
+                    &mut new_scope,
+                    format_args!(
+                        "({},{},{}) reasons={} layers={}",
+                        invalidation.coord.x,
+                        invalidation.coord.y,
+                        invalidation.coord.z,
+                        invalidation.dirty.reasons.labels(),
+                        invalidation.dirty.layers.labels()
+                    ),
+                );
+            }
+            perf_trace::instant_event(
+                "mesh.block_edit_invalidation",
+                &format!(
+                    "pos=({}, {}, {}) old={:?} new={:?} chunk_local=({}, {}, {}) old_scope_chunks={} new_scope_chunks={} new_scope={}",
+                    world_pos.x,
+                    world_pos.y,
+                    world_pos.z,
+                    old_block,
+                    new_block,
+                    local.x,
+                    local.y,
+                    local.z,
+                    Self::affected_chunks_for_block_change(world_pos).len(),
+                    invalidations.len(),
+                    new_scope
+                ),
+            );
+        }
+
+        invalidations
+    }
+
     fn mesh_state_from_reasons(reasons: MeshDirtyReasons) -> ChunkMeshState {
         if reasons.is_empty() {
             ChunkMeshState::CleanReady
@@ -13735,19 +14750,20 @@ impl State {
         if self
             .mesh_schedule
             .get(&coord)
-            .is_some_and(|entry| !entry.queued_reasons.is_empty())
+            .is_some_and(|entry| !entry.queued.is_empty())
         {
             self.enqueue_dirty_chunk_coord(coord);
         }
     }
 
-    fn mark_chunk_dirty_with_reasons(&mut self, coord: ChunkCoord, reasons: MeshDirtyReasons) {
-        if reasons.is_empty() {
+    fn mark_chunk_dirty_with_scope(&mut self, coord: ChunkCoord, dirty: ChunkMeshDirtySet) {
+        if dirty.is_empty() {
             return;
         }
-        self.note_mesh_dirty_reason_metrics(reasons);
+        self.note_mesh_dirty_reason_metrics(dirty.reasons);
 
-        let should_await_lighting = self.mesh_should_await_lighting_finalization(coord, reasons);
+        let should_await_lighting =
+            self.mesh_should_await_lighting_finalization(coord, dirty.reasons);
         let mut enqueue_now = false;
         let mut coalesced = false;
         let mut avoided = false;
@@ -13756,13 +14772,13 @@ impl State {
             match entry.state {
                 ChunkMeshState::CleanReady => {
                     if should_await_lighting {
-                        entry.pending_reasons |= reasons;
+                        entry.pending.merge_assign(dirty);
                         entry.state = ChunkMeshState::AwaitingLightingFinalization;
                         avoided = true;
                     } else {
-                        let before = entry.queued_reasons;
-                        entry.queued_reasons |= reasons;
-                        entry.state = Self::mesh_state_from_reasons(entry.queued_reasons);
+                        let before = entry.queued;
+                        entry.queued.merge_assign(dirty);
+                        entry.state = Self::mesh_state_from_reasons(entry.queued.reasons);
                         enqueue_now = true;
                         coalesced = !before.is_empty();
                     }
@@ -13771,33 +14787,32 @@ impl State {
                 | ChunkMeshState::DirtyLighting
                 | ChunkMeshState::DirtyBoundary
                 | ChunkMeshState::DirtyMixed => {
-                    let before = entry.queued_reasons;
-                    entry.queued_reasons |= reasons;
-                    entry.state = Self::mesh_state_from_reasons(entry.queued_reasons);
+                    let before = entry.queued;
+                    entry.queued.merge_assign(dirty);
+                    entry.state = Self::mesh_state_from_reasons(entry.queued.reasons);
                     enqueue_now = true;
-                    coalesced =
-                        entry.queued_reasons != before || self.dirty_chunk_set.contains(&coord);
+                    coalesced = entry.queued != before || self.dirty_chunk_set.contains(&coord);
                 }
                 ChunkMeshState::InFlight => {
-                    let before = entry.pending_reasons;
-                    entry.pending_reasons |= reasons;
-                    coalesced =
-                        entry.pending_reasons != before || self.inflight.contains_key(&coord);
+                    let before = entry.pending;
+                    entry.pending.merge_assign(dirty);
+                    coalesced = entry.pending != before || self.inflight.contains_key(&coord);
                     avoided = true;
                 }
                 ChunkMeshState::AwaitingLightingFinalization => {
-                    let before = entry.pending_reasons;
-                    entry.pending_reasons |= reasons;
+                    let before = entry.pending;
+                    entry.pending.merge_assign(dirty);
                     if !should_await_lighting {
-                        entry.queued_reasons |= entry.pending_reasons;
-                        entry.pending_reasons = MeshDirtyReasons::NONE;
-                        entry.state = Self::mesh_state_from_reasons(entry.queued_reasons);
+                        let pending = entry.pending;
+                        entry.queued.merge_assign(pending);
+                        entry.pending = ChunkMeshDirtySet::default();
+                        entry.state = Self::mesh_state_from_reasons(entry.queued.reasons);
                         enqueue_now = true;
                     } else {
                         entry.state = ChunkMeshState::AwaitingLightingFinalization;
                         avoided = true;
                     }
-                    coalesced = entry.pending_reasons != before || avoided;
+                    coalesced = entry.pending != before || avoided;
                 }
             }
         }
@@ -13813,8 +14828,30 @@ impl State {
         }
     }
 
+    fn mark_chunk_dirty_with_reasons_and_layers(
+        &mut self,
+        coord: ChunkCoord,
+        reasons: MeshDirtyReasons,
+        layers: MeshLayerMask,
+        merged_edits: u32,
+    ) {
+        self.mark_chunk_dirty_with_scope(
+            coord,
+            ChunkMeshDirtySet::new(reasons, layers, merged_edits),
+        );
+    }
+
+    fn mark_chunk_dirty_with_reasons(&mut self, coord: ChunkCoord, reasons: MeshDirtyReasons) {
+        self.mark_chunk_dirty_with_reasons_and_layers(coord, reasons, MeshLayerMask::ALL, 0);
+    }
+
     pub(crate) fn mark_chunk_dirty(&mut self, coord: ChunkCoord) {
-        self.mark_chunk_dirty_with_reasons(coord, MeshDirtyReasons::GEOMETRY);
+        self.mark_chunk_dirty_with_reasons_and_layers(
+            coord,
+            MeshDirtyReasons::GEOMETRY,
+            MeshLayerMask::ALL,
+            0,
+        );
     }
 
     fn mark_chunk_lighting_dirty(&mut self, coord: ChunkCoord) {
@@ -13831,85 +14868,86 @@ impl State {
 
     fn maybe_release_mesh_after_lighting_finalization(&mut self, coord: ChunkCoord) {
         let should_release = self.mesh_schedule.get(&coord).is_some_and(|entry| {
-            entry.state == ChunkMeshState::AwaitingLightingFinalization
-                && !entry.pending_reasons.is_empty()
+            entry.state == ChunkMeshState::AwaitingLightingFinalization && !entry.pending.is_empty()
         }) && !self
             .mesh_should_await_lighting_finalization(coord, MeshDirtyReasons::LIGHTING);
         if !should_release {
             return;
         }
 
-        let queued_reasons = {
+        let queued = {
             let entry = self.mesh_schedule.entry(coord).or_default();
-            entry.queued_reasons |= entry.pending_reasons;
-            entry.pending_reasons = MeshDirtyReasons::NONE;
-            entry.state = Self::mesh_state_from_reasons(entry.queued_reasons);
-            entry.queued_reasons
+            let pending = entry.pending;
+            entry.queued.merge_assign(pending);
+            entry.pending = ChunkMeshDirtySet::default();
+            entry.state = Self::mesh_state_from_reasons(entry.queued.reasons);
+            entry.queued
         };
-        if !queued_reasons.is_empty() {
+        if !queued.is_empty() {
             self.enqueue_dirty_chunk_coord(coord);
         }
     }
 
-    fn begin_mesh_dispatch(&mut self, coord: ChunkCoord, revision: u64) -> MeshDirtyReasons {
-        let reasons = {
+    fn begin_mesh_dispatch(&mut self, coord: ChunkCoord, revision: u64) -> ChunkMeshDirtySet {
+        let dirty = {
             let entry = self.mesh_schedule.entry(coord).or_default();
-            let reasons = if entry.queued_reasons.is_empty() {
-                MeshDirtyReasons::GEOMETRY
+            let dirty = if entry.queued.is_empty() {
+                ChunkMeshDirtySet::new(MeshDirtyReasons::GEOMETRY, MeshLayerMask::ALL, 0)
             } else {
-                entry.queued_reasons
+                entry.queued
             };
-            entry.queued_reasons = MeshDirtyReasons::NONE;
-            entry.inflight_reasons = reasons;
+            entry.queued = ChunkMeshDirtySet::default();
+            entry.inflight = dirty;
             entry.state = ChunkMeshState::InFlight;
-            reasons
+            dirty
         };
         self.inflight.insert(coord, revision);
-        if reasons.contains(MeshDirtyReasons::BOUNDARY) {
+        if dirty.reasons.contains(MeshDirtyReasons::BOUNDARY) {
             self.frame_perf.mesh_boundary_dispatches += 1;
         }
-        if reasons.contains(MeshDirtyReasons::LIGHTING) {
+        if dirty.reasons.contains(MeshDirtyReasons::LIGHTING) {
             self.frame_perf.mesh_lighting_dispatches += 1;
         }
-        reasons
+        dirty
     }
 
     fn finish_mesh_dispatch(
         &mut self,
         coord: ChunkCoord,
-        requeue_reasons: Option<MeshDirtyReasons>,
+        requeue_dirty: Option<ChunkMeshDirtySet>,
     ) {
-        let mut next_reasons = {
+        let mut next_dirty = {
             let entry = self.mesh_schedule.entry(coord).or_default();
-            let mut next_reasons = requeue_reasons.unwrap_or(entry.pending_reasons);
-            if requeue_reasons.is_some() {
-                next_reasons |= entry.pending_reasons;
+            let mut next_dirty = requeue_dirty.unwrap_or(entry.pending);
+            if requeue_dirty.is_some() {
+                let pending = entry.pending;
+                next_dirty.merge_assign(pending);
             }
-            entry.pending_reasons = MeshDirtyReasons::NONE;
-            entry.inflight_reasons = MeshDirtyReasons::NONE;
-            next_reasons
+            entry.pending = ChunkMeshDirtySet::default();
+            entry.inflight = ChunkMeshDirtySet::default();
+            next_dirty
         };
-        let should_await_lighting = if next_reasons.is_empty() {
+        let should_await_lighting = if next_dirty.is_empty() {
             false
         } else {
-            self.mesh_should_await_lighting_finalization(coord, next_reasons)
+            self.mesh_should_await_lighting_finalization(coord, next_dirty.reasons)
         };
 
         let mut enqueue_now = false;
         {
             let entry = self.mesh_schedule.entry(coord).or_default();
-            if next_reasons.is_empty() {
-                entry.queued_reasons = MeshDirtyReasons::NONE;
+            if next_dirty.is_empty() {
+                entry.queued = ChunkMeshDirtySet::default();
                 entry.state = ChunkMeshState::CleanReady;
             } else if should_await_lighting {
-                entry.queued_reasons = MeshDirtyReasons::NONE;
-                entry.pending_reasons = next_reasons;
+                entry.queued = ChunkMeshDirtySet::default();
+                entry.pending = next_dirty;
                 entry.state = ChunkMeshState::AwaitingLightingFinalization;
                 self.frame_perf.mesh_avoided_remeshes += 1;
             } else {
-                entry.queued_reasons |= next_reasons;
-                next_reasons = entry.queued_reasons;
-                entry.state = Self::mesh_state_from_reasons(next_reasons);
+                entry.queued.merge_assign(next_dirty);
+                next_dirty = entry.queued;
+                entry.state = Self::mesh_state_from_reasons(next_dirty.reasons);
                 enqueue_now = true;
             }
         }
@@ -14360,27 +15398,38 @@ impl State {
         }
     }
 
-    pub(crate) fn mark_dirty_after_block_change(&mut self, world_pos: IVec3) -> usize {
-        let affected = Self::affected_chunks_for_block_change(world_pos);
-        for (index, coord) in affected.iter().copied().enumerate() {
-            if index == 0 {
-                self.mark_chunk_dirty_with_reasons(coord, MeshDirtyReasons::GEOMETRY);
-            } else {
-                self.mark_chunk_boundary_dirty(coord);
-            }
-            self.mark_column_dirty_for_chunk(coord);
+    pub(crate) fn mark_dirty_after_block_change(
+        &mut self,
+        world_pos: IVec3,
+        old_block: BlockId,
+        new_block: BlockId,
+    ) -> usize {
+        let invalidations =
+            self.classify_block_edit_mesh_invalidation(world_pos, old_block, new_block);
+        for invalidation in invalidations.iter().copied() {
+            self.mark_chunk_dirty_with_scope(invalidation.coord, invalidation.dirty);
+            self.mark_column_dirty_for_chunk(invalidation.coord);
         }
-        affected.len()
+        invalidations.len()
     }
 
-    fn stage_block_edit_dirty_after_block_change(&mut self, world_pos: IVec3) -> usize {
-        let affected = Self::affected_chunks_for_block_change(world_pos);
-        for coord in affected.iter().copied() {
-            self.pending_block_edit_dirty_chunks.insert(coord);
+    fn stage_block_edit_dirty_after_block_change(
+        &mut self,
+        world_pos: IVec3,
+        old_block: BlockId,
+        new_block: BlockId,
+    ) -> usize {
+        let invalidations =
+            self.classify_block_edit_mesh_invalidation(world_pos, old_block, new_block);
+        for invalidation in invalidations.iter().copied() {
+            self.pending_block_edit_dirty_chunks
+                .entry(invalidation.coord)
+                .or_default()
+                .merge_assign(invalidation.dirty);
             self.pending_block_edit_dirty_columns
-                .insert((coord.x, coord.z));
+                .insert((invalidation.coord.x, invalidation.coord.z));
         }
-        affected.len()
+        invalidations.len()
     }
 
     fn flush_pending_block_edit_dirty_marks(&mut self) -> (usize, usize, bool) {
@@ -14396,8 +15445,22 @@ impl State {
             .drain()
             .collect::<Vec<_>>();
 
-        for coord in dirty_chunks {
-            self.mark_chunk_dirty(coord);
+        for (coord, dirty) in dirty_chunks {
+            perf_trace::instant_event(
+                "mesh.block_edit_flush",
+                &format!(
+                    "coord=({}, {}, {}) reasons={} reason_bits={} layers={} layer_bits={} merged_edits={}",
+                    coord.x,
+                    coord.y,
+                    coord.z,
+                    dirty.reasons.labels(),
+                    dirty.reasons.bits(),
+                    dirty.layers.labels(),
+                    dirty.layers.bits(),
+                    dirty.merged_edits
+                ),
+            );
+            self.mark_chunk_dirty_with_scope(coord, dirty);
         }
         for (cx, cz) in dirty_columns {
             self.mark_column_dirty(cx, cz);
@@ -14958,13 +16021,15 @@ impl State {
             "render.lighting.step",
             step_total_ms,
             &format!(
-                "pending_dirty={} req_pending={} inflight={} result_q={} stream_backlog={} remove_backlog={} step_count={} step_max_ms={:.3}",
+                "pending_dirty={} req_pending={} inflight={} result_q={} stream_backlog={} remove_backlog={} block_edit_backlog={} step_count={} step_max_ms={:.3}",
                 self.pending_lighting_dirty_chunks.len(),
                 self.lighting_request_pending as u8,
                 self.lighting_job_inflight as u8,
                 self.lighting_results.len(),
                 self.pending_chunk_added_lighting_jobs.len(),
                 self.pending_removed_lighting_batches.len(),
+                self.pending_block_edit_lighting_batches.len()
+                    + usize::from(self.active_block_edit_lighting_job.is_some()),
                 steps,
                 self.frame_perf.lighting_incremental_step_max_ms
             ),
@@ -15035,27 +16100,314 @@ impl State {
         );
     }
 
-    fn run_incremental_block_change_lighting(
-        &mut self,
-        changes: &[LightingBlockChange],
-        reason: &str,
-    ) {
+    fn block_edit_lighting_merge_neighborhood(pos: IVec3) -> Vec<ChunkCoord> {
+        let base = World::world_to_chunk_coord(pos);
+        let mut out = Vec::with_capacity(27);
+        for dy in -1..=1 {
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    out.push(ChunkCoord {
+                        x: base.x + dx,
+                        y: base.y + dy,
+                        z: base.z + dz,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    fn merge_block_edit_lighting_batch(&mut self, target_id: u64, source_id: u64) -> bool {
+        if target_id == source_id {
+            return false;
+        }
+        let Some(source) = self.pending_block_edit_lighting_batches.remove(&source_id) else {
+            return false;
+        };
+        self.pending_block_edit_lighting_order
+            .retain(|queued| *queued != source_id);
+        let now = Instant::now();
+        let ready_at = now + Duration::from_millis(BLOCK_EDIT_LIGHTING_COALESCE_DELAY_MS);
+        let source_change_count = source.changes.len();
+        let Some(target) = self.pending_block_edit_lighting_batches.get_mut(&target_id) else {
+            return false;
+        };
+        target.changes.extend(source.changes);
+        target.primary_chunks.extend(source.primary_chunks);
+        target
+            .merge_chunks
+            .extend(source.merge_chunks.iter().copied());
+        target.merged_batches = target
+            .merged_batches
+            .saturating_add(1 + source.merged_batches);
+        target.merged_changes = target
+            .merged_changes
+            .saturating_add(source.merged_changes + source_change_count);
+        target.ready_at = ready_at;
+        for coord in source.merge_chunks {
+            self.pending_block_edit_lighting_chunk_batches
+                .insert(coord, target_id);
+        }
+        true
+    }
+
+    fn enqueue_block_edit_lighting_repairs(&mut self, changes: &[ClassifiedLightingBlockChange]) {
         if changes.is_empty() {
             return;
         }
-        let primary_coords: Vec<ChunkCoord> = changes
-            .iter()
-            .map(|change| World::world_to_chunk_coord(change.pos))
-            .collect();
         let started = Instant::now();
-        let result = self.world.lighting_on_block_changes(changes);
-        self.commit_incremental_lighting_result(
-            reason,
-            &primary_coords,
-            &[],
-            result,
+        let now = Instant::now();
+        let mut new_batches = 0usize;
+        let mut merged_batches = 0usize;
+        let mut coalesced_changes = 0usize;
+
+        for &change in changes {
+            if change.flags.is_geometry_only() {
+                continue;
+            }
+            let merge_neighborhood =
+                Self::block_edit_lighting_merge_neighborhood(change.change.pos);
+            let mut overlapping_batch_ids = HashSet::new();
+            for coord in &merge_neighborhood {
+                if let Some(&batch_id) = self.pending_block_edit_lighting_chunk_batches.get(coord)
+                    && self
+                        .pending_block_edit_lighting_batches
+                        .contains_key(&batch_id)
+                {
+                    overlapping_batch_ids.insert(batch_id);
+                }
+            }
+
+            let batch_id = if let Some(target_id) = overlapping_batch_ids.iter().copied().min() {
+                let merge_sources = overlapping_batch_ids
+                    .iter()
+                    .copied()
+                    .filter(|batch_id| *batch_id != target_id)
+                    .collect::<Vec<_>>();
+                for source_id in merge_sources {
+                    if self.merge_block_edit_lighting_batch(target_id, source_id) {
+                        merged_batches += 1;
+                    }
+                }
+                coalesced_changes += 1;
+                target_id
+            } else {
+                let batch_id = self.next_block_edit_lighting_batch_id;
+                self.next_block_edit_lighting_batch_id = self
+                    .next_block_edit_lighting_batch_id
+                    .wrapping_add(1)
+                    .max(1);
+                self.pending_block_edit_lighting_batches
+                    .insert(batch_id, BlockEditLightingBatch::new(batch_id, now));
+                self.pending_block_edit_lighting_order.push_back(batch_id);
+                new_batches += 1;
+                batch_id
+            };
+
+            if let Some(batch) = self.pending_block_edit_lighting_batches.get_mut(&batch_id) {
+                batch.changes.push(change);
+                batch
+                    .primary_chunks
+                    .insert(World::world_to_chunk_coord(change.change.pos));
+                batch
+                    .merge_chunks
+                    .extend(merge_neighborhood.iter().copied());
+                batch.ready_at = now + Duration::from_millis(BLOCK_EDIT_LIGHTING_COALESCE_DELAY_MS);
+            }
+            for coord in merge_neighborhood {
+                self.pending_block_edit_lighting_chunk_batches
+                    .insert(coord, batch_id);
+            }
+        }
+
+        let backlog = self.pending_block_edit_lighting_batches.len()
+            + usize::from(self.active_block_edit_lighting_job.is_some());
+        self.frame_perf.lighting_block_edit_batches_enqueued += new_batches;
+        self.frame_perf.lighting_block_edit_batches_merged += merged_batches;
+        self.frame_perf.lighting_block_edit_coalesced_changes += coalesced_changes;
+        self.frame_perf.lighting_block_edit_enqueue_ms += started.elapsed().as_secs_f32() * 1000.0;
+        self.frame_perf.lighting_block_edit_backlog_depth = self
+            .frame_perf
+            .lighting_block_edit_backlog_depth
+            .max(backlog);
+        perf_trace::record_duration_ms(
+            "lighting.block_edit.enqueue",
             started.elapsed().as_secs_f32() * 1000.0,
+            &format!(
+                "changes={} new_batches={} merged_batches={} coalesced_changes={} backlog={}",
+                changes.len(),
+                new_batches,
+                merged_batches,
+                coalesced_changes,
+                backlog
+            ),
         );
+    }
+
+    fn start_next_block_edit_lighting_job_if_ready(&mut self, now: Instant) -> bool {
+        while let Some(batch_id) = self.pending_block_edit_lighting_order.front().copied() {
+            let Some(batch) = self.pending_block_edit_lighting_batches.get(&batch_id) else {
+                self.pending_block_edit_lighting_order.pop_front();
+                continue;
+            };
+            let ready = batch.ready_at <= now;
+            if !ready {
+                return false;
+            }
+            self.pending_block_edit_lighting_order.pop_front();
+            let Some(batch) = self.pending_block_edit_lighting_batches.remove(&batch_id) else {
+                continue;
+            };
+            for coord in &batch.merge_chunks {
+                self.pending_block_edit_lighting_chunk_batches.remove(coord);
+            }
+            let Some(task) = self
+                .world
+                .begin_localized_block_lighting_repair_task(&batch.changes)
+            else {
+                continue;
+            };
+            let mut primary_chunks = batch.primary_chunks.into_iter().collect::<Vec<_>>();
+            primary_chunks.sort_by_key(|coord| (coord.x, coord.y, coord.z));
+            self.active_block_edit_lighting_job = Some(BlockEditLightingJob {
+                batch_id: batch.id,
+                primary_chunks,
+                merged_batches: batch.merged_batches,
+                merged_changes: batch.merged_changes,
+                enqueued_at: batch.enqueued_at,
+                cpu_ms_accum: 0.0,
+                task,
+            });
+            return true;
+        }
+        false
+    }
+
+    fn commit_block_edit_lighting_job(
+        &mut self,
+        job: BlockEditLightingJob,
+        stats: LocalizedLightingRepairStats,
+        affected_chunks: Vec<ChunkCoord>,
+    ) {
+        let affected_chunk_set = affected_chunks.iter().copied().collect::<HashSet<_>>();
+        let mut boundary_neighbor_chunks = HashSet::new();
+        for &coord in &affected_chunks {
+            self.queue_lighting_changed_chunk_dirty(coord);
+            for neighbor in Self::neighbor_chunk_coords(coord) {
+                if !affected_chunk_set.contains(&neighbor)
+                    && self.world.get_chunk(neighbor).is_some()
+                {
+                    boundary_neighbor_chunks.insert(neighbor);
+                }
+            }
+        }
+        for coord in boundary_neighbor_chunks.iter().copied() {
+            self.mark_chunk_boundary_dirty(coord);
+        }
+
+        self.frame_perf.lighting_chunks_changed += affected_chunks.len();
+        self.frame_perf.lighting_block_edit_chunks_touched += affected_chunks.len();
+        self.frame_perf.lighting_block_edit_skylight_columns = self
+            .frame_perf
+            .lighting_block_edit_skylight_columns
+            .saturating_add(stats.skylight_columns_seeded);
+
+        perf_trace::record_duration(
+            "lighting.block_edit.job",
+            Duration::from_secs_f32(job.cpu_ms_accum.max(0.0) / 1000.0),
+            &format!(
+                "batch={} primary={} affected={} voxels_visited={} changed_voxels={} sky_queue_visits={} block_queue_visits={} sky_nodes={} block_nodes={} skylight_columns={} merged_batches={} merged_changes={} latency_ms={:.2}",
+                job.batch_id,
+                job.primary_chunks.len(),
+                affected_chunks.len(),
+                stats.voxels_visited,
+                stats.changed_voxels,
+                stats.sky_queue_visits,
+                stats.block_queue_visits,
+                stats.sky_nodes_queued,
+                stats.block_nodes_queued,
+                stats.skylight_columns_seeded,
+                job.merged_batches,
+                job.merged_changes,
+                job.enqueued_at.elapsed().as_secs_f32() * 1000.0
+            ),
+        );
+    }
+
+    fn pump_block_edit_lighting_repairs(&mut self) {
+        let started = Instant::now();
+        let frame_budget =
+            Duration::from_secs_f32((BLOCK_EDIT_LIGHTING_FRAME_BUDGET_MS / 1000.0).max(0.0));
+        let step_limits = LocalizedLightingRepairStepLimits {
+            max_voxels_visited: BLOCK_EDIT_LIGHTING_MAX_VOXELS_PER_STEP,
+            max_wall_clock: Duration::from_secs_f32(
+                (BLOCK_EDIT_LIGHTING_STEP_BUDGET_MS / 1000.0).max(0.0),
+            ),
+        };
+        let mut steps = 0usize;
+
+        while steps < BLOCK_EDIT_LIGHTING_MAX_STEPS_PER_FRAME && started.elapsed() < frame_budget {
+            if self.active_block_edit_lighting_job.is_none()
+                && !self.start_next_block_edit_lighting_job_if_ready(Instant::now())
+            {
+                break;
+            }
+            let Some(mut job) = self.active_block_edit_lighting_job.take() else {
+                break;
+            };
+            let step_started = Instant::now();
+            let step_result = self
+                .world
+                .step_localized_block_lighting_repair_task(&mut job.task, step_limits);
+            let step_ms = step_started.elapsed().as_secs_f32() * 1000.0;
+            job.cpu_ms_accum += step_ms;
+            steps += 1;
+            self.last_lighting_step_ms = self.last_lighting_step_ms.max(step_ms);
+            self.frame_perf.rebuild_world_lighting_ms += step_ms;
+            self.frame_perf.lighting_block_edit_process_ms += step_ms;
+            self.frame_perf.lighting_block_edit_budget_used_ms += step_ms;
+            self.frame_perf.lighting_block_edit_steps += 1;
+            self.frame_perf.lighting_block_edit_voxels_visited = self
+                .frame_perf
+                .lighting_block_edit_voxels_visited
+                .saturating_add(step_result.stats.voxels_visited);
+            self.frame_perf.lighting_block_edit_changed_voxels = self
+                .frame_perf
+                .lighting_block_edit_changed_voxels
+                .saturating_add(step_result.stats.changed_voxels);
+            self.frame_perf.lighting_block_edit_backlog_depth =
+                self.frame_perf.lighting_block_edit_backlog_depth.max(
+                    self.pending_block_edit_lighting_batches.len()
+                        + usize::from(self.active_block_edit_lighting_job.is_some())
+                        + 1,
+                );
+
+            perf_trace::record_duration_ms(
+                "lighting.block_edit.step",
+                step_ms,
+                &format!(
+                    "batch={} primary={} backlog={} q_pending={} latency_ms={:.2} voxels_visited={} changed_voxels={} complete={} merged_batches={} merged_changes={}",
+                    job.batch_id,
+                    job.primary_chunks.len(),
+                    self.pending_block_edit_lighting_batches.len(),
+                    job.task.pending_queue_len(),
+                    job.enqueued_at.elapsed().as_secs_f32() * 1000.0,
+                    step_result.stats.voxels_visited,
+                    step_result.stats.changed_voxels,
+                    step_result.complete as u8,
+                    job.merged_batches,
+                    job.merged_changes
+                ),
+            );
+
+            if step_result.complete {
+                let stats = job.task.total_stats();
+                let affected_chunks = job.task.affected_chunks();
+                self.commit_block_edit_lighting_job(job, stats, affected_chunks);
+            } else {
+                self.active_block_edit_lighting_job = Some(job);
+            }
+        }
     }
 
     fn enqueue_pending_block_edit(&mut self, pos: IVec3, old: BlockId, new: BlockId) {
@@ -15145,7 +16497,10 @@ impl State {
         let mut sand_steps_used = 0usize;
         let mut sand_scanned = 0usize;
         let mut sand_dropped = 0usize;
-        let mut lighting_changes = Vec::with_capacity(BLOCK_EDIT_SIDEFX_MAX_EDITS_PER_FRAME);
+        let mut lighting_changes = Vec::<ClassifiedLightingBlockChange>::with_capacity(
+            BLOCK_EDIT_SIDEFX_MAX_EDITS_PER_FRAME,
+        );
+        let mut lighting_geometry_only = 0usize;
         let mut edits_remaining_before = self.pending_block_edits.len();
         let mut sand_remaining_before = self.pending_sand_gravity_checks.len();
 
@@ -15156,12 +16511,15 @@ impl State {
             };
 
             edits_processed += 1;
-            let _ = self.stage_block_edit_dirty_after_block_change(edit.pos);
-            lighting_changes.push(LightingBlockChange {
-                pos: edit.pos,
-                old: edit.old,
-                new: edit.new,
-            });
+            let _ = self.stage_block_edit_dirty_after_block_change(edit.pos, edit.old, edit.new);
+            let lighting_change = self
+                .world
+                .classify_block_change_lighting(edit.pos, edit.old, edit.new);
+            if lighting_change.flags.is_geometry_only() {
+                lighting_geometry_only += 1;
+            } else {
+                lighting_changes.push(lighting_change);
+            }
 
             self.notify_fluid_on_block_change(edit.pos, edit.old, edit.new);
             fluid_notifies += 1;
@@ -15206,7 +16564,7 @@ impl State {
 
         let (dirty_chunks_flushed, dirty_columns_flushed, dirty_marks_flushed) =
             self.flush_pending_block_edit_dirty_marks();
-        self.run_incremental_block_change_lighting(&lighting_changes, "block_sidefx");
+        self.enqueue_block_edit_lighting_repairs(&lighting_changes);
 
         let ms = started.elapsed().as_secs_f32() * 1000.0;
         edits_remaining_before = edits_remaining_before.saturating_sub(edits_processed);
@@ -15215,7 +16573,7 @@ impl State {
             "proc.process_pending_block_edit_sidefx.work",
             ms,
             &format!(
-                "edits_proc={} edits_q_before={} edits_q_after={} fluids={} particles_spawned={} particle_events={} sand_checks_proc={} sand_q_before={} sand_q_after={} sand_steps={} sand_scanned={} sand_dropped={} dirty_chunks_flush={} dirty_cols_flush={} dirty_marks_flushed={}",
+                "edits_proc={} edits_q_before={} edits_q_after={} fluids={} particles_spawned={} particle_events={} sand_checks_proc={} sand_q_before={} sand_q_after={} sand_steps={} sand_scanned={} sand_dropped={} light_repairs={} light_geom_only={} dirty_chunks_flush={} dirty_cols_flush={} dirty_marks_flushed={}",
                 edits_processed,
                 edits_remaining_before + edits_processed,
                 self.pending_block_edits.len(),
@@ -15228,6 +16586,8 @@ impl State {
                 sand_steps_used,
                 sand_scanned,
                 sand_dropped,
+                lighting_changes.len(),
+                lighting_geometry_only,
                 dirty_chunks_flushed,
                 dirty_columns_flushed,
                 dirty_marks_flushed as u8
@@ -15396,6 +16756,7 @@ impl State {
         self.pump_lighting_results();
         self.pump_removed_lighting_batches();
         self.pump_chunk_added_lighting_jobs();
+        self.pump_block_edit_lighting_repairs();
         self.pump_pending_lighting_dirty_chunk_marks();
         self.schedule_lighting_rebuild_if_needed();
     }
@@ -15477,26 +16838,17 @@ impl State {
         self.mark_chunk_user_only_if_unknown(World::world_to_chunk_coord(landing));
         self.sync_generated_empty_chunk_marker(World::world_to_chunk_coord(pos));
         self.sync_generated_empty_chunk_marker(World::world_to_chunk_coord(landing));
+        let source_lighting =
+            self.world
+                .classify_block_change_lighting(pos, BlockId::Sand, BlockId::Air);
+        let landing_lighting =
+            self.world
+                .classify_block_change_lighting(landing, replaced, BlockId::Sand);
         self.notify_fluid_on_block_change(pos, BlockId::Sand, BlockId::Air);
-        let _ = self.stage_block_edit_dirty_after_block_change(pos);
-        self.run_incremental_block_change_lighting(
-            &[LightingBlockChange {
-                pos,
-                old: BlockId::Sand,
-                new: BlockId::Air,
-            }],
-            "sand_gravity_source",
-        );
+        let _ = self.stage_block_edit_dirty_after_block_change(pos, BlockId::Sand, BlockId::Air);
         self.notify_fluid_on_block_change(landing, replaced, BlockId::Sand);
-        let _ = self.stage_block_edit_dirty_after_block_change(landing);
-        self.run_incremental_block_change_lighting(
-            &[LightingBlockChange {
-                pos: landing,
-                old: replaced,
-                new: BlockId::Sand,
-            }],
-            "sand_gravity_landing",
-        );
+        let _ = self.stage_block_edit_dirty_after_block_change(landing, replaced, BlockId::Sand);
+        self.enqueue_block_edit_lighting_repairs(&[source_lighting, landing_lighting]);
         true
     }
 
@@ -15710,18 +17062,21 @@ impl State {
                     continue;
                 };
 
-                let dispatch_reasons = self.begin_mesh_dispatch(coord, revision);
+                let dispatch_dirty = self.begin_mesh_dispatch(coord, revision);
                 perf_trace::instant_event(
                     "mesh.dispatch",
                     &format!(
-                        "coord=({}, {}, {}) revision={} state={} reasons={} reason_bits={} queue_len={} inflight={}",
+                        "coord=({}, {}, {}) revision={} state={} reasons={} reason_bits={} layers={} layer_bits={} merged_edits={} queue_len={} inflight={}",
                         coord.x,
                         coord.y,
                         coord.z,
                         revision,
                         ChunkMeshState::InFlight.as_str(),
-                        dispatch_reasons.labels(),
-                        dispatch_reasons.bits(),
+                        dispatch_dirty.reasons.labels(),
+                        dispatch_dirty.reasons.bits(),
+                        dispatch_dirty.layers.labels(),
+                        dispatch_dirty.layers.bits(),
+                        dispatch_dirty.merged_edits,
                         self.dirty_chunk_queue.len(),
                         self.inflight.len()
                     ),
@@ -15735,6 +17090,9 @@ impl State {
                         mesh_debug_epoch: self.mesh_debug_epoch,
                         snapshot,
                         use_greedy: USE_GREEDY_MESHING,
+                        layer_mask: dispatch_dirty.layers,
+                        reason_labels: dispatch_dirty.reasons.labels(),
+                        merged_edits: dispatch_dirty.merged_edits,
                     })
                     .is_ok();
                 dispatch_send_mesh_job_ms += send_started.elapsed().as_secs_f32() * 1000.0;
@@ -15748,7 +17106,7 @@ impl State {
                 } else {
                     let started = Instant::now();
                     self.inflight.remove(&coord);
-                    self.finish_mesh_dispatch(coord, Some(dispatch_reasons));
+                    self.finish_mesh_dispatch(coord, Some(dispatch_dirty));
                     dispatch_requeue_dirty_ms += started.elapsed().as_secs_f32() * 1000.0;
                     break;
                 }
@@ -15859,6 +17217,9 @@ impl State {
     }
 
     pub(crate) fn process_dirty_chunk_meshes(&mut self, camera: &Camera) {
+        if !self.world_session_state.allows_runtime_processing() {
+            return;
+        }
         let _trace_scope = perf_trace::scope("state.process_dirty_chunk_meshes");
         let proc_started = Instant::now();
         self.update_stream_burst_mode_for_camera(camera);
@@ -15931,13 +17292,15 @@ impl State {
             let _scope = perf_trace::scope("proc.rebuild_world_lighting_if_dirty");
             let started = Instant::now();
             let _lighting_scope = perf_trace::scope("render.lighting.step").with_counts(format!(
-                "pending_dirty={} req_pending={} inflight={} result_q={} stream_backlog={} remove_backlog={}",
+                "pending_dirty={} req_pending={} inflight={} result_q={} stream_backlog={} remove_backlog={} block_edit_backlog={}",
                 self.pending_lighting_dirty_chunks.len(),
                 self.lighting_request_pending as u8,
                 self.lighting_job_inflight as u8,
                 self.lighting_results.len(),
                 self.pending_chunk_added_lighting_jobs.len(),
-                self.pending_removed_lighting_batches.len()
+                self.pending_removed_lighting_batches.len(),
+                self.pending_block_edit_lighting_batches.len()
+                    + usize::from(self.active_block_edit_lighting_job.is_some())
             ));
             self.rebuild_world_lighting_if_dirty();
             let ms = started.elapsed().as_secs_f32() * 1000.0;
@@ -16087,12 +17450,18 @@ impl State {
             if result.mesh_debug_epoch != self.mesh_debug_epoch {
                 if self.inflight.get(&result.coord).copied() == Some(result.revision) {
                     self.inflight.remove(&result.coord);
-                    let retry_reasons = self
+                    let retry_dirty = self
                         .mesh_schedule
                         .get(&result.coord)
-                        .map(|entry| entry.inflight_reasons)
-                        .unwrap_or(MeshDirtyReasons::GEOMETRY);
-                    self.finish_mesh_dispatch(result.coord, Some(retry_reasons));
+                        .map(|entry| entry.inflight)
+                        .unwrap_or_else(|| {
+                            ChunkMeshDirtySet::new(
+                                MeshDirtyReasons::GEOMETRY,
+                                MeshLayerMask::ALL,
+                                0,
+                            )
+                        });
+                    self.finish_mesh_dispatch(result.coord, Some(retry_dirty));
                 }
                 continue;
             }
@@ -16102,12 +17471,14 @@ impl State {
                 None => continue,
             };
             if expected_revision != result.revision {
-                let retry_reasons = self
+                let retry_dirty = self
                     .mesh_schedule
                     .get(&result.coord)
-                    .map(|entry| entry.inflight_reasons)
-                    .unwrap_or(MeshDirtyReasons::GEOMETRY);
-                self.finish_mesh_dispatch(result.coord, Some(retry_reasons));
+                    .map(|entry| entry.inflight)
+                    .unwrap_or_else(|| {
+                        ChunkMeshDirtySet::new(MeshDirtyReasons::GEOMETRY, MeshLayerMask::ALL, 0)
+                    });
+                self.finish_mesh_dispatch(result.coord, Some(retry_dirty));
                 continue;
             }
 
@@ -16116,36 +17487,34 @@ impl State {
                 .get_chunk(result.coord)
                 .map(|chunk| chunk.revision);
             if current_revision != Some(result.revision) {
-                let retry_reasons = self
+                let retry_dirty = self
                     .mesh_schedule
                     .get(&result.coord)
-                    .map(|entry| entry.inflight_reasons)
-                    .unwrap_or(MeshDirtyReasons::GEOMETRY);
-                self.finish_mesh_dispatch(result.coord, Some(retry_reasons));
+                    .map(|entry| entry.inflight)
+                    .unwrap_or_else(|| {
+                        ChunkMeshDirtySet::new(MeshDirtyReasons::GEOMETRY, MeshLayerMask::ALL, 0)
+                    });
+                self.finish_mesh_dispatch(result.coord, Some(retry_dirty));
                 continue;
             }
 
             let had_mesh = self.chunk_meshes.contains_key(&result.coord);
             let lighting_progress = self.chunk_lighting_progress.get(&result.coord).cloned();
-            let has_mesh = if let Some(geometry) = result.geometry {
-                let apply_started = Instant::now();
-                let existing_mesh = self.chunk_meshes.remove(&result.coord);
-                let (new_mesh, stats) = upload_layered_chunk_mesh_to_gpu_reuse(
-                    &self.device,
-                    &self.queue,
-                    geometry,
-                    existing_mesh,
-                );
-                apply_mesh_time += apply_started.elapsed();
-                upload_stats.add_assign(stats);
-                if let Some(layered_mesh) = new_mesh {
-                    self.chunk_meshes.insert(result.coord, layered_mesh);
-                    true
-                } else {
-                    false
-                }
+            let apply_started = Instant::now();
+            let existing_mesh = self.chunk_meshes.remove(&result.coord);
+            let (new_mesh, stats) = upload_layered_chunk_mesh_layers_to_gpu_reuse(
+                &self.device,
+                &self.queue,
+                result.geometry,
+                result.layer_mask,
+                existing_mesh,
+            );
+            apply_mesh_time += apply_started.elapsed();
+            upload_stats.add_assign(stats);
+            let has_mesh = if let Some(layered_mesh) = new_mesh {
+                self.chunk_meshes.insert(result.coord, layered_mesh);
+                true
             } else {
-                self.chunk_meshes.remove(&result.coord);
                 false
             };
             self.finish_mesh_dispatch(result.coord, None);
@@ -16157,13 +17526,16 @@ impl State {
                 "mesh_upload.queue_wait",
                 wait_dur,
                 &format!(
-                    "coord=({}, {}, {}) near_visible={} had_mesh={} has_mesh={}",
+                    "coord=({}, {}, {}) near_visible={} had_mesh={} has_mesh={} reasons={} layers={} merged_edits={}",
                     result.coord.x,
                     result.coord.y,
                     result.coord.z,
                     is_near_visible,
                     had_mesh,
-                    has_mesh
+                    has_mesh,
+                    result.reason_labels,
+                    result.layer_mask.labels(),
+                    result.merged_edits
                 ),
             );
 
@@ -16271,6 +17643,9 @@ impl State {
     }
 
     pub(crate) fn pump_mesh_results(&mut self, camera: &Camera) -> MeshPumpProgress {
+        if !self.world_session_state.allows_runtime_processing() {
+            return MeshPumpProgress::default();
+        }
         self.pump_mesh_results_with_limits(camera, MESH_RESULTS_DRAIN_PER_FRAME, None)
     }
 
@@ -16289,6 +17664,142 @@ impl State {
             let _ = self.with_fluids_system_mut(|fluids, world| {
                 fluids.mark_transforming_with_neighbors(world, world_pos);
             });
+        }
+    }
+
+    fn winter_surface_hash(seed: u64, tick_index: u64, x: i32, z: i32) -> u64 {
+        let mut v = seed ^ tick_index.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        v ^= (x as i64 as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        v ^= (z as i64 as u64).wrapping_mul(0x94D0_49BB_1331_11EB);
+        v ^= v >> 30;
+        v = v.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        v ^ (v >> 27)
+    }
+
+    fn winter_surface_supports_snow(block: BlockId) -> bool {
+        block.is_solid()
+            && !matches!(
+                block,
+                BlockId::Air
+                    | BlockId::WaterStill
+                    | BlockId::WaterFlowing
+                    | BlockId::LavaStill
+                    | BlockId::LavaFlowing
+                    | BlockId::Ice
+                    | BlockId::Snow
+            )
+    }
+
+    fn try_apply_environment_block_change(&mut self, pos: IVec3, new_block: BlockId) -> bool {
+        if !World::in_bounds(pos) || !self.world.is_chunk_loaded_at(pos) {
+            return false;
+        }
+        let old_block = self.world.get_block(pos);
+        if old_block == new_block {
+            return false;
+        }
+        if self
+            .world
+            .set_block_and_data_loaded_only(pos, new_block, 0)
+            .is_err()
+        {
+            return false;
+        }
+        self.enqueue_pending_block_edit(pos, old_block, new_block);
+        true
+    }
+
+    fn apply_winter_surface_tick(&mut self, tick_index: u64) {
+        if self.active_precipitation_kind() != Some(PrecipitationKind::Snow)
+            || self.active_sim_columns.is_empty()
+        {
+            return;
+        }
+
+        let started = Instant::now();
+        let world_seed = self.world.seed();
+        let mut candidates = Vec::with_capacity(self.active_sim_columns.len().min(64));
+        for coord in &self.active_sim_columns {
+            let score = Self::winter_surface_hash(world_seed, tick_index, coord.x, coord.z);
+            candidates.push((score, *coord));
+        }
+        candidates.sort_by_key(|(score, coord)| (*score, coord.x, coord.z));
+
+        let mut sampled = 0u32;
+        let mut snow_placed = 0u32;
+        let mut ice_placed = 0u32;
+        for (score, coord) in candidates.into_iter().take(WINTER_SURFACE_COLUMNS_PER_TICK) {
+            let world_x = coord.x * CHUNK_SIZE + (score as i32 & (CHUNK_SIZE - 1));
+            let world_z = coord.z * CHUNK_SIZE + (((score >> 8) as i32) & (CHUNK_SIZE - 1));
+            sampled = sampled.saturating_add(1);
+
+            for y in (self.world.min_y().max(1)..=self.world.max_y() - 1).rev() {
+                let pos = IVec3::new(world_x, y, world_z);
+                if !self.world.is_chunk_loaded_at(pos) {
+                    continue;
+                }
+                let block = self.world.get_block(pos);
+                if block == BlockId::Air {
+                    continue;
+                }
+                let above = pos + IVec3::Y;
+                if !self.world.is_chunk_loaded_at(above) {
+                    break;
+                }
+                let above_block = self.world.get_block(above);
+                if matches!(block, BlockId::WaterStill | BlockId::WaterFlowing)
+                    && above_block == BlockId::Air
+                {
+                    if self.try_apply_environment_block_change(pos, BlockId::Ice) {
+                        ice_placed = ice_placed.saturating_add(1);
+                    }
+                    break;
+                }
+                if Self::winter_surface_supports_snow(block) && above_block == BlockId::Air {
+                    if self.try_apply_environment_block_change(above, BlockId::Snow) {
+                        snow_placed = snow_placed.saturating_add(1);
+                    }
+                    break;
+                }
+                break;
+            }
+
+            if (snow_placed + ice_placed) as usize >= WINTER_SURFACE_MAX_CHANGES_PER_TICK {
+                break;
+            }
+        }
+
+        self.winter_surface_debug_counts.ticks =
+            self.winter_surface_debug_counts.ticks.saturating_add(1);
+        self.winter_surface_debug_counts.columns_sampled = self
+            .winter_surface_debug_counts
+            .columns_sampled
+            .saturating_add(sampled as u64);
+        self.winter_surface_debug_counts.snow_placed = self
+            .winter_surface_debug_counts
+            .snow_placed
+            .saturating_add(snow_placed as u64);
+        self.winter_surface_debug_counts.water_frozen = self
+            .winter_surface_debug_counts
+            .water_frozen
+            .saturating_add(ice_placed as u64);
+        self.winter_surface_debug_counts.last_tick_columns = sampled;
+        self.winter_surface_debug_counts.last_tick_snow = snow_placed;
+        self.winter_surface_debug_counts.last_tick_ice = ice_placed;
+        self.winter_surface_debug_counts.last_tick_ms = started.elapsed().as_secs_f32() * 1000.0;
+
+        if snow_placed > 0 || ice_placed > 0 {
+            perf_trace::instant_event(
+                "winter.surface_tick",
+                &format!(
+                    "tick={} sampled={} snow={} ice={} env={}",
+                    tick_index,
+                    sampled,
+                    snow_placed,
+                    ice_placed,
+                    self.world_environment().label()
+                ),
+            );
         }
     }
 
@@ -16330,9 +17841,13 @@ impl State {
             self.sim_system_last_frame_ticks[idx] =
                 self.sim_system_last_frame_ticks[idx].saturating_add(1);
         }
+        self.apply_winter_surface_tick(tick_index);
     }
 
     pub(crate) fn update_fluid_simulation(&mut self, dt: f32) {
+        if !self.world_session_state.allows_simulation() {
+            return;
+        }
         self.frame_index = self.frame_index.wrapping_add(1);
         self.fluid_accum += dt.max(0.0);
         let max_catchup = FLUID_FIXED_STEP_SECONDS * FLUID_MAX_TICKS_PER_FRAME as f32;
@@ -16397,14 +17912,36 @@ impl State {
     pub(crate) fn worldgen_features_debug_line(&self) -> String {
         let c = self.worldgen_feature_debug_counts;
         format!(
-            "Worldgen: chunks={} last W/src/sand={}/{}/{} total W/src/sand={}/{}/{}",
+            "Worldgen: chunks={} last W/src/sand/snow/ice={}/{}/{}/{}/{} total W/src/sand/snow/ice={}/{}/{}/{}/{}",
             c.chunks_applied,
             c.last_worldgen_water_blocks,
             c.last_worldgen_water_source_blocks,
             c.last_shoreline_sand_blocks,
+            c.last_winter_snow_blocks,
+            c.last_winter_ice_blocks,
             c.total_worldgen_water_blocks,
             c.total_worldgen_water_source_blocks,
-            c.total_shoreline_sand_blocks
+            c.total_shoreline_sand_blocks,
+            c.total_winter_snow_blocks,
+            c.total_winter_ice_blocks
+        )
+    }
+
+    pub(crate) fn winter_debug_line(&self) -> String {
+        let c = self.winter_surface_debug_counts;
+        format!(
+            "Climate: env={} precip={} sampled={}/{} snow={}/{} ice={}/{} last_ms={:.3}",
+            self.world_environment().label(),
+            self.active_precipitation_kind()
+                .map(PrecipitationKind::label)
+                .unwrap_or("off"),
+            c.last_tick_columns,
+            c.columns_sampled,
+            c.last_tick_snow,
+            c.snow_placed,
+            c.last_tick_ice,
+            c.water_frozen,
+            c.last_tick_ms
         )
     }
 
@@ -16466,6 +18003,9 @@ impl State {
     }
 
     pub(crate) fn update_texture_animations(&mut self, dt: f32) {
+        if !self.world_session_state.allows_runtime_processing() {
+            return;
+        }
         self.texture_anim_accum += dt.max(0.0);
         let mut dirty = false;
         while self.texture_anim_accum >= MINECRAFT_TICK_SECONDS {
@@ -16793,6 +18333,116 @@ impl State {
         self.outline_target = None;
     }
 
+    fn precipitation_strength(&self) -> f32 {
+        self.precipitation_visual_intensity.clamp(0.0, 1.0)
+    }
+
+    fn rain_column_hash(wx: i32, wz: i32) -> u32 {
+        let mut v = (wx as u32).wrapping_mul(0x9E37_79B9) ^ (wz as u32).wrapping_mul(0x85EB_CA6B);
+        v ^= v >> 16;
+        v = v.wrapping_mul(0x7FEB_352D);
+        v ^= v >> 15;
+        v = v.wrapping_mul(0x846C_A68B);
+        v ^ (v >> 16)
+    }
+
+    fn build_precipitation_vertices(
+        &self,
+        camera: &Camera,
+        kind: PrecipitationKind,
+    ) -> Vec<OutlineVertex> {
+        let rain = self.precipitation_strength();
+        if rain <= 0.02 {
+            return Vec::new();
+        }
+
+        let center_x = camera.position.x.floor() as i32;
+        let center_z = camera.position.z.floor() as i32;
+        let center_y = camera.position.y;
+        let min_y = self.world.min_y() as f32;
+        let max_y = self.world.max_y() as f32;
+        let step = CLASSIC_RAIN_GRID_STEP as usize;
+        let radius = CLASSIC_RAIN_RADIUS_BLOCKS;
+        let mut vertices = Vec::with_capacity(
+            (((radius * 2 + 1) / CLASSIC_RAIN_GRID_STEP).pow(2) as usize).saturating_mul(2),
+        );
+
+        for dz in (-radius..=radius).step_by(step) {
+            for dx in (-radius..=radius).step_by(step) {
+                let cell_x = center_x + dx;
+                let cell_z = center_z + dz;
+                let hash = Self::rain_column_hash(cell_x, cell_z);
+                let offset_x = (((hash & 0xFF) as f32 / 255.0) - 0.5) * 0.65;
+                let offset_z = ((((hash >> 8) & 0xFF) as f32 / 255.0) - 0.5) * 0.65;
+                let (
+                    speed_base,
+                    speed_step,
+                    vertical_drop,
+                    streak_dx,
+                    streak_dz,
+                    top_offset,
+                    bottom_offset,
+                    min_length,
+                    max_length,
+                ) = match kind {
+                    PrecipitationKind::Rain => (
+                        7.5,
+                        0.4,
+                        6.0,
+                        0.10,
+                        0.04,
+                        CLASSIC_RAIN_TOP_OFFSET,
+                        CLASSIC_RAIN_BOTTOM_OFFSET,
+                        CLASSIC_RAIN_MIN_LENGTH,
+                        CLASSIC_RAIN_MAX_LENGTH,
+                    ),
+                    PrecipitationKind::Snow => (
+                        2.4,
+                        0.14,
+                        2.1,
+                        0.03,
+                        0.01,
+                        CLASSIC_RAIN_TOP_OFFSET * 0.8,
+                        CLASSIC_RAIN_BOTTOM_OFFSET * 0.6,
+                        CLASSIC_RAIN_MIN_LENGTH * 0.55,
+                        CLASSIC_RAIN_MAX_LENGTH * 0.65,
+                    ),
+                };
+                let speed = speed_base + (((hash >> 16) & 0x0F) as f32) * speed_step;
+                let phase = (self.precipitation_phase_seconds * speed
+                    + ((hash >> 20) & 0x0F) as f32)
+                    .fract();
+                let terrain_y = self.world.terrain_height_at(cell_x, cell_z) as f32 + 1.0;
+                let top_y = (center_y + top_offset - phase * vertical_drop)
+                    .clamp(terrain_y + min_length, max_y);
+                let bottom_y = (terrain_y.max(center_y - bottom_offset)).clamp(min_y, top_y - 0.25);
+                let length = (min_length + (((hash >> 24) & 0x07) as f32) * 0.75 + rain * 1.5)
+                    .clamp(min_length, max_length);
+                let start = Vec3::new(
+                    cell_x as f32 + 0.5 + offset_x,
+                    top_y,
+                    cell_z as f32 + 0.5 + offset_z,
+                );
+                let end = Vec3::new(
+                    start.x + streak_dx,
+                    (top_y - length).max(bottom_y),
+                    start.z + streak_dz,
+                );
+                if start.y - end.y < 0.5 {
+                    continue;
+                }
+                vertices.push(OutlineVertex {
+                    position: start.to_array(),
+                });
+                vertices.push(OutlineVertex {
+                    position: end.to_array(),
+                });
+            }
+        }
+
+        vertices
+    }
+
     fn sky_clear_color_rgb(&self) -> [f32; 3] {
         let t = self.world_time.sky_brightness.clamp(0.0, 1.0);
         let day = [0.52, 0.72, 1.00];
@@ -16805,6 +18455,10 @@ impl State {
         let horizon = (1.0 - sun_curve).clamp(0.0, 1.0);
         let twilight = horizon.powf(1.8) * (1.0 - (t * 2.0 - 1.0).abs()).clamp(0.0, 1.0);
         color = lerp3(color, [0.96, 0.52, 0.22], twilight * 0.16);
+        let rain = self.precipitation_strength();
+        if rain > 0.0 {
+            color = lerp3(color, [0.36, 0.41, 0.47], rain * 0.65);
+        }
         color
     }
 
@@ -16904,12 +18558,14 @@ impl State {
         let billboard_right = camera.right();
         let billboard_up = billboard_right.cross(camera.forward()).normalize_or_zero();
         let moon_uv = self.moon_phase_uv_rect();
-        let sun_color = [self.world_time.sun_brightness; 3];
-        let moon_strength = (1.0 - self.world_time.sky_brightness).clamp(0.15, 1.0);
+        let rain = self.precipitation_strength();
+        let sun_color = [self.world_time.sun_brightness * (1.0 - rain * 0.45); 3];
+        let moon_strength = (1.0 - self.world_time.sky_brightness).clamp(0.15, 1.0) * (1.0 - rain);
         let moon_color = [moon_strength; 3];
         let star_visibility = (1.0 - self.world_time.sky_brightness)
             .clamp(0.0, 1.0)
-            .powf(2.2);
+            .powf(2.2)
+            * (1.0 - rain);
 
         let mut vertices = [Vertex {
             position: [0.0, 0.0, 0.0],
@@ -17073,6 +18729,12 @@ impl State {
             self.camera_uniform.fog_color[2] =
                 lerp(self.camera_uniform.fog_color[2], sky_rgb[2], mix);
             self.camera_uniform.fog_params[2] *= lerp(1.20, 0.85, world_time.sky_brightness);
+            let rain = self.precipitation_strength();
+            if rain > 0.0 {
+                self.camera_uniform.fog_params[0] *= lerp(1.0, 0.80, rain);
+                self.camera_uniform.fog_params[1] *= lerp(1.0, 0.72, rain);
+                self.camera_uniform.fog_params[2] *= lerp(1.0, 1.12, rain);
+            }
 
             let cfg = self.world.config();
             if cfg.boundary_ocean() {
@@ -17256,6 +18918,26 @@ impl State {
                 })
             }
         };
+        let precipitation_line_mesh: Option<(wgpu::Buffer, u32)> =
+            if !draw_world_scene || self.precipitation_strength() <= 0.02 {
+                None
+            } else if let Some(kind) = self.active_precipitation_kind() {
+                let vertices = self.build_precipitation_vertices(camera, kind);
+                if vertices.is_empty() {
+                    None
+                } else {
+                    let vertex_buffer =
+                        self.device
+                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("Precipitation Line Vertex Buffer"),
+                                contents: bytemuck::cast_slice(&vertices),
+                                usage: wgpu::BufferUsages::VERTEX,
+                            });
+                    Some((vertex_buffer, vertices.len() as u32))
+                }
+            } else {
+                None
+            };
         let ui_mesh_scope = perf_trace::scope("render.build_ui_meshes").with_counts(format!(
             "gen={} menu={} inv={} debug={} chat={} hotbar_slots={}",
             generation_overlay.is_some() as u8,
@@ -17804,6 +19486,16 @@ impl State {
                         world_drawcalls += 1;
                     }
                 }
+                if let Some((vertex_buffer, vertex_count)) = &precipitation_line_mesh {
+                    let precipitation_pipeline = match self.active_precipitation_kind() {
+                        Some(PrecipitationKind::Snow) => &self.snow_pipeline,
+                        _ => &self.rain_pipeline,
+                    };
+                    rpass.set_pipeline(precipitation_pipeline);
+                    rpass.set_bind_group(0, &self.camera_bind_group, &[]);
+                    rpass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                    rpass.draw(0..*vertex_count, 0..1);
+                }
 
                 // Partikel sind World-Space Billboards und nutzen dieselbe Kamera-Uniform.
                 // Keine zusätzliche Kamera-Offset-Logik: view_proj transformiert sie korrekt.
@@ -18225,13 +19917,15 @@ impl State {
             || provisional > 0
             || visual_ready > 0
             || !self.pending_chunk_added_lighting_jobs.is_empty()
-            || !self.pending_removed_lighting_batches.is_empty();
+            || !self.pending_removed_lighting_batches.is_empty()
+            || !self.pending_block_edit_lighting_batches.is_empty()
+            || self.active_block_edit_lighting_job.is_some();
         let debounce_ms_left = self
             .lighting_rebuild_not_before
             .map(|t| t.saturating_duration_since(now).as_millis())
             .unwrap_or(0);
         format!(
-            "Lighting Pending: {} (prov={} visual={} final={} req={} inflight={} dirty_q={} stream_q={} remove_q={} result_q={} debounce={}ms)",
+            "Lighting Pending: {} (prov={} visual={} final={} req={} inflight={} dirty_q={} stream_q={} remove_q={} edit_q={} active_edit={} result_q={} debounce={}ms)",
             if pending { "yes" } else { "no" },
             provisional,
             visual_ready,
@@ -18241,6 +19935,8 @@ impl State {
             self.pending_lighting_dirty_chunks.len(),
             self.pending_chunk_added_lighting_jobs.len(),
             self.pending_removed_lighting_batches.len(),
+            self.pending_block_edit_lighting_batches.len(),
+            self.active_block_edit_lighting_job.is_some() as u8,
             self.lighting_results.len(),
             debounce_ms_left
         )
@@ -18255,7 +19951,9 @@ impl State {
                 + self.mesh_upload_queue.len(),
             lighting_dirty_chunks: self.pending_lighting_dirty_chunks.len()
                 + self.pending_chunk_added_lighting_jobs.len()
-                + self.pending_removed_lighting_batches.len(),
+                + self.pending_removed_lighting_batches.len()
+                + self.pending_block_edit_lighting_batches.len()
+                + usize::from(self.active_block_edit_lighting_job.is_some()),
             storage_loads_inflight: self.saved_column_loads_inflight.len()
                 + self.storage_loader.queue_len_approx(),
             active_sim_columns: self.active_sim_columns.len(),
