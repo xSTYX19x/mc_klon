@@ -14,11 +14,11 @@ but not as an active TODO list.
 
 ## Partially/Open in the Historical Sense
 
-1. Humans/mob stub for early Classic feel
-2. fine-tuning of individual UI/gameplay parity details
+See "Historical / Classic Parity" in `docs/TODO.md`.
 
 ## Active References
 
 - `docs/01_status_und_aktueller_stand.md`
 - `docs/todos_worldgen.md`
 - `docs/performance_optimizations.md`
+- `docs/TODO.md`

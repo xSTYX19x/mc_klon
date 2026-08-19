@@ -31,27 +31,9 @@ Current initial ore table:
 - iron
 - gold
 
-## High Priority
+## Priorities
 
-- [ ] Split ore profiles by preset instead of using one shared default profile
-- [ ] Add neighbor-aware exposed-air checks so `HiddenOnly` ores are trustworthy at chunk borders
-- [ ] Expand worldgen regression tests with seam, density, and height-distribution sampling
-- [ ] Continue consolidating legacy/older worldgen entry points against the active worker pipeline
-- [ ] Document preset differences and worldgen phase order more explicitly where contributors will find it quickly
-
-## Medium Priority
-
-- [ ] Add more ore families once replacement and height targets are defined clearly
-- [ ] Introduce biome/material-aware replacement rules beyond plain stone
-- [ ] Add richer height models if balancing needs more than uniform/triangle distributions
-- [ ] Make more worldgen metrics visible in the debug overlay
-- [ ] Prepare the worldgen config path for taller worlds without redoing ore anchors again
-
-## Low Priority
-
-- [ ] Decide and document long-term world size expectations more explicitly
-- [ ] Add comparison screenshots / seed references per preset
-- [ ] Revisit historical parity content only after the modern feature passes remain stable
+See "Worldgen" in `docs/TODO.md`.
 
 ## Worldgen Phase Order
 
@@ -69,7 +51,4 @@ If future passes are added, they should fit into this ordered pipeline instead o
 
 ## Test / Acceptance Ideas
 
-- [ ] sample several fixed seeds and assert per-ore counts stay within defined tolerances
-- [ ] keep deterministic tests for same-seed same-column equality
-- [ ] add a visual/manual checklist for chunk-border seams
-- [ ] measure that startup and normal chunkgen remain within acceptable warmup budgets after ore tuning
+See "Worldgen > Test/acceptance ideas" in `docs/TODO.md`.

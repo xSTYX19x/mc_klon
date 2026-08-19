@@ -68,3 +68,4 @@ Details are in:
 - `docs/06_runtime_contracts_and_pipelines.md`
 - `docs/performance_optimizations.md`
 - `docs/todos_worldgen.md`
+- `docs/TODO.md`

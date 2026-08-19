@@ -26,9 +26,7 @@ Three guidelines remain central for this repo:
 
 ## Next Architecture Steps
 
-1. Productize ticking areas (configuration, flags, UX)
-2. Measure/improve V2 storage efficiency for block-name palettes
-3. Continue consolidating the worldgen path
+See "UI / UX", "Storage / Content Foundation", and "Worldgen" in `docs/TODO.md`.
 
 ## Guardrails
 

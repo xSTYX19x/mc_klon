@@ -25,20 +25,7 @@ Status: 2026-03-04
 
 ## Migration Path
 
-### Step 1
-
-- Keep V1/V2 compatibility explicit (read compatibility + migration tests)
-- Expand save/load tests for signature drift, unknown blocks, and remap cases
-
-### Step 2
-
-- If measurements justify it: design a more compact v2.1/v3 storage layout
-- Goal: less string overhead while preserving forward compatibility
-
-### Step 3
-
-- Migrate in-memory to `BlockStateId` + separate dirty flags
-- After that, optionally use palette/bitpacking at runtime as well
+See "Storage / Content Foundation" in `docs/TODO.md`.
 
 ## Definition of Done
 

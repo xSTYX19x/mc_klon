@@ -16,24 +16,9 @@ Status: 2026-03-07
 - Startup loading flow now uses the same warmup/overlay path as `Generate new level`
 - Hotbar/inventory 3D block previews use cached preview meshes instead of rebuilding slot content every frame
 
-## High Priority
+## Priorities
 
-1. Document reproducible profiling scenes as a baseline
-2. Continue consolidating the worldgen path (reduces duplicate work/branching)
-3. Measure and, if necessary, reduce V2 storage overhead for block-name palettes
-4. Measure startup warmup and first-playable-frame timing under fixed scenes
-
-## Medium Priority
-
-1. Preset-specific worldgen tuning with snapshot tests
-2. Complete ticking-area workflows (radius/flags/UX) beyond the shortcut baseline
-3. Refine additional upload/dispatch metrics in the overlay
-4. Measure preview cache growth and decide whether eviction/prewarming is needed
-
-## Low Priority
-
-1. GPU-driven submission only if a draw-call bottleneck is proven
-2. More advanced occlusion approaches only after measurement
+See "Performance" (and "Rendering" for the GPU-driven/occlusion items) in `docs/TODO.md`.
 
 ## Measure Before Optimizing
 

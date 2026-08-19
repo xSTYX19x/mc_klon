@@ -80,6 +80,7 @@ Current options in this pass:
 - `view_bobbing`
 - `render_distance`
 - `vsync`
+- `backface_culling`
 - core gameplay keybindings
 
 Rules:

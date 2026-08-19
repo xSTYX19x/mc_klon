@@ -121,38 +121,4 @@ That direction is now active in the code:
 
 ## Current Open Work By Subsystem
 
-### Rendering
-
-1. extend the occlusion/selection contract to more non-cube shapes such as stairs, panes, fences, torches, and rails
-2. make lighting and exposure checks use the same shape-aware rules as meshing
-3. add better debug visualization for face coverage, baked AO classes, and preview cache behavior
-
-### Worldgen
-
-1. split ore tables by preset/profile instead of one shared default table
-2. add richer ore rules: hidden-only exposure, more ore families, and biome/material-aware replacement
-3. strengthen deterministic regression coverage with sampled-world statistics and seam checks
-
-### UI / UX
-
-1. keep expanding the options UI without reintroducing scattered hard-coded runtime settings
-2. move remaining block-selection/icon paths onto the same 3D preview system
-3. add a fuller ticking-area/editor UX instead of shortcut-only management
-
-### Gameplay
-
-1. wire hotbar digit keys and decide whether they belong in the rebindable controls set
-2. continue block-shape gameplay polish for future interactables
-3. decide how spawn persistence and first-view direction should affect startup readiness
-
-### Performance
-
-1. document reproducible startup and streaming benchmark scenes
-2. measure ore-pass, preview-cache, and loading-screen warmup costs before deeper optimization work
-3. continue consolidating legacy worldgen/storage paths that still duplicate logic
-
-### Docs / Cleanup
-
-1. keep README, status docs, backlog docs, and worldgen TODOs updated after feature landings
-2. reduce stale notes that still describe pre-settings or pre-loading-screen behavior
-3. tighten file/module comments around the newer contracts so they are discoverable from code as well as docs
+See `docs/TODO.md` for the current open-work list by subsystem.
