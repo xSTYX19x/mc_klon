@@ -155,16 +155,24 @@ fn grown_capacity(required: u64) -> u64 {
     required.max(256).next_power_of_two()
 }
 
+/// `label_prefix` is borrowed rather than formatted into an owned `String`: this
+/// runs on every buffer creation, and the label is debug metadata only.
 fn create_gpu_buffer(
     device: &wgpu::Device,
-    label: String,
+    label_prefix: &str,
+    kind: &str,
     usage: wgpu::BufferUsages,
     size: u64,
     stats: &mut MeshUploadStats,
 ) -> wgpu::Buffer {
     let started = Instant::now();
+    let label = if cfg!(debug_assertions) {
+        Some(format!("{label_prefix} {kind}"))
+    } else {
+        None
+    };
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(&label),
+        label: label.as_deref(),
         size,
         usage: usage | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
@@ -225,7 +233,8 @@ pub(crate) fn upload_cpu_mesh_to_gpu_reuse(
     if vertex_buffer.is_none() {
         vertex_buffer = Some(create_gpu_buffer(
             device,
-            format!("{label_prefix} Vertex Buffer"),
+            label_prefix,
+            "Vertex Buffer",
             wgpu::BufferUsages::VERTEX,
             vertex_capacity_bytes,
             &mut stats,
@@ -256,7 +265,8 @@ pub(crate) fn upload_cpu_mesh_to_gpu_reuse(
     if index_buffer.is_none() {
         index_buffer = Some(create_gpu_buffer(
             device,
-            format!("{label_prefix} Index Buffer"),
+            label_prefix,
+            "Index Buffer",
             wgpu::BufferUsages::INDEX,
             index_capacity_bytes,
             &mut stats,
@@ -306,7 +316,11 @@ pub(crate) fn upload_world_cpu_mesh_to_gpu_reuse(
     let (mut vertex_buffer, vertex_capacity_bytes, vertex_reused) = if let Some(ref old) = existing
     {
         if old.vertex_capacity_bytes >= required_vertex_bytes {
-            (Some(old.vertex_buffer.clone()), old.vertex_capacity_bytes, true)
+            (
+                Some(old.vertex_buffer.clone()),
+                old.vertex_capacity_bytes,
+                true,
+            )
         } else {
             (None, grown_capacity(required_vertex_bytes), false)
         }
@@ -316,18 +330,29 @@ pub(crate) fn upload_world_cpu_mesh_to_gpu_reuse(
     if vertex_buffer.is_none() {
         vertex_buffer = Some(create_gpu_buffer(
             device,
-            format!("{label_prefix} Vertex Buffer"),
+            label_prefix,
+            "Vertex Buffer",
             wgpu::BufferUsages::VERTEX,
             vertex_capacity_bytes,
             &mut stats,
         ));
     }
     let vertex_buffer = vertex_buffer.expect("vertex buffer must be allocated");
-    write_buffer_bytes(queue, &vertex_buffer, vertex_bytes, vertex_reused, &mut stats);
+    write_buffer_bytes(
+        queue,
+        &vertex_buffer,
+        vertex_bytes,
+        vertex_reused,
+        &mut stats,
+    );
 
     let (mut index_buffer, index_capacity_bytes, index_reused) = if let Some(ref old) = existing {
         if old.index_capacity_bytes >= required_index_bytes {
-            (Some(old.index_buffer.clone()), old.index_capacity_bytes, true)
+            (
+                Some(old.index_buffer.clone()),
+                old.index_capacity_bytes,
+                true,
+            )
         } else {
             (None, grown_capacity(required_index_bytes), false)
         }
@@ -337,7 +362,8 @@ pub(crate) fn upload_world_cpu_mesh_to_gpu_reuse(
     if index_buffer.is_none() {
         index_buffer = Some(create_gpu_buffer(
             device,
-            format!("{label_prefix} Index Buffer"),
+            label_prefix,
+            "Index Buffer",
             wgpu::BufferUsages::INDEX,
             index_capacity_bytes,
             &mut stats,

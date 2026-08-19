@@ -1250,6 +1250,10 @@ const FRAME_MESH_MENU_OVERLAY: &str = "Menu Overlay";
 const FRAME_MESH_DEBUG_OVERLAY: &str = "Debug Overlay";
 const FRAME_MESH_FIRST_PERSON_OVERLAY: &str = "First Person Overlay";
 
+/// Wall-clock bound for the blocking spawn-placement column wait.
+const ENSURE_COLUMN_GENERATION_TIMEOUT: Duration = Duration::from_secs(5);
+const ENSURE_COLUMN_GENERATION_POLL_INTERVAL: Duration = Duration::from_micros(250);
+
 const MESH_UPLOAD_LOG_THRESHOLD: Duration = Duration::from_millis(4);
 const BLOCK_EDIT_SIDEFX_BUDGET_MS: f32 = 1.5;
 const BLOCK_EDIT_SIDEFX_MAX_EDITS_PER_FRAME: usize = 8;
@@ -12917,34 +12921,50 @@ impl State {
         World::in_bounds(above) && fluid_kind(world.get_block(above)) != Some(kind)
     }
 
+    /// Blocks until the column is generated. Only reached from spawn placement
+    /// during the loading screen, so blocking is acceptable — but it used to
+    /// busy-spin on `yield_now()` for up to 512 iterations, burning a core that
+    /// the worldgen workers could have used. Now it sleeps between polls and is
+    /// bounded by wall clock rather than an iteration count, so a stalled column
+    /// gives up after a predictable time instead of an unpredictable one.
     pub(crate) fn ensure_column_loaded_or_generated(&mut self, world_x: i32, world_z: i32) {
         let cx = world_x.div_euclid(CHUNK_SIZE);
         let cz = world_z.div_euclid(CHUNK_SIZE);
-        if !self.try_load_saved_column_if_present(cx, cz) {
-            let min_chunk_y = self.world.min_chunk_y();
-            let max_chunk_y = self.world.max_chunk_y();
-            let mut spins = 0usize;
-            while (min_chunk_y..=max_chunk_y).any(|y| {
+        if self.try_load_saved_column_if_present(cx, cz) {
+            return;
+        }
+
+        let min_chunk_y = self.world.min_chunk_y();
+        let max_chunk_y = self.world.max_chunk_y();
+        let started = Instant::now();
+        loop {
+            let preset = self.worldgen_preset;
+            let mut missing = 0usize;
+            for y in min_chunk_y..=max_chunk_y {
                 let coord = ChunkCoord { x: cx, y, z: cz };
-                !self.chunk_is_generation_satisfied(coord)
-            }) {
-                let preset = self.worldgen_preset;
-                for y in min_chunk_y..=max_chunk_y {
-                    let coord = ChunkCoord { x: cx, y, z: cz };
-                    if self.chunk_is_generation_satisfied(coord) {
-                        continue;
-                    }
-                    let _ = self.request_chunk_generation(coord, preset);
+                if self.chunk_is_generation_satisfied(coord) {
+                    continue;
                 }
-                self.pump_chunkgen_results();
-                spins = spins.saturating_add(1);
-                if spins > 512 {
+                missing += 1;
+                // Re-requested each pass on purpose: the job channel is bounded
+                // and may have rejected an earlier attempt.
+                let _ = self.request_chunk_generation(coord, preset);
+            }
+            if missing == 0 {
+                break;
+            }
+            if self.pump_chunkgen_results() == 0 {
+                if started.elapsed() >= ENSURE_COLUMN_GENERATION_TIMEOUT {
+                    crate::console_error!(
+                        "[worldgen] column ({cx}, {cz}) not ready after {:.0}ms, giving up with {missing} section(s) missing",
+                        started.elapsed().as_secs_f32() * 1000.0
+                    );
                     break;
                 }
-                std::thread::yield_now();
+                std::thread::sleep(ENSURE_COLUMN_GENERATION_POLL_INTERVAL);
             }
-            self.mark_column_dirty(cx, cz);
         }
+        self.mark_column_dirty(cx, cz);
     }
 
     fn pump_chunkgen_results(&mut self) -> usize {
@@ -18650,9 +18670,18 @@ impl State {
                     + ((hash >> 20) & 0x0F) as f32)
                     .fract();
                 let terrain_y = self.world.terrain_height_at(cell_x, cell_z) as f32 + 1.0;
+                // `f32::clamp` panics when min > max. Both bounds here are derived
+                // from terrain height, so a column whose terrain sits within
+                // `min_length` of the world ceiling (or below `min_y + 0.25`)
+                // would take the whole frame down. `.max().min()` saturates
+                // instead, which is the intent.
                 let top_y = (center_y + top_offset - phase * vertical_drop)
-                    .clamp(terrain_y + min_length, max_y);
-                let bottom_y = (terrain_y.max(center_y - bottom_offset)).clamp(min_y, top_y - 0.25);
+                    .max(terrain_y + min_length)
+                    .min(max_y);
+                let bottom_y = terrain_y
+                    .max(center_y - bottom_offset)
+                    .max(min_y)
+                    .min(top_y - 0.25);
                 let length = (min_length + (((hash >> 24) & 0x07) as f32) * 0.75 + rain * 1.5)
                     .clamp(min_length, max_length);
                 let start = Vec3::new(
@@ -19047,7 +19076,6 @@ impl State {
         let mut visible_lod_columns: Vec<(LodColumnCoord, f32)> = Vec::with_capacity(256);
         let mut visible_chunks: Vec<(ChunkCoord, f32)> =
             Vec::with_capacity(self.chunk_meshes.len());
-        let mut transparent_chunks = Vec::new();
         if draw_world_scene {
             let aspect = (self.config.width as f32 / self.config.height as f32).max(0.0001);
             let frustum = Frustum::from_view_proj(build_view_proj_wgpu(camera, aspect));
@@ -19106,14 +19134,6 @@ impl State {
                     .then_with(|| coord_a.x.cmp(&coord_b.x))
                     .then_with(|| coord_a.y.cmp(&coord_b.y))
                     .then_with(|| coord_a.z.cmp(&coord_b.z))
-            });
-            transparent_chunks = visible_chunks.clone();
-            transparent_chunks.sort_by(|(coord_a, dist_a), (coord_b, dist_b)| {
-                dist_b
-                    .total_cmp(dist_a)
-                    .then_with(|| coord_b.x.cmp(&coord_a.x))
-                    .then_with(|| coord_b.y.cmp(&coord_a.y))
-                    .then_with(|| coord_b.z.cmp(&coord_a.z))
             });
         }
         let near_mesh_memory_bytes = self.total_near_mesh_memory_bytes();
@@ -19570,7 +19590,7 @@ impl State {
                     let _transparent_scope = perf_trace::scope("render.draw.transparent")
                         .with_counts(format!(
                             "chunks={} boundary_ocean={}",
-                            transparent_chunks.len(),
+                            visible_chunks.len(),
                             show_boundary_ocean as u8
                         ));
                     rpass.set_pipeline(&self.render_pipeline_transparent);
@@ -19587,7 +19607,10 @@ impl State {
                             world_drawcalls += 1;
                         }
                     }
-                    for (coord, _) in &transparent_chunks {
+                    // Back-to-front is exactly `visible_chunks` reversed: the
+                    // transparent order used to be a full clone plus a second
+                    // sort with every comparison term flipped.
+                    for (coord, _) in visible_chunks.iter().rev() {
                         let Some(layered) = self.chunk_meshes.get(coord) else {
                             continue;
                         };

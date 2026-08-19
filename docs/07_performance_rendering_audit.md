@@ -498,16 +498,16 @@ Keine Säulen-Ursache, aber ein Crash, der auf die richtige Terrainhöhe wartet.
 | high | `src/render/mesh_gpu.rs:196-260` | Pro-Chunk-pro-Layer `wgpu::Buffer` (bis zu 6/Chunk), keine Suballocation; `grown_capacity` = `next_power_of_two` → bis zu 2× VRAM-Verschwendung | Layer aus einer großen persistenten Arena suballozieren; bestehenden Reuse-on-Fit-Pfad behalten |
 | high | `src/render/state.rs:5678` | Mesh-Job-Channel `unbounded` + FIFO-Worker → ferne Chunks verhungern nahe (`inflight(mesh=148)`) | Bounded Channel + umsortierbare Pending-Queue |
 | medium | `src/console.rs:9-13`; `src/world/mod.rs:2425-2454`; `src/render/state.rs:17604` | `eprintln!` (ungepuffert, globaler Lock) pro Mesh-Pump und ×6 pro Lighting-Job, aus Worker-Threads | Level-gegateter, gepufferter Logger |
-| medium | `src/meshing/pool.rs:63-70` | `take_mesh_data` macht `mem::take` und allokiert dann frische `Vec::with_capacity(8192/12288)` ≈ **410 KB pro Aufruf** — der Pool alloziert, statt zu poolen | Slice zurückgeben / in caller-eigenen Buffer drainen, oder Free-List retirierter Vecs |
-| medium | `src/meshing/pool.rs:152-158` | `reserve_if_hint` ruft `Vec::reserve` (additiv) mit monoton wachsenden Hints aus `update_hint` → Kapazität ratcht auf den größten je gemeshten Chunk hoch | `reserve_exact` gegen `hint - len`, Hint verfallen lassen |
-| medium | `src/render/state.rs:18874` | `transparent_chunks = visible_chunks.clone()` + zweiter Full-Sort, jeden Frame | `visible_chunks` rückwärts iterieren — der Sort ist exakt invertiert |
-| medium | `src/render/state.rs:18898-18906` | Partikel-Vertex-/Index-Buffer jeden Frame neu gebaut | Persistenter Ring-Buffer |
+| ~~medium~~ → **kein Befund** | `src/meshing/pool.rs:63-70` | `take_mesh_data` allokiert zwar ≈410 KB pro Aufruf, wird aber **nur in Tests** aufgerufen (`pool.rs`, `pool_regression_test.rs`) — kein Produktionspfad | keine Maßnahme; Einstufung war falsch |
+| medium | `src/meshing/pool.rs:152-158` | `reserve_if_hint` ruft `Vec::reserve` (additiv) mit monoton wachsenden Hints aus `update_hint` → Kapazität ratcht auf den größten je gemeshten Chunk hoch | ✅ behoben: `reserve_exact` nur auf den Fehlbetrag, Hint klingt jetzt ab |
+| medium | `src/render/state.rs:18874` | `transparent_chunks = visible_chunks.clone()` + zweiter Full-Sort, jeden Frame | ✅ behoben: `visible_chunks.iter().rev()`, Clone und Sort entfallen |
+| medium | `src/render/state.rs:18898-18906` | Partikel-Vertex-/Index-Buffer jeden Frame neu gebaut | ✅ behoben mit §5 (`frame_mesh_slots`) |
 | medium | `Cargo.toml` | Feature `allocation_tracking` wird in `src/meshing/liquids.rs:10` und `:653` benutzt, ist aber **nirgends deklariert** → `cargo build --features allocation_tracking` schlägt fehl; der Tracker ist unerreichbar | `[features]\nallocation_tracking = []` ergänzen |
-| medium | `src/render/state.rs:18418` | Erreichbarer `f32::clamp`-Panic (min > max) in der Precipitation | `.max().min()` |
-| low | `src/meshing/neighborhood.rs:60-64` | `resize()` gefolgt von `fill()` — drei redundante Full-Fills à 5832 Elemente pro Mesh-Job | `fill` nach `resize`/`clear` streichen |
-| low | `src/meshing/neighborhood.rs:176-182` | Toter Zweig: `if world_y > WORLD_MAX_Y { 0xF0 } else { 0xF0 }` | Zusammenfassen; klären, ob der `< 0`-Fall wirklich `0` sein soll |
-| low | `src/render/mesh_gpu.rs:216` | `format!("{label_prefix} Vertex Buffer")` allokiert einen `String` pro Buffer-Erzeugung | `&'static str`-Labels, oder `None` im Release |
-| low | `src/render/state.rs:10496-10510` | `count_urgent_near_mesh_uploads` scannt die volle Upload-Queue jeden Frame (zweimal, über beide Budget-Pfade) | Zähler inkrementell pflegen |
+| medium | `src/render/state.rs:18418` | Erreichbarer `f32::clamp`-Panic (min > max) in der Precipitation | ✅ behoben: `.max().min()` |
+| low | `src/meshing/neighborhood.rs:60-64` | `resize()` gefolgt von `fill()` — drei redundante Full-Fills à 5832 Elemente pro Mesh-Job | ✅ behoben: `clear()` + `resize()`, ein Durchlauf statt zwei |
+| low | `src/meshing/neighborhood.rs:176-182` | Toter Zweig: `if world_y > WORLD_MAX_Y { 0xF0 } else { 0xF0 }` | ✅ behoben: zusammengefasst, `0xF0` als benannte Konstante `FULL_SKYLIGHT_PACKED`; `< 0` → `0` ist beabsichtigt (Weltboden) |
+| low | `src/render/mesh_gpu.rs:216` | `format!("{label_prefix} Vertex Buffer")` allokiert einen `String` pro Buffer-Erzeugung | ✅ behoben: Label nur noch unter `debug_assertions`, sonst `None` |
+| ~~low~~ → **teilweise falsch** | `src/render/state.rs:10496-10510` | `count_urgent_near_mesh_uploads` scannt die Upload-Queue einmal pro Pump — **nicht** zweimal: die beiden Aufrufstellen sind Alternativzweige derselben `if let`. Bei Queue-Längen von 13–62 unkritisch | zurückgestellt |
 | medium | `src/render/state.rs:16157-16177` | **`pump_removed_lighting_batches` bricht unbedingt nach dem ersten Batch ab** — siehe §D.1 | Entscheiden: `if let` (Verhalten festschreiben) oder `break` entfernen (Budget wirken lassen) |
 | medium | Build/CI | **`cargo clippy --all-targets -- -D warnings` schlägt fehl** — siehe §D.2 | Lint aus §D.1 auflösen, dann Warning-Schulden abtragen |
 | — | gesamtes Crate | **Null `unsafe`-Blöcke.** `unwrap`/`expect`-Dichte niedrig und auf Init-/Test-Pfade konzentriert (state.rs: 5, greedy.rs: 12, world/mod.rs: 19, region_file.rs: 14, chunkgen_worker.rs: 13) | keine Maßnahme |
@@ -674,10 +674,13 @@ Der Report oben ist die Analyse auf `8f7634d`. Diese Tabelle hält nach, was dav
 | §2.4 | Startup-deferred-Set strandet | ✅ behoben | working tree |
 | §5 | Per-Frame-GPU-Buffer für Overlays/Partikel/Precipitation | ✅ behoben | working tree |
 | §1.5 | `eprintln!` in Hot Paths | ✅ behoben | working tree |
-| §1.3 | 512-Iterationen-Spin im Main-Thread | offen (Severity auf *low* korrigiert) | |
-| §1.4 | Mesh-Job-Priority-Inversion | offen | |
-| §2.5 | `blocks_skylight` vs. `OcclusionShape` | offen | |
-| §5 (Rest) | Chunk-Mesh-Suballocation statt Buffer pro Layer | offen | |
+| §1.3 | 512-Iterationen-Spin im Main-Thread | ✅ behoben | working tree |
+| §5 (klein) | Precipitation-Panic, `transparent_chunks`-Clone, Pool-Ratchet, Neighborhood-Fills, Buffer-Labels | ✅ behoben | working tree |
+| §1.4 | Mesh-Job-Priority-Inversion | offen (bewusst) | |
+| §2.5 | `blocks_skylight` vs. `OcclusionShape` | offen (bewusst) | |
+| §5 (Rest) | Chunk-Mesh-Suballocation statt Buffer pro Layer | offen (bewusst) | |
+| §2.2 (Rest) | Lighting auf den Worker-Pool | offen (bewusst) | |
+| §D.3 (Rest) | Removal-Lighting stufen | offen (bewusst) | |
 | §D.1 | `pump_removed_lighting_batches` bricht nach einem Batch ab | ✅ behoben | working tree |
 | §D.2 | Lint-Befehl aus `CLAUDE.md` schlägt fehl | 🟡 Clippy-Errors weg, Warning-Schulden offen | working tree |
 | §D.3 | Chunk-Entladung repariert Lighting synchron (188 ms) | ✅ behoben | working tree |
@@ -705,6 +708,19 @@ Eine Falle dabei: `showing_pause_menu` wurde aus `menu_overlay_mesh.is_some()` a
 - `rebuild_lighting_for_snapshot` (`src/world/mod.rs`) emittierte **sechs** `eprintln!` pro Aufruf, auf einem Lighting-Worker-Thread, jedes mit prozessweitem stderr-Lock und eigenem `write(2)`. Jetzt ein einzelnes `record_duration_ms`-Event mit denselben Zahlen — kostet nichts, wenn Tracing aus ist.
 - Die Mesh-Upload-Zeile feuerte bei `created_buffers > 0`, also während des Streamings praktisch jeden Frame. Die Bedingung ist jetzt rein zeitbasiert; die Buffer-Zahl steht ohnehin in `frame_perf.mesh_gpu_buffers_created` und damit im Stall-Report.
 
+**§1.3 — Spawn-Spin.** `ensure_column_loaded_or_generated` busy-spinnte mit `yield_now()` über bis zu 512 Iterationen und verbrannte dabei einen Kern, den die Worldgen-Worker gebrauchen konnten. Jetzt `sleep(250µs)` zwischen den Polls und eine Wanduhr-Schranke (5 s) statt einer Iterationszahl — eine hängende Spalte gibt nach vorhersagbarer Zeit auf und loggt das, statt still abzubrechen. Blockierend bleibt es bewusst: es läuft einmal während des Ladebildschirms, und die Spawn-Platzierung braucht die Spalte.
+
+**§5 (kleine Posten).**
+- Erreichbarer `f32::clamp`-Panic in der Precipitation (`clamp` panict bei min > max; beide Grenzen kommen aus der Terrainhöhe) → `.max().min()`.
+- `transparent_chunks = visible_chunks.clone()` plus zweiter Full-Sort pro Frame → die Transparent-Reihenfolge ist exakt die Umkehrung, also `visible_chunks.iter().rev()`. Clone und Sort entfallen ersatzlos.
+- `reserve_if_hint` rief `Vec::reserve` (additiv auf die Länge) mit absoluten Hints, `update_hint` ratchte nur nach oben → jetzt `reserve_exact` auf den Fehlbetrag, und der Hint klingt ab, statt sich auf dem größten je gemeshten Chunk festzusetzen.
+- `neighborhood.rs`: `resize()` + `fill()` lief zweimal über alle 5832 Elemente → `clear()` + `resize()`. Der tote Zweig in `fill_default_light` ist zusammengefasst, `0xF0` heißt jetzt `FULL_SKYLIGHT_PACKED`.
+- Buffer-Labels in `mesh_gpu.rs` werden nur noch unter `debug_assertions` formatiert.
+
+Pool-Regressionstests (`pool_regression_test.rs`, von `.claude/rules/meshing.md` gefordert) laufen durch.
+
+**§D.2 (Teil) — Warning-Schulden.** `allocation_tracker` wurde bedingungslos kompiliert, aber nur unter `#[cfg(feature = "allocation_tracking")]` benutzt — jetzt ist das Modul selbst hinter dem Feature. 109 → 102 Warnungen. Nebenbei erstmals verifiziert, dass `cargo check --features allocation_tracking` überhaupt baut (das Feature war bis zum Cargo.toml-Fix gar nicht deklariert).
+
 ### Messlauf nach §1.1/§1.2 — `logs/run_1787160799_221`
 
 Erster Lauf mit dem neuen Tracing-Default. Belege:
@@ -731,6 +747,20 @@ Der neue Lauf appliziert 25 Chunks in 12.7 ms, wo die alten 1–17 Chunks für 1
 **Neuer Hauptverursacher:** §D.3 (Unload-Lighting, 188.6 ms) — vorbestehend, vorher vom Tracing-Overhead verdeckt.
 
 **Nebenbefund:** `lighting.chunk_finalized` meldet Latenzen von **100–113 Sekunden** von `provisional` bis `finalized`. Keine Frame-Kosten, aber ein Beleg dafür, wie weit die Finalisierung hinterherhinkt. Dass die Chunks trotzdem nicht dunkel bleiben, liegt am §2.3-Fix — sie werden schon bei `VisualReady` neu gemesht.
+
+### Bewusst offen gelassen
+
+Diese Punkte sind nicht vergessen, sondern zurückgestellt — jeder aus einem konkreten Grund:
+
+| § | Warum nicht jetzt |
+|---|---|
+| §1.4 Mesh-Job-Priority-Inversion | Erfordert bounded Channel + umsortierbare Pending-Queue. Ein falsch gesetztes In-Flight-Limit kann Starvation oder Deadlock erzeugen; das gehört gemessen, nicht geraten. Die Messgrundlage (`mesh wait_avg/max`) stammt noch von vor allen Fixes. |
+| §5 (Rest) Chunk-Mesh-Suballocation | Arena-Allokator für bis zu 6 Buffer pro Chunk. Größerer Umbau in `mesh_gpu.rs` mit Lebensdauer-/Fragmentierungsfragen; ohne Messung des Ist-Zustands nicht sinnvoll priorisierbar. |
+| §2.2 (Rest) Lighting auf den Worker-Pool | Verschiebt inkrementelles Lighting vom Main-Thread auf den (heute idlen) `LightingWorkerPool`. Betrifft die Konsistenz zwischen Weltzustand und Lighting-Snapshot — ein Nebenläufigkeitsproblem, kein Tuning. |
+| §D.3 (Rest) Removal-Lighting stufen | `lighting_on_chunks_removed` müsste auf die Step-API umgestellt werden. Die akute Spitze (188 ms) ist bereits weg; der Rest ist Feinschliff. |
+| §2.5 `blocks_skylight` vs. `OcclusionShape` | Ändert sichtbar die Beleuchtung von Gras, Blättern und Slabs im gesamten Terrain. Ohne visuelle Prüfung im laufenden Spiel nicht verantwortbar. Der abgesicherte Zwischenschritt wäre ein Test, der die Übereinstimmung für jeden Block asserted, mit Whitelist für gewollte Ausnahmen. |
+| §3.2 Greedy-AO über gemergte Spans | `MaskCell`-Gleichheit um die AO-Werte erweitern stoppt das Mergen an AO-Kanten — korrekter, aber mehr Quads. Sichtbare und Performance-Auswirkung, gehört gemessen. |
+| §D.2 (Rest) Dead-Code-Warnungen | ~100 `never used`-Warnungen. Massenhaft löschen würde vermutlich Vorrat für laufende Arbeit entfernen, massenhaft `#[allow]` würde künftige echte Funde verstecken. Braucht eine Entscheidung pro Posten. |
 
 ### Testlage
 

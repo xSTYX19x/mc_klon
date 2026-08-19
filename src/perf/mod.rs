@@ -1,3 +1,6 @@
+// Only consumed under this feature (see `meshing/liquids.rs`). Compiling it
+// unconditionally produced ~8 dead-code warnings in every normal build.
+#[cfg(feature = "allocation_tracking")]
 pub(crate) mod allocation_tracker;
 pub(crate) mod trace;
 
@@ -6,7 +9,8 @@ use std::time::{Duration, Instant};
 
 use winit::window::Window;
 
-pub(crate) use allocation_tracker::{ALLOCATION_TRACKER, AllocationStats, AllocationTracker};
+#[cfg(feature = "allocation_tracking")]
+pub(crate) use allocation_tracker::ALLOCATION_TRACKER;
 
 const EMA_ALPHA: f32 = 0.10;
 const REPORT_INTERVAL: Duration = Duration::from_secs(1);

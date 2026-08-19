@@ -158,16 +158,28 @@ fn reserve_if_hint<T>(buffer: &mut Vec<T>, hint: usize) -> u32 {
     if hint == 0 {
         return 0;
     }
-    buffer.reserve(hint);
+    // `Vec::reserve` is additive on top of the current length, so passing the
+    // absolute hint asked for `len + hint` and made the buffer ratchet upward
+    // across chunks. Reserve only the shortfall, and only if there is one.
+    let additional = hint.saturating_sub(buffer.len());
+    if additional == 0 {
+        return 0;
+    }
+    buffer.reserve_exact(additional);
     1
 }
 
+/// Tracks the working-set size for the next chunk. The hint decays toward the
+/// most recent usage instead of latching onto the largest chunk ever meshed,
+/// which otherwise kept every later chunk's buffers at that peak.
 #[inline(always)]
 fn update_hint(current: &mut usize, capacity: usize) -> u32 {
     if capacity > *current {
         *current = capacity;
         1
     } else {
+        // Ease back down so a single dense chunk does not pin the hint forever.
+        *current -= (*current - capacity) / 4;
         0
     }
 }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use glam::IVec3;
 
 use crate::blocks::BlockId;
-use crate::world::{BlockAccess, CHUNK_SIZE, Chunk, ChunkCoord, WORLD_MAX_Y};
+use crate::world::{BlockAccess, CHUNK_SIZE, Chunk, ChunkCoord};
 
 #[derive(Clone)]
 pub(crate) struct ChunkSnapshot {
@@ -18,6 +18,9 @@ pub(crate) struct NeighborhoodSnapshot {
     // Order: +X, -X, +Y, -Y, +Z, -Z.
     pub(crate) neighbors: [Option<ChunkSnapshot>; 6],
 }
+
+/// Sky=15, block=0. What an unknown neighbour cell defaults to.
+const FULL_SKYLIGHT_PACKED: u8 = 0xF0;
 
 pub(crate) const PADDED_CHUNK_SIZE: i32 = CHUNK_SIZE + 2;
 pub(crate) const PADDED_CHUNK_STRIDE_Z: usize = PADDED_CHUNK_SIZE as usize;
@@ -56,10 +59,12 @@ impl MeshingNeighborhoodScratch {
         stats.allocations_avoided += ensure_capacity(&mut self.block_data, PADDED_CHUNK_VOLUME);
         stats.allocations_avoided += ensure_capacity(&mut self.light, PADDED_CHUNK_VOLUME);
 
+        // `clear` + `resize` fills the whole (now empty) buffer in one pass; the
+        // previous `resize` followed by `fill` walked all 5832 elements twice.
+        self.blocks.clear();
         self.blocks.resize(PADDED_CHUNK_VOLUME, BlockId::Air);
-        self.blocks.fill(BlockId::Air);
+        self.block_data.clear();
         self.block_data.resize(PADDED_CHUNK_VOLUME, 0);
-        self.block_data.fill(0);
         self.light.resize(PADDED_CHUNK_VOLUME, 0);
         fill_default_light(
             &mut self.light,
@@ -184,13 +189,10 @@ fn ensure_capacity<T>(buffer: &mut Vec<T>, needed: usize) -> u32 {
 fn fill_default_light(light: &mut [u8], origin_world_y: i32, y_stride: usize) {
     for padded_y in 0..PADDED_CHUNK_SIZE as usize {
         let world_y = origin_world_y + padded_y as i32 - 1;
-        let fill = if world_y < 0 {
-            0
-        } else if world_y > WORLD_MAX_Y {
-            0xF0
-        } else {
-            0xF0
-        };
+        // Below the world floor there is no sky; everywhere else a missing
+        // neighbour defaults to full skylight so an absent chunk brightens the
+        // halo rather than baking a dark seam into the mesh.
+        let fill = if world_y < 0 { 0 } else { FULL_SKYLIGHT_PACKED };
         let start = padded_y * y_stride;
         let end = start + y_stride;
         light[start..end].fill(fill);
@@ -345,13 +347,7 @@ impl<'a> MeshingNeighborhood<'a> {
 
     #[inline(always)]
     fn default_light_for_world_y(world_y: i32) -> u8 {
-        if world_y < 0 {
-            0
-        } else if world_y > WORLD_MAX_Y {
-            0xF0
-        } else {
-            0xF0
-        }
+        if world_y < 0 { 0 } else { FULL_SKYLIGHT_PACKED }
     }
 }
 
