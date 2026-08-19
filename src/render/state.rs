@@ -17520,14 +17520,16 @@ impl State {
             let _scope = perf_trace::scope("proc.enqueue_chunks_within_view");
             let started = Instant::now();
             let _stream_scope = perf_trace::scope("render.streaming.ensure_columns").with_counts(
-                format!(
-                    "view_chunks={} inflight_chunkgen={} inflight_mesh={} saved_inflight={} saved_q={}",
-                    self.view_distance_chunks,
-                    self.chunkgen_inflight.len(),
-                    self.inflight.len(),
-                    self.saved_column_loads_inflight.len(),
-                    self.storage_loader.queue_len_approx()
-                ),
+                || {
+                    format!(
+                        "view_chunks={} inflight_chunkgen={} inflight_mesh={} saved_inflight={} saved_q={}",
+                        self.view_distance_chunks,
+                        self.chunkgen_inflight.len(),
+                        self.inflight.len(),
+                        self.saved_column_loads_inflight.len(),
+                        self.storage_loader.queue_len_approx()
+                    )
+                },
             );
             self.enqueue_chunks_within_view(camera);
             let ms = started.elapsed().as_secs_f32() * 1000.0;
@@ -17544,7 +17546,7 @@ impl State {
         {
             let _scope = perf_trace::scope("proc.rebuild_world_lighting_if_dirty");
             let started = Instant::now();
-            let _lighting_scope = perf_trace::scope("render.lighting.step").with_counts(format!(
+            let _lighting_scope = perf_trace::scope("render.lighting.step").with_counts(|| format!(
                 "pending_dirty={} req_pending={} inflight={} result_q={} stream_backlog={} remove_backlog={} block_edit_backlog={}",
                 self.pending_lighting_dirty_chunks.len(),
                 self.lighting_request_pending as u8,
@@ -17653,14 +17655,16 @@ impl State {
                 ),
             );
         }
-        let _upload_scope = perf_trace::scope("render.upload.meshes").with_counts(format!(
-            "queue={} inflight={} urgent_near={} budget_ms={:.2} speed={:.2}",
-            self.mesh_upload_queue.len(),
-            self.inflight.len(),
-            urgent_near_uploads,
-            mesh_upload_budget_ms,
-            self.stream_camera_speed_blocks_per_sec
-        ));
+        let _upload_scope = perf_trace::scope("render.upload.meshes").with_counts(|| {
+            format!(
+                "queue={} inflight={} urgent_near={} budget_ms={:.2} speed={:.2}",
+                self.mesh_upload_queue.len(),
+                self.inflight.len(),
+                urgent_near_uploads,
+                mesh_upload_budget_ms,
+                self.stream_camera_speed_blocks_per_sec
+            )
+        });
 
         let (center_chunk_x, center_chunk_y, center_chunk_z) = Self::camera_chunk_coords(camera);
         while upload_loop_iterations < STREAM_STAGE_LOOP_SAFETY_CAP {
@@ -18079,12 +18083,14 @@ impl State {
             let system_name = self.sim_systems[idx].name();
             let started = Instant::now();
             let _scope =
-                perf_trace::scope(format!("sim.fixed_tick.{system_name}")).with_counts(format!(
-                    "tick={} active_cols={} dt_ms={:.3}",
-                    tick_index,
-                    active_cols,
-                    tick_dt * 1000.0
-                ));
+                perf_trace::scope(format!("sim.fixed_tick.{system_name}")).with_counts(|| {
+                    format!(
+                        "tick={} active_cols={} dt_ms={:.3}",
+                        tick_index,
+                        active_cols,
+                        tick_dt * 1000.0
+                    )
+                });
             self.sim_systems[idx].fixed_tick(
                 &mut self.world,
                 tick_dt,
@@ -19160,15 +19166,17 @@ impl State {
             } else {
                 0
             };
-        let ui_mesh_scope = perf_trace::scope("render.build_ui_meshes").with_counts(format!(
-            "gen={} menu={} inv={} debug={} chat={} hotbar_slots={}",
-            generation_overlay.is_some() as u8,
-            menu_overlay.is_some() as u8,
-            inventory_overlay.is_some() as u8,
-            debug_overlay.is_some() as u8,
-            chat_overlay.is_some() as u8,
-            hotbar.len()
-        ));
+        let ui_mesh_scope = perf_trace::scope("render.build_ui_meshes").with_counts(|| {
+            format!(
+                "gen={} menu={} inv={} debug={} chat={} hotbar_slots={}",
+                generation_overlay.is_some() as u8,
+                menu_overlay.is_some() as u8,
+                inventory_overlay.is_some() as u8,
+                debug_overlay.is_some() as u8,
+                chat_overlay.is_some() as u8,
+                hotbar.len()
+            )
+        });
         if let Some(overlay) = generation_overlay {
             let (vertices, indices) = build_generating_screen_mesh(
                 self.config.width,
@@ -19519,13 +19527,14 @@ impl State {
                 rpass.draw_indexed(0..SKY_OBJECT_INDEX_COUNT, 0, 0..1);
 
                 {
-                    let _opaque_scope =
-                        perf_trace::scope("render.draw.opaque").with_counts(format!(
+                    let _opaque_scope = perf_trace::scope("render.draw.opaque").with_counts(|| {
+                        format!(
                             "chunks={} lod_cols={} far_lod={}",
                             visible_chunks.len(),
                             visible_lod_columns.len(),
                             self.far_lod_enabled as u8
-                        ));
+                        )
+                    });
                     if self.far_lod_enabled {
                         // Erst Far-LOD, dann Near-Chunkmeshes.
                         rpass.set_pipeline(&self.render_pipeline_lod);
@@ -19565,7 +19574,7 @@ impl State {
                 }
                 {
                     let _cutout_scope = perf_trace::scope("render.draw.cutout")
-                        .with_counts(format!("chunks={}", visible_chunks.len()));
+                        .with_counts(|| format!("chunks={}", visible_chunks.len()));
                     // Leaves/plants should stay double-sided so canopy layers read naturally
                     // from below even when global backface culling is enabled for solid blocks.
                     rpass.set_pipeline(self.cutout_world_pipeline());
@@ -19588,11 +19597,13 @@ impl State {
                 }
                 {
                     let _transparent_scope = perf_trace::scope("render.draw.transparent")
-                        .with_counts(format!(
-                            "chunks={} boundary_ocean={}",
-                            visible_chunks.len(),
-                            show_boundary_ocean as u8
-                        ));
+                        .with_counts(|| {
+                            format!(
+                                "chunks={} boundary_ocean={}",
+                                visible_chunks.len(),
+                                show_boundary_ocean as u8
+                            )
+                        });
                     rpass.set_pipeline(&self.render_pipeline_transparent);
                     rpass.set_bind_group(0, &self.world_texture_bind_group, &[]);
                     rpass.set_bind_group(1, &self.camera_bind_group, &[]);

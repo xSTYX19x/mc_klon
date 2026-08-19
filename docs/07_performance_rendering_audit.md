@@ -191,7 +191,7 @@ Kritische Stellen:
 
 ### 1.6 Trace-`format!`-Allokationen, die auch ohne Arbeit laufen
 
-**Severity:** medium · **Status:** CONFIRMED
+**Severity:** medium · **Status:** CONFIRMED · **Umsetzung: ✅ behoben**
 
 `src/render/state.rs:17401-17408`:
 
@@ -200,13 +200,17 @@ let _upload_scope = perf_trace::scope("render.upload.meshes").with_counts(format
     "queue={} inflight={} urgent_near={} budget_ms={:.2} speed={:.2}", …));
 ```
 
-Allokiert einen `String` **jeden Frame**, unabhängig davon, ob überhaupt ein Upload stattfindet. Gleiches Muster im Follow-Up-Pump (`src/render/state.rs:12644-12660`). Wird durch Fix 1.1 mit erledigt.
+Allokiert einen `String` **jeden Frame**, unabhängig davon, ob überhaupt ein Upload stattfindet. Gleiches Muster im Follow-Up-Pump (`src/render/state.rs:12644-12660`).
+
+> **Korrektur.** Hier stand zunächst „wird durch Fix 1.1 mit erledigt". Das war falsch: `format!` ist ein eager ausgewertetes Argument, der String entsteht also unabhängig vom Trace-Level. Das Gaten der Runtime hilft an dieser Stelle nicht.
+
+**Fix:** `TraceScope::with_counts` nimmt jetzt `impl FnOnce() -> String` statt `impl Into<String>` und ruft die Closure nur, wenn die Runtime aktiv ist. Alle 11 Aufrufstellen auf `|| format!(…)` umgestellt.
 
 ---
 
 ### 1.7 Budgets werden geprüft, aber ein einzelnes Item kann sie sprengen
 
-**Severity:** medium · **Status:** CONFIRMED
+**Severity:** medium · **Status:** CONFIRMED · **Umsetzung: 🟡 teilweise**
 
 Alle Stage-Loops nutzen das Muster:
 
@@ -218,7 +222,9 @@ if iterations > 0 && elapsed >= budget { break; }
 
 Das garantiert ≥1 Item pro Frame — korrekt so. Es gibt aber **keine Obergrenze für die Kosten eines einzelnen Items**, weshalb `budget_ms=1.25` und `pure_ms=312.9` in denselben Logs koexistieren.
 
-Nach Fix 1.1 und 1.2 sollten die Per-Item-Kosten kollabieren. Falls nicht: Watchdog ergänzen, der (aggregiert) loggt, wenn ein Item das gesamte Stage-Budget überschreitet.
+Nach Fix 1.1 und 1.2 **sind** die Per-Item-Kosten kollabiert (Chunk-Apply 104 → 0.51 ms pro Chunk, gemessen). §D.3 war der verbliebene grobe Fall — ein einzelner unbudgetierter Aufruf nach einer budgetierten Schleife — und ist behoben.
+
+**Was bleibt:** das Muster selbst. Das Budget wird weiterhin *vor* dem Item geprüft, ein einzelnes teures Item kann es also überschreiten (aktuell relevant beim Removal-Lighting, ~8–19 ms pro Batch). Ein aggregierter Watchdog, der meldet wenn ein Item das ganze Stage-Budget sprengt, wäre die nächste Absicherung.
 
 ---
 
@@ -440,7 +446,7 @@ Ein Stapel aus Sections über die volle Höhe, der mit ≈0.011 Helligkeit rende
 
 ### 3.1 Boundary-Ocean-Plane-Aliasing
 
-**Severity:** medium · **Status:** SUSPECTED
+**Severity:** medium · **Status:** SUSPECTED · **Umsetzung: offen** (unbestätigt, braucht visuelle Prüfung)
 
 `src/render/state.rs:2783-2833` baut UVs als `world_x * BOUNDARY_OCEAN_UV_TILE_PER_BLOCK` über einen Ring, der bis zur Weltgrenze reicht. Mit `Nearest`-Filterung und ohne Mipmaps produziert ein unbegrenzter UV-Bereich auf einer bildschirmfüllenden Ebene starkes Moiré.
 
@@ -452,7 +458,7 @@ Liest sich normalerweise als horizontale Bänderung Richtung Horizont, nicht als
 
 ### 3.2 Greedy-AO-Interpolation über gemergte Spans
 
-**Severity:** low · **Status:** CONFIRMED
+**Severity:** low · **Status:** CONFIRMED · **Umsetzung: offen** (bewusst)
 
 AO wird nur an den vier Ecken eines gemergten Quads gesampelt (`src/meshing/greedy.rs:1219-1240`). Occluder im Inneren eines langen gemergten Runs werden ignoriert; AO wird zu einer linearen Rampe über die gesamte Spanne.
 
@@ -466,7 +472,7 @@ Ergebnis: sichtbare Bänderung/Streifen entlang gemergter Runs. Kosmetisch, aber
 
 ### 3.3 Erreichbarer `f32::clamp`-Panic in der Precipitation
 
-**Severity:** low · **Status:** CONFIRMED
+**Severity:** low · **Status:** CONFIRMED · **Umsetzung: ✅ behoben**
 
 `src/render/state.rs:18418-18420`:
 
@@ -491,25 +497,25 @@ Keine Säulen-Ursache, aber ein Crash, der auf die richtige Terrainhöhe wartet.
 
 | Sev | Ort | Problem | Fix |
 |-----|-----|---------|-----|
-| critical | `src/perf/trace.rs:237-268`, `src/main.rs:34` | Bedingungsloses Tracing; globaler Mutex über JSON + Datei-I/O gehalten; 558 MB/Session | Feature-Gate; lazy `FnOnce`-Counts; dedizierter Writer-Thread |
-| critical | `src/render/state.rs:11040` | Kompletter Startup-Set-Rebuild + 2 Collection-Clones + `format!` pro Aufruf, mehrfach pro Frame | Sets inkrementell pflegen |
-| high | `src/render/state.rs:12732` | 512-Iterationen-Main-Thread-Spin, wartet auf Chunkgen-Worker | Aufrufer async-tolerant machen |
-| high | `src/render/state.rs:18898-19242` | `create_buffer_init` an 17 Stellen in `render()` — **11 davon ohne Cache-Gate**, siehe Korrektur in §5.1 | Persistente Grow-on-Demand-Buffer + `write_buffer`; verletzt `.claude/rules/render.md` |
-| high | `src/render/mesh_gpu.rs:196-260` | Pro-Chunk-pro-Layer `wgpu::Buffer` (bis zu 6/Chunk), keine Suballocation; `grown_capacity` = `next_power_of_two` → bis zu 2× VRAM-Verschwendung | Layer aus einer großen persistenten Arena suballozieren; bestehenden Reuse-on-Fit-Pfad behalten |
-| high | `src/render/state.rs:5678` | Mesh-Job-Channel `unbounded` + FIFO-Worker → ferne Chunks verhungern nahe (`inflight(mesh=148)`) | Bounded Channel + umsortierbare Pending-Queue |
-| medium | `src/console.rs:9-13`; `src/world/mod.rs:2425-2454`; `src/render/state.rs:17604` | `eprintln!` (ungepuffert, globaler Lock) pro Mesh-Pump und ×6 pro Lighting-Job, aus Worker-Threads | Level-gegateter, gepufferter Logger |
+| critical | `src/perf/trace.rs:237-268`, `src/main.rs:34` | Bedingungsloses Tracing; globaler Mutex über JSON + Datei-I/O gehalten; 558 MB/Session | ✅ behoben (§1.1) |
+| critical | `src/render/state.rs:11040` | Kompletter Startup-Set-Rebuild + 2 Collection-Clones + `format!` pro Aufruf, mehrfach pro Frame | ✅ behoben (§1.2) |
+| high | `src/render/state.rs:12732` | 512-Iterationen-Main-Thread-Spin, wartet auf Chunkgen-Worker | ✅ behoben (§1.3) — Severity nachträglich auf *low* korrigiert |
+| high | `src/render/state.rs:18898-19242` | `create_buffer_init` an 17 Stellen in `render()` — **11 davon ohne Cache-Gate**, siehe Korrektur in §5.1 | ✅ behoben (§5) für die 11 ungecachten Stellen |
+| high | `src/render/mesh_gpu.rs:196-260` | Pro-Chunk-pro-Layer `wgpu::Buffer` (bis zu 6/Chunk), keine Suballocation; `grown_capacity` = `next_power_of_two` → bis zu 2× VRAM-Verschwendung | **offen** (bewusst) — Arena-Umbau, braucht Messung |
+| high | `src/render/state.rs:5678` | Mesh-Job-Channel `unbounded` + FIFO-Worker → ferne Chunks verhungern nahe (`inflight(mesh=148)`) | **offen** (bewusst) — Starvation-Risiko, braucht Messung |
+| medium | `src/console.rs:9-13`; `src/world/mod.rs:2425-2454`; `src/render/state.rs:17604` | `eprintln!` (ungepuffert, globaler Lock) pro Mesh-Pump und ×6 pro Lighting-Job, aus Worker-Threads | ✅ behoben (§1.5) |
 | ~~medium~~ → **kein Befund** | `src/meshing/pool.rs:63-70` | `take_mesh_data` allokiert zwar ≈410 KB pro Aufruf, wird aber **nur in Tests** aufgerufen (`pool.rs`, `pool_regression_test.rs`) — kein Produktionspfad | keine Maßnahme; Einstufung war falsch |
 | medium | `src/meshing/pool.rs:152-158` | `reserve_if_hint` ruft `Vec::reserve` (additiv) mit monoton wachsenden Hints aus `update_hint` → Kapazität ratcht auf den größten je gemeshten Chunk hoch | ✅ behoben: `reserve_exact` nur auf den Fehlbetrag, Hint klingt jetzt ab |
 | medium | `src/render/state.rs:18874` | `transparent_chunks = visible_chunks.clone()` + zweiter Full-Sort, jeden Frame | ✅ behoben: `visible_chunks.iter().rev()`, Clone und Sort entfallen |
 | medium | `src/render/state.rs:18898-18906` | Partikel-Vertex-/Index-Buffer jeden Frame neu gebaut | ✅ behoben mit §5 (`frame_mesh_slots`) |
-| medium | `Cargo.toml` | Feature `allocation_tracking` wird in `src/meshing/liquids.rs:10` und `:653` benutzt, ist aber **nirgends deklariert** → `cargo build --features allocation_tracking` schlägt fehl; der Tracker ist unerreichbar | `[features]\nallocation_tracking = []` ergänzen |
+| medium | `Cargo.toml` | Feature `allocation_tracking` wird in `src/meshing/liquids.rs:10` und `:653` benutzt, ist aber **nirgends deklariert** → `cargo build --features allocation_tracking` schlägt fehl; der Tracker ist unerreichbar | ✅ behoben — Feature deklariert und Modul dahinter gegatet |
 | medium | `src/render/state.rs:18418` | Erreichbarer `f32::clamp`-Panic (min > max) in der Precipitation | ✅ behoben: `.max().min()` |
 | low | `src/meshing/neighborhood.rs:60-64` | `resize()` gefolgt von `fill()` — drei redundante Full-Fills à 5832 Elemente pro Mesh-Job | ✅ behoben: `clear()` + `resize()`, ein Durchlauf statt zwei |
 | low | `src/meshing/neighborhood.rs:176-182` | Toter Zweig: `if world_y > WORLD_MAX_Y { 0xF0 } else { 0xF0 }` | ✅ behoben: zusammengefasst, `0xF0` als benannte Konstante `FULL_SKYLIGHT_PACKED`; `< 0` → `0` ist beabsichtigt (Weltboden) |
 | low | `src/render/mesh_gpu.rs:216` | `format!("{label_prefix} Vertex Buffer")` allokiert einen `String` pro Buffer-Erzeugung | ✅ behoben: Label nur noch unter `debug_assertions`, sonst `None` |
 | ~~low~~ → **teilweise falsch** | `src/render/state.rs:10496-10510` | `count_urgent_near_mesh_uploads` scannt die Upload-Queue einmal pro Pump — **nicht** zweimal: die beiden Aufrufstellen sind Alternativzweige derselben `if let`. Bei Queue-Längen von 13–62 unkritisch | zurückgestellt |
-| medium | `src/render/state.rs:16157-16177` | **`pump_removed_lighting_batches` bricht unbedingt nach dem ersten Batch ab** — siehe §D.1 | Entscheiden: `if let` (Verhalten festschreiben) oder `break` entfernen (Budget wirken lassen) |
-| medium | Build/CI | **`cargo clippy --all-targets -- -D warnings` schlägt fehl** — siehe §D.2 | Lint aus §D.1 auflösen, dann Warning-Schulden abtragen |
+| medium | `src/render/state.rs:16157-16177` | **`pump_removed_lighting_batches` bricht unbedingt nach dem ersten Batch ab** — siehe §D.1 | ✅ behoben (§D.1) — `break` entfernt, wurde durch §D.3 zur Voraussetzung |
+| medium | Build/CI | **`cargo clippy --all-targets -- -D warnings` schlägt fehl** — siehe §D.2 | 🟡 teilweise — Clippy-Errors 3→0; ~102 Dead-Code-Warnungen offen |
 | — | gesamtes Crate | **Null `unsafe`-Blöcke.** `unwrap`/`expect`-Dichte niedrig und auf Init-/Test-Pfade konzentriert (state.rs: 5, greedy.rs: 12, world/mod.rs: 19, region_file.rs: 14, chunkgen_worker.rs: 13) | keine Maßnahme |
 
 ### 5.1 — Korrektur: „17 `create_buffer_init` pro Frame"
@@ -685,6 +691,12 @@ Der Report oben ist die Analyse auf `8f7634d`. Diese Tabelle hält nach, was dav
 | §D.2 | Lint-Befehl aus `CLAUDE.md` schlägt fehl | 🟡 Clippy-Errors weg, Warning-Schulden offen | working tree |
 | §D.3 | Chunk-Entladung repariert Lighting synchron (188 ms) | ✅ behoben | working tree |
 | §D.4 | `tops`-Kategorienliste ohne Unload-Bucket | ✅ behoben | working tree |
+| §1.6 | Trace-`format!` läuft auch ohne Arbeit | ✅ behoben | working tree |
+| §1.7 | Einzelnes Item kann das Stage-Budget sprengen | 🟡 grober Fall (§D.3) weg, Muster bleibt | working tree |
+| §3.3 | `f32::clamp`-Panic in der Precipitation | ✅ behoben | working tree |
+| §3.1 | Boundary-Ocean-Aliasing | offen — SUSPECTED, nie bestätigt | |
+| §3.2 | Greedy-AO über gemergte Spans | offen (bewusst) | |
+| §D.2 (Rest) | ~102 Dead-Code-Warnungen | offen (bewusst) | |
 
 ### Was konkret geändert wurde
 

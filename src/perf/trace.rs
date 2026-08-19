@@ -249,8 +249,15 @@ pub(crate) struct TraceScope {
 }
 
 impl TraceScope {
-    pub(crate) fn with_counts(mut self, counts: impl Into<String>) -> Self {
-        self.counts = Some(counts.into());
+    /// Builds the counts string only if the event will actually be recorded.
+    ///
+    /// The eager `with_counts(format!(…))` form evaluated its argument before the
+    /// call, so several per-frame scopes allocated a `String` on every frame even
+    /// with tracing off — gating the runtime alone does not help there.
+    pub(crate) fn with_counts(mut self, counts: impl FnOnce() -> String) -> Self {
+        if TRACE_RUNTIME.get().is_some() {
+            self.counts = Some(counts());
+        }
         self
     }
 }

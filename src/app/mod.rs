@@ -2373,7 +2373,7 @@ impl ApplicationHandler for App {
             // Redraw -> Update (dt, camera), Uniform schreiben, Render
             WindowEvent::RedrawRequested => {
                 let _frame_trace = perf_trace::scope("app.frame");
-                let _frame_total_trace = perf_trace::scope("frame.total").with_counts(format!(
+                let _frame_total_trace = perf_trace::scope("frame.total").with_counts(|| format!(
                     "in_game={} paused={} inv={} chat_open={} mouse_captured={}",
                     self.is_in_game() as u8,
                     self.is_paused() as u8,
@@ -2453,7 +2453,7 @@ impl ApplicationHandler for App {
                     self.clear_action_state();
                 }
 
-                let frame_input_trace = perf_trace::scope("frame.input").with_counts(format!(
+                let frame_input_trace = perf_trace::scope("frame.input").with_counts(|| format!(
                     "chat_open={} debug={} wheel_accum={:.2}",
                     self.chat_open as u8, self.show_debug_overlay as u8, self.mouse_wheel_accum_y
                 ));
@@ -2508,7 +2508,7 @@ impl ApplicationHandler for App {
                 let inventory_open_for_render = self.is_inventory_open();
                 if let Some(state) = self.state.as_mut() {
                     let _update_trace = perf_trace::scope("app.update");
-                    let frame_sim_trace = perf_trace::scope("frame.sim").with_counts(format!(
+                    let frame_sim_trace = perf_trace::scope("frame.sim").with_counts(|| format!(
                         "gameplay_active={} world_active={} move_mode={:?} in_game={}",
                         gameplay_active as u8,
                         world_processing_active as u8,
@@ -2863,7 +2863,7 @@ impl ApplicationHandler for App {
                     drop(frame_sim_trace);
                     let render_result = {
                         let _render_submit_trace = perf_trace::scope("frame.render.submit")
-                            .with_counts(format!(
+                            .with_counts(|| format!(
                                 "debug={} chat_open={} inv={} menu={}",
                                 self.show_debug_overlay as u8,
                                 self.chat_open as u8,
