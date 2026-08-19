@@ -61,7 +61,7 @@ When an item ships, delete it from here instead of marking it done.
 ## UI / UX
 
 - keep expanding the options UI without reintroducing scattered hard-coded runtime settings
-- add reset/default flows and validation feedback to options UX
+- [x] add reset/default flows and validation feedback to options UX *(umgesetzt, wartet auf Verifikation)*
 - move remaining legacy block-selection/icon paths onto the 3D preview renderer
 - add a real in-game ticking-area editor (radius/flags UI) instead of the `Ctrl+T`/`Ctrl+Shift+T` shortcut-only workflow
 - options "back" button always jumps to the main/pause menu instead of one level up: `MenuOrigin` (`src/app/mod.rs:125`) is only a two-way `MainMenu`/`PauseMenu` tag, and `close_options_menu` (`app/mod.rs:793`) always exits straight to that origin; sub-screen back already special-cases `OptionsScreen::Root` (`app/mod.rs:1187`) but nothing generalizes it — replace `MenuOrigin` with a real `Vec<Screen>` navigation stack (push on every "enter screen", pop on back) shared by options and any future nested menus

@@ -17,7 +17,7 @@ pub(crate) struct AppSettings {
     pub(crate) controls: InputBindings,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct GameplaySettings {
     pub(crate) view_bobbing: bool,
@@ -29,7 +29,7 @@ impl Default for GameplaySettings {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct GraphicsSettings {
     pub(crate) render_distance: RenderDistance,
@@ -121,7 +121,7 @@ impl InputAction {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InputBindings {
     keys: [KeyCode; InputAction::ALL.len()],
 }
@@ -249,6 +249,52 @@ impl Default for AppSettings {
             gameplay: file.gameplay,
             graphics: file.graphics,
             controls: file.controls.into_runtime(),
+        }
+    }
+}
+
+/// Groups of settings that can be reset to their `Default` values as a unit.
+/// Keeping the scopes here (instead of in the menu code) means new settings only
+/// have to be added to the matching `Default` impl to take part in reset flows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SettingsScope {
+    Gameplay,
+    Graphics,
+    Controls,
+    All,
+}
+
+impl SettingsScope {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Gameplay => "gameplay settings",
+            Self::Graphics => "graphics settings",
+            Self::Controls => "controls",
+            Self::All => "all settings",
+        }
+    }
+}
+
+impl AppSettings {
+    pub(crate) fn is_default(&self, scope: SettingsScope) -> bool {
+        match scope {
+            SettingsScope::Gameplay => self.gameplay == GameplaySettings::default(),
+            SettingsScope::Graphics => self.graphics == GraphicsSettings::default(),
+            SettingsScope::Controls => self.controls == InputBindings::default(),
+            SettingsScope::All => {
+                self.is_default(SettingsScope::Gameplay)
+                    && self.is_default(SettingsScope::Graphics)
+                    && self.is_default(SettingsScope::Controls)
+            }
+        }
+    }
+
+    pub(crate) fn reset(&mut self, scope: SettingsScope) {
+        match scope {
+            SettingsScope::Gameplay => self.gameplay = GameplaySettings::default(),
+            SettingsScope::Graphics => self.graphics = GraphicsSettings::default(),
+            SettingsScope::Controls => self.controls = InputBindings::default(),
+            SettingsScope::All => *self = Self::default(),
         }
     }
 }

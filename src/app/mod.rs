@@ -28,7 +28,7 @@ use crate::render::state::{
     MenuOverlay, SavedWorldSummary, WorldGenParams, WorldGenRequest, WorldLoadStageStats,
     pause_menu_item_at_pos_px,
 };
-use crate::settings::{AppSettings, InputAction, keycode_label};
+use crate::settings::{AppSettings, InputAction, SettingsScope, keycode_label};
 use crate::world::{FluidKind, World, WorldEnvironment};
 use crate::worldgen::ClassicLevelSize;
 
@@ -58,8 +58,7 @@ const PAUSE_MENU_ITEMS: [&str; 6] = [
     "Options",
     "Exit to main menu",
 ];
-const OPTIONS_ROOT_ITEMS: [&str; 4] =
-    ["General / Gameplay", "Video / Graphics", "Controls", "Back"];
+const OPTIONS_ROOT_ITEMS: [&str; 3] = ["General / Gameplay", "Video / Graphics", "Controls"];
 
 struct ChatLine {
     text: String,
@@ -82,6 +81,14 @@ struct PendingChatTextDedup {
 struct SavedWorldMenuEntry {
     summary: SavedWorldSummary,
     label: String,
+}
+
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 struct MenuScreenContent {
@@ -127,7 +134,7 @@ enum MenuOrigin {
     PauseMenu,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum OptionsScreen {
     Root,
     Gameplay,
@@ -135,12 +142,45 @@ enum OptionsScreen {
     Controls,
 }
 
+impl OptionsScreen {
+    /// Rows that carry an actual value/sub-screen; every options screen appends a
+    /// "reset to defaults" row and a "Back" row after those.
+    const fn value_row_count(self) -> usize {
+        match self {
+            Self::Root => OPTIONS_ROOT_ITEMS.len(),
+            Self::Gameplay => 1,
+            Self::Graphics => 3,
+            Self::Controls => InputAction::ALL.len(),
+        }
+    }
+
+    const fn reset_scope(self) -> SettingsScope {
+        match self {
+            Self::Root => SettingsScope::All,
+            Self::Gameplay => SettingsScope::Gameplay,
+            Self::Graphics => SettingsScope::Graphics,
+            Self::Controls => SettingsScope::Controls,
+        }
+    }
+
+    const fn reset_row(self) -> usize {
+        self.value_row_count()
+    }
+
+    const fn item_count(self) -> usize {
+        self.value_row_count() + 2
+    }
+}
+
+#[derive(Clone)]
 struct OptionsMenuState {
     origin: MenuOrigin,
     screen: OptionsScreen,
     selected: usize,
     awaiting_rebind: Option<InputAction>,
     status_line: Option<String>,
+    /// Armed by the first activation of a reset row; the second activation performs it.
+    pending_reset: Option<SettingsScope>,
 }
 
 pub(crate) struct App {
@@ -629,9 +669,15 @@ impl App {
         self.controller.clear_inputs();
     }
 
-    fn persist_settings(&self) {
-        if let Err(err) = self.settings.save() {
-            crate::console_error!("failed to save settings: {err}");
+    /// Persists settings; returns a user-facing error line when the write failed
+    /// so menu screens can surface it instead of only logging to the console.
+    fn persist_settings(&self) -> Option<String> {
+        match self.settings.save() {
+            Ok(()) => None,
+            Err(err) => {
+                crate::console_error!("failed to save settings: {err}");
+                Some(format!("Could not save settings: {err}"))
+            }
         }
     }
 
@@ -783,6 +829,7 @@ impl App {
             selected: 0,
             awaiting_rebind: None,
             status_line: None,
+            pending_reset: None,
         });
         self.clear_action_state();
         if let Some(window) = self.window.as_ref() {
@@ -837,12 +884,7 @@ impl App {
             GameState::MainMenu { .. } => MAIN_MENU_ITEMS.len(),
             GameState::Paused { .. } => PAUSE_MENU_ITEMS.len(),
             GameState::LoadLevelMenu { worlds, .. } => worlds.len().max(1) + 1,
-            GameState::Options(options) => match options.screen {
-                OptionsScreen::Root => OPTIONS_ROOT_ITEMS.len(),
-                OptionsScreen::Gameplay => 2,
-                OptionsScreen::Graphics => 4,
-                OptionsScreen::Controls => InputAction::ALL.len() + 1,
-            },
+            GameState::Options(options) => options.screen.item_count(),
             _ => 0,
         }
     }
@@ -864,8 +906,19 @@ impl App {
             GameState::LoadLevelMenu {
                 selected: current, ..
             } => *current = selected,
-            GameState::Options(options) => options.selected = selected,
+            GameState::Options(options) => {
+                if options.selected != selected {
+                    options.pending_reset = None;
+                }
+                options.selected = selected;
+            }
             _ => {}
+        }
+    }
+
+    fn clear_pending_reset(&mut self) {
+        if let GameState::Options(options) = &mut self.game_state {
+            options.pending_reset = None;
         }
     }
 
@@ -879,6 +932,7 @@ impl App {
             let next = (current as i32 + delta).rem_euclid(count as i32) as usize;
             self.set_selected_menu_index(next);
         }
+        self.clear_pending_reset();
     }
 
     fn enter_world_loading_screen(&mut self, title: &str, phase: &str) {
@@ -1005,8 +1059,11 @@ impl App {
                 self.reset_view_bobbing();
             }
             if matches!(self.game_state, GameState::Options(_)) {
-                self.persist_settings();
+                let save_error = self.persist_settings();
                 self.apply_settings_to_state();
+                if let Some(error) = save_error {
+                    self.set_options_status(None, error);
+                }
             }
         }
         changed
@@ -1094,13 +1151,7 @@ impl App {
 
     fn activate_options_selected(&mut self) {
         let mut options = match self.game_state {
-            GameState::Options(ref mut options) => Some(OptionsMenuState {
-                origin: options.origin,
-                screen: options.screen,
-                selected: options.selected,
-                awaiting_rebind: options.awaiting_rebind,
-                status_line: options.status_line.clone(),
-            }),
+            GameState::Options(ref options) => Some(options.clone()),
             _ => None,
         };
         let Some(mut options) = options.take() else {
@@ -1111,45 +1162,36 @@ impl App {
             return;
         }
 
-        match options.screen {
+        let screen = options.screen;
+        if options.selected == screen.reset_row() {
+            self.activate_options_reset_row(screen);
+            return;
+        }
+        if options.selected > screen.reset_row() {
+            self.close_options_menu(options);
+            return;
+        }
+
+        match screen {
             OptionsScreen::Root => match options.selected {
                 0 => options.screen = OptionsScreen::Gameplay,
                 1 => options.screen = OptionsScreen::Graphics,
-                2 => options.screen = OptionsScreen::Controls,
-                _ => {
-                    self.close_options_menu(options);
-                    return;
-                }
+                _ => options.screen = OptionsScreen::Controls,
             },
-            OptionsScreen::Gameplay => {
-                if options.selected == 0 {
-                    self.apply_selected_option_step(1);
-                    return;
-                }
-                self.close_options_menu(options);
-                return;
-            }
-            OptionsScreen::Graphics => {
-                if options.selected <= 2 {
-                    self.apply_selected_option_step(1);
-                    return;
-                }
-                self.close_options_menu(options);
+            OptionsScreen::Gameplay | OptionsScreen::Graphics => {
+                self.apply_selected_option_step(1);
                 return;
             }
             OptionsScreen::Controls => {
-                if options.selected < InputAction::ALL.len() {
-                    let action = InputAction::ALL[options.selected];
-                    if let GameState::Options(state) = &mut self.game_state {
-                        state.awaiting_rebind = Some(action);
-                        state.status_line = Some(format!(
-                            "Press a key for {}. Escape cancels.",
-                            action.label()
-                        ));
-                    }
-                    return;
+                let action = InputAction::ALL[options.selected];
+                if let GameState::Options(state) = &mut self.game_state {
+                    state.awaiting_rebind = Some(action);
+                    state.pending_reset = None;
+                    state.status_line = Some(format!(
+                        "Press a key for {}. Escape cancels.",
+                        action.label()
+                    ));
                 }
-                self.close_options_menu(options);
                 return;
             }
         }
@@ -1157,18 +1199,59 @@ impl App {
         options.selected = 0;
         options.awaiting_rebind = None;
         options.status_line = None;
+        options.pending_reset = None;
         self.game_state = GameState::Options(options);
+    }
+
+    /// Two-step reset: the first activation arms a confirmation, the second one
+    /// applies `AppSettings::reset` for that screen's scope and persists it.
+    fn activate_options_reset_row(&mut self, screen: OptionsScreen) {
+        let scope = screen.reset_scope();
+        let armed = matches!(
+            &self.game_state,
+            GameState::Options(options) if options.pending_reset == Some(scope)
+        );
+
+        if self.settings.is_default(scope) {
+            self.set_options_status(
+                None,
+                format!("{} already at defaults.", capitalize(scope.label())),
+            );
+            return;
+        }
+
+        if !armed {
+            self.set_options_status(
+                Some(scope),
+                format!(
+                    "Reset {} to defaults? Activate again to confirm.",
+                    scope.label()
+                ),
+            );
+            return;
+        }
+
+        self.settings.reset(scope);
+        if !self.settings.gameplay.view_bobbing {
+            self.reset_view_bobbing();
+        }
+        let save_error = self.persist_settings();
+        self.apply_settings_to_state();
+        let status = save_error
+            .unwrap_or_else(|| format!("{} reset to defaults.", capitalize(scope.label())));
+        self.set_options_status(None, status);
+    }
+
+    fn set_options_status(&mut self, pending_reset: Option<SettingsScope>, status: String) {
+        if let GameState::Options(options) = &mut self.game_state {
+            options.pending_reset = pending_reset;
+            options.status_line = Some(status);
+        }
     }
 
     fn handle_options_back(&mut self) -> bool {
         let mut options = match &self.game_state {
-            GameState::Options(options) => Some(OptionsMenuState {
-                origin: options.origin,
-                screen: options.screen,
-                selected: options.selected,
-                awaiting_rebind: options.awaiting_rebind,
-                status_line: options.status_line.clone(),
-            }),
+            GameState::Options(options) => Some(options.clone()),
             _ => None,
         };
         let Some(mut options) = options.take() else {
@@ -1180,6 +1263,11 @@ impl App {
                 state.awaiting_rebind = None;
                 state.status_line = Some("Rebind cancelled.".to_string());
             }
+            return true;
+        }
+
+        if options.pending_reset.take().is_some() {
+            self.set_options_status(None, "Reset cancelled.".to_string());
             return true;
         }
 
@@ -1205,8 +1293,10 @@ impl App {
         };
 
         let conflict = self.settings.controls.set_key_swapping(action, code);
-        self.persist_settings();
-        let status = if let Some(other) = conflict {
+        let save_error = self.persist_settings();
+        let status = if let Some(error) = save_error {
+            error
+        } else if let Some(other) = conflict {
             format!(
                 "{} bound to {}. Swapped with {}.",
                 action.label(),
@@ -1364,27 +1454,24 @@ impl App {
                 show_panorama: false,
             }),
             GameState::Options(options) => {
-                let (title, items) = match options.screen {
+                let (title, mut items) = match options.screen {
                     OptionsScreen::Root => (
                         "Options".to_string(),
                         OPTIONS_ROOT_ITEMS
                             .iter()
                             .map(|item| (*item).to_string())
-                            .collect(),
+                            .collect::<Vec<_>>(),
                     ),
                     OptionsScreen::Gameplay => (
                         "General / Gameplay".to_string(),
-                        vec![
-                            format!(
-                                "View bobbing: {}",
-                                if self.settings.gameplay.view_bobbing {
-                                    "On"
-                                } else {
-                                    "Off"
-                                }
-                            ),
-                            "Back".to_string(),
-                        ],
+                        vec![format!(
+                            "View bobbing: {}",
+                            if self.settings.gameplay.view_bobbing {
+                                "On"
+                            } else {
+                                "Off"
+                            }
+                        )],
                     ),
                     OptionsScreen::Graphics => (
                         "Video / Graphics".to_string(),
@@ -1413,11 +1500,10 @@ impl App {
                                     "Off"
                                 }
                             ),
-                            "Back".to_string(),
                         ],
                     ),
                     OptionsScreen::Controls => {
-                        let mut items = Vec::with_capacity(InputAction::ALL.len() + 1);
+                        let mut items = Vec::with_capacity(InputAction::ALL.len());
                         for action in InputAction::ALL {
                             items.push(format!(
                                 "{}: {}",
@@ -1425,22 +1511,38 @@ impl App {
                                 keycode_label(self.settings.controls.key_for(action))
                             ));
                         }
-                        items.push("Back".to_string());
                         ("Controls".to_string(), items)
                     }
                 };
+
+                let scope = options.screen.reset_scope();
+                let at_defaults = self.settings.is_default(scope);
+                let armed = options.pending_reset == Some(scope);
+                items.push(if armed {
+                    format!("Reset {} to defaults - confirm?", scope.label())
+                } else {
+                    format!("Reset {} to defaults", scope.label())
+                });
+                items.push("Back".to_string());
+                let mut enabled = vec![true; items.len()];
+                enabled[options.screen.reset_row()] = !at_defaults;
+
                 let footer = if let Some(action) = options.awaiting_rebind {
                     Some(format!(
                         "Press a key for {}. Escape cancels.",
                         action.label()
                     ))
+                } else if let Some(status) = options.status_line.clone() {
+                    Some(status)
+                } else if at_defaults {
+                    Some(format!("{} at defaults.", capitalize(scope.label())))
                 } else {
-                    options.status_line.clone()
+                    None
                 };
                 Some(MenuScreenContent {
                     title,
                     selected: options.selected,
-                    enabled: vec![true; items.len()],
+                    enabled,
                     items,
                     footer,
                     show_panorama: matches!(options.origin, MenuOrigin::MainMenu),
@@ -2120,7 +2222,7 @@ impl ApplicationHandler for App {
                                 self.settings.graphics.render_distance =
                                     all[(index + 1) % all.len()];
                             }
-                            self.persist_settings();
+                            let _ = self.persist_settings();
                             self.apply_settings_to_state();
                             crate::console_info!(
                                 "Render distance: {} ({} chunks)",
@@ -2373,14 +2475,16 @@ impl ApplicationHandler for App {
             // Redraw -> Update (dt, camera), Uniform schreiben, Render
             WindowEvent::RedrawRequested => {
                 let _frame_trace = perf_trace::scope("app.frame");
-                let _frame_total_trace = perf_trace::scope("frame.total").with_counts(|| format!(
-                    "in_game={} paused={} inv={} chat_open={} mouse_captured={}",
-                    self.is_in_game() as u8,
-                    self.is_paused() as u8,
-                    self.is_inventory_open() as u8,
-                    self.chat_open as u8,
-                    self.controller.mouse_captured as u8
-                ));
+                let _frame_total_trace = perf_trace::scope("frame.total").with_counts(|| {
+                    format!(
+                        "in_game={} paused={} inv={} chat_open={} mouse_captured={}",
+                        self.is_in_game() as u8,
+                        self.is_paused() as u8,
+                        self.is_inventory_open() as u8,
+                        self.chat_open as u8,
+                        self.controller.mouse_captured as u8
+                    )
+                });
                 // dt in Sekunden (Zeit seit letztem Frame)
                 let now = Instant::now();
                 let dt = self
@@ -2453,10 +2557,14 @@ impl ApplicationHandler for App {
                     self.clear_action_state();
                 }
 
-                let frame_input_trace = perf_trace::scope("frame.input").with_counts(|| format!(
-                    "chat_open={} debug={} wheel_accum={:.2}",
-                    self.chat_open as u8, self.show_debug_overlay as u8, self.mouse_wheel_accum_y
-                ));
+                let frame_input_trace = perf_trace::scope("frame.input").with_counts(|| {
+                    format!(
+                        "chat_open={} debug={} wheel_accum={:.2}",
+                        self.chat_open as u8,
+                        self.show_debug_overlay as u8,
+                        self.mouse_wheel_accum_y
+                    )
+                });
                 let in_game = self.is_in_game();
                 let gameplay_active = in_game && !self.chat_open;
                 let world_processing_active = self
@@ -2508,13 +2616,15 @@ impl ApplicationHandler for App {
                 let inventory_open_for_render = self.is_inventory_open();
                 if let Some(state) = self.state.as_mut() {
                     let _update_trace = perf_trace::scope("app.update");
-                    let frame_sim_trace = perf_trace::scope("frame.sim").with_counts(|| format!(
-                        "gameplay_active={} world_active={} move_mode={:?} in_game={}",
-                        gameplay_active as u8,
-                        world_processing_active as u8,
-                        self.player.mode,
-                        in_game as u8
-                    ));
+                    let frame_sim_trace = perf_trace::scope("frame.sim").with_counts(|| {
+                        format!(
+                            "gameplay_active={} world_active={} move_mode={:?} in_game={}",
+                            gameplay_active as u8,
+                            world_processing_active as u8,
+                            self.player.mode,
+                            in_game as u8
+                        )
+                    });
                     if world_processing_active {
                         state.begin_frame_profiling(dt * 1000.0);
                         state.world_time.advance(dt);
@@ -2863,13 +2973,15 @@ impl ApplicationHandler for App {
                     drop(frame_sim_trace);
                     let render_result = {
                         let _render_submit_trace = perf_trace::scope("frame.render.submit")
-                            .with_counts(|| format!(
-                                "debug={} chat_open={} inv={} menu={}",
-                                self.show_debug_overlay as u8,
-                                self.chat_open as u8,
-                                inventory_open_for_render as u8,
-                                menu_open_for_render as u8
-                            ));
+                            .with_counts(|| {
+                                format!(
+                                    "debug={} chat_open={} inv={} menu={}",
+                                    self.show_debug_overlay as u8,
+                                    self.chat_open as u8,
+                                    inventory_open_for_render as u8,
+                                    menu_open_for_render as u8
+                                )
+                            });
                         let _render_trace = perf_trace::scope("app.render");
                         let _perf_scope = self.perf.scope(PerfCat::Render);
                         state.render(
