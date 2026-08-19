@@ -2422,35 +2422,21 @@ pub(crate) fn rebuild_lighting_for_snapshot(snapshot: &mut SnapshotWorldLighting
     let block_propagation_ms = block_propagation_started.elapsed().as_secs_f64() * 1000.0;
     let total_ms = rebuild_started.elapsed().as_secs_f64() * 1000.0;
 
-    crate::console_error!(
-        "[perf][lighting][world] loaded_chunks={} xz_columns={} total_ms={:.2}",
-        loaded_chunk_count,
-        xz_column_count,
-        total_ms
-    );
-    crate::console_error!(
-        "[perf][lighting][world] phase=clear_light ms={:.2} sky_q_peak=0 block_q_peak=0",
-        clear_light_ms
-    );
-    crate::console_error!(
-        "[perf][lighting][world] phase=skylight_seed ms={:.2} sky_q_peak={} block_q_peak=0",
-        skylight_seed_ms,
-        skylight_seed_sky_queue_peak
-    );
-    crate::console_error!(
-        "[perf][lighting][world] phase=block_seed ms={:.2} sky_q_peak=0 block_q_peak={}",
-        block_seed_ms,
-        block_seed_queue_peak
-    );
-    crate::console_error!(
-        "[perf][lighting][world] phase=sky_propagation ms={:.2} sky_q_peak={} block_q_peak=0",
-        sky_propagation_ms,
-        sky_propagation_queue_peak
-    );
-    crate::console_error!(
-        "[perf][lighting][world] phase=block_propagation ms={:.2} sky_q_peak=0 block_q_peak={}",
-        block_propagation_ms,
-        block_propagation_queue_peak
+    // This runs on a lighting worker thread. It used to emit six `eprintln!`,
+    // each taking the process-wide stderr lock and issuing its own `write(2)` —
+    // contending with the main thread for every bulk rebuild. The same numbers now
+    // go to the trace ring as one event, which costs nothing when tracing is off.
+    crate::perf::trace::record_duration_ms(
+        "lighting.world_rebuild",
+        total_ms as f32,
+        &format!(
+            "loaded_chunks={loaded_chunk_count} xz_columns={xz_column_count} \
+             clear_ms={clear_light_ms:.2} \
+             skylight_seed_ms={skylight_seed_ms:.2} skylight_seed_q_peak={skylight_seed_sky_queue_peak} \
+             block_seed_ms={block_seed_ms:.2} block_seed_q_peak={block_seed_queue_peak} \
+             sky_prop_ms={sky_propagation_ms:.2} sky_prop_q_peak={sky_propagation_queue_peak} \
+             block_prop_ms={block_propagation_ms:.2} block_prop_q_peak={block_propagation_queue_peak}"
+        ),
     );
 }
 

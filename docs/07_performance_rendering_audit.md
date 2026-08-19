@@ -1,7 +1,12 @@
 # 07 — Performance & Rendering-Correctness Audit
 
-**Datum:** 2026-08-19 · **Basis:** Commit `8f7634d` (branch `main`, clean) · **Modus:** read-only
-**Verifikation:** `cargo check` → exit 0. Keine Datei außerhalb von `docs/` verändert.
+**Datum:** 2026-08-19 · **Basis der Analyse:** Commit `8f7634d` (branch `main`, clean)
+**Verifikation der Analyse:** `cargo check` → exit 0.
+
+> **Umsetzungsstand.** Der Report wurde read-only erstellt; Fixes kamen danach. Erledigt sind §1.1,
+> §1.2 (Commit `188fdb8`) sowie §2.1, §2.3, §2.4 und die Durchsatz-Anpassung aus §2.2.
+> Details in [Umsetzungsstand](#umsetzungsstand). Die Messwerte im Report stammen durchweg aus
+> Läufen **vor** diesen Fixes und sind entsprechend zu lesen.
 
 Untersuchte Symptome (Priorität wie gemeldet):
 
@@ -23,21 +28,22 @@ Jeder Befund ist markiert als **CONFIRMED** (Code- **und** Log-Evidenz) oder **S
 4. [Symptom 3 — Schwarze vertikale Säulen](#4-symptom-3--schwarze-vertikale-säulen)
 5. [Allgemeine Schwachstellen](#5-allgemeine-schwachstellen)
 6. [Nächste Messungen](#6-nächste-messungen)
-7. [Anhang A — Rohdaten aus den Stall-Reports](#anhang-a--rohdaten-aus-den-stall-reports)
-8. [Anhang B — Was explizit geprüft und ausgeschlossen wurde](#anhang-b--was-explizit-geprüft-und-ausgeschlossen-wurde)
-9. [Anhang C — Relevante Konstanten](#anhang-c--relevante-konstanten)
+7. [Umsetzungsstand](#umsetzungsstand)
+8. [Anhang A — Rohdaten aus den Stall-Reports](#anhang-a--rohdaten-aus-den-stall-reports)
+9. [Anhang B — Was explizit geprüft und ausgeschlossen wurde](#anhang-b--was-explizit-geprüft-und-ausgeschlossen-wurde)
+10. [Anhang C — Relevante Konstanten](#anhang-c--relevante-konstanten)
 
 ---
 
 ## 1. TOP SUSPECTS
 
-| # | Befund | Severity | Symptom | Status |
-|---|--------|----------|---------|--------|
-| 1 | Immer aktives Chrome-Tracing: JSON-Serialisierung + Datei-I/O unter **einem globalen Mutex**, geteilt von Main-Thread und allen Workern | critical | 1 | CONFIRMED |
-| 2 | `refresh_worldgen_warmup_tracking()` baut das komplette Startup-Section-Set pro Drain neu → O(n²) über den Startup | critical | 1 | CONFIRMED |
-| 3 | Provisorisches Licht unterhalb Y=64 ist **komplett 0**, und der Lighting-Backlog wird nie abgebaut (190–218 Jobs dauerhaft) | critical | 2, 3 | CONFIRMED |
-| 4 | `mesh_should_await_lighting_finalization` parkt den korrigierenden Remesh bis `Finalized` — was Rand-Chunks u. U. nie erreichen | high | 2, 3 | CONFIRMED |
-| 5 | 17 `create_buffer_init`-Aufrufe **pro Frame** in `render()` + `queue.write_buffer` pro Chunk-Layer ohne Suballocation | high | 1 | CONFIRMED |
+| # | Befund | Severity | Symptom | Analyse | Umsetzung |
+|---|--------|----------|---------|---------|-----------|
+| 1 | Immer aktives Chrome-Tracing: JSON-Serialisierung + Datei-I/O unter **einem globalen Mutex**, geteilt von Main-Thread und allen Workern | critical | 1 | CONFIRMED | ✅ §1.1 |
+| 2 | `refresh_worldgen_warmup_tracking()` baut das komplette Startup-Section-Set pro Drain neu → O(n²) über den Startup | critical | 1 | CONFIRMED | ✅ §1.2 |
+| 3 | Provisorisches Licht unterhalb Y=64 ist **komplett 0**, und der Lighting-Backlog wird nie abgebaut (190–218 Jobs dauerhaft) | critical | 2, 3 | CONFIRMED | ✅ §2.1 + §2.2 |
+| 4 | `mesh_should_await_lighting_finalization` parkt den korrigierenden Remesh bis `Finalized` — was Rand-Chunks u. U. nie erreichen | high | 2, 3 | CONFIRMED | ✅ §2.3 + §2.4 |
+| 5 | `create_buffer_init` an 17 Stellen in `render()` (davon 11 ohne Cache-Gate) + `queue.write_buffer` pro Chunk-Layer ohne Suballocation | high | 1 | CONFIRMED (Zahl korrigiert) | ✅ Overlays behoben, Chunk-Suballocation offen |
 
 ### Kernzahlen aus den eigenen Logs
 
@@ -125,13 +131,16 @@ Konkrete Hot Spots:
 
 ### 1.3 Synchroner Spin-Wait auf Chunk-Generierung im Main-Thread
 
-**Severity:** high · **Likelihood Symptom 1:** hoch · **Status:** CONFIRMED
+**Severity:** ~~high~~ → **low** · **Likelihood Symptom 1:** gering · **Status:** CONFIRMED (Severity nachträglich korrigiert)
+
+> **Korrektur (nach Prüfung des Aufrufpfads).** Die ursprüngliche Einstufung als „Kandidat für den
+> 9.7-Sekunden-Frame" war falsch. Der Aufrufpfad ist einmalig, nicht wiederkehrend — siehe unten.
 
 **Evidenz:** `src/render/state.rs:12732-12759` — `ensure_column_loaded_or_generated` läuft bis zu **512 Iterationen**, jede mit Generierungs-Requests, `pump_chunkgen_results()` und `std::thread::yield_now()`. Blockiert den Main-Thread, bis der Worker liefert.
 
-Aufrufer: `src/app/mod.rs:1515`.
+**Aufrufpfad:** `src/app/mod.rs:1515` in `world_spawn_settled_feet_near` ← `src/app/mod.rs:2423`. Das läuft **genau einmal**, beim Übergang `GeneratingWorld` → `InGame`, also während des Ladebildschirms — nicht im Gameplay und nicht beim Streaming. Die Suche deckt bis zu (2·8+1)² = 289 Spalten ab, die aber überwiegend schon vom Startup-Warmup generiert sind; gespinnt wird nur für Spalten außerhalb des Warmup-Radius.
 
-**Mechanismus:** Harter Main-Thread-Stall, nur begrenzt durch Worker-Latenz × 512. Kandidat für den 9.7-Sekunden-Frame.
+**Mechanismus:** Kann den Übergangs-Frame verlängern, erklärt aber **nicht** die gemeldete Lag beim Bewegen. Die 9.7-s-Frames aus `run_1773085075_183` gehen auf §1.1/§1.2 zurück.
 
 **Fix:** Aufrufer soll eine noch nicht fertige Column tolerieren (`Poll::Pending` zurückgeben, nächsten Frame erneut versuchen) statt zu spinnen.
 
@@ -485,7 +494,7 @@ Keine Säulen-Ursache, aber ein Crash, der auf die richtige Terrainhöhe wartet.
 | critical | `src/perf/trace.rs:237-268`, `src/main.rs:34` | Bedingungsloses Tracing; globaler Mutex über JSON + Datei-I/O gehalten; 558 MB/Session | Feature-Gate; lazy `FnOnce`-Counts; dedizierter Writer-Thread |
 | critical | `src/render/state.rs:11040` | Kompletter Startup-Set-Rebuild + 2 Collection-Clones + `format!` pro Aufruf, mehrfach pro Frame | Sets inkrementell pflegen |
 | high | `src/render/state.rs:12732` | 512-Iterationen-Main-Thread-Spin, wartet auf Chunkgen-Worker | Aufrufer async-tolerant machen |
-| high | `src/render/state.rs:18898-19242` | **17** `create_buffer_init`-Aufrufe pro Frame in `render()` (Partikel, Precipitation, Outlines, UI) | Persistente Grow-on-Demand-Buffer + `write_buffer`; verletzt `.claude/rules/render.md` |
+| high | `src/render/state.rs:18898-19242` | `create_buffer_init` an 17 Stellen in `render()` — **11 davon ohne Cache-Gate**, siehe Korrektur in §5.1 | Persistente Grow-on-Demand-Buffer + `write_buffer`; verletzt `.claude/rules/render.md` |
 | high | `src/render/mesh_gpu.rs:196-260` | Pro-Chunk-pro-Layer `wgpu::Buffer` (bis zu 6/Chunk), keine Suballocation; `grown_capacity` = `next_power_of_two` → bis zu 2× VRAM-Verschwendung | Layer aus einer großen persistenten Arena suballozieren; bestehenden Reuse-on-Fit-Pfad behalten |
 | high | `src/render/state.rs:5678` | Mesh-Job-Channel `unbounded` + FIFO-Worker → ferne Chunks verhungern nahe (`inflight(mesh=148)`) | Bounded Channel + umsortierbare Pending-Queue |
 | medium | `src/console.rs:9-13`; `src/world/mod.rs:2425-2454`; `src/render/state.rs:17604` | `eprintln!` (ungepuffert, globaler Lock) pro Mesh-Pump und ×6 pro Lighting-Job, aus Worker-Threads | Level-gegateter, gepufferter Logger |
@@ -499,7 +508,67 @@ Keine Säulen-Ursache, aber ein Crash, der auf die richtige Terrainhöhe wartet.
 | low | `src/meshing/neighborhood.rs:176-182` | Toter Zweig: `if world_y > WORLD_MAX_Y { 0xF0 } else { 0xF0 }` | Zusammenfassen; klären, ob der `< 0`-Fall wirklich `0` sein soll |
 | low | `src/render/mesh_gpu.rs:216` | `format!("{label_prefix} Vertex Buffer")` allokiert einen `String` pro Buffer-Erzeugung | `&'static str`-Labels, oder `None` im Release |
 | low | `src/render/state.rs:10496-10510` | `count_urgent_near_mesh_uploads` scannt die volle Upload-Queue jeden Frame (zweimal, über beide Budget-Pfade) | Zähler inkrementell pflegen |
+| medium | `src/render/state.rs:16157-16177` | **`pump_removed_lighting_batches` bricht unbedingt nach dem ersten Batch ab** — siehe §D.1 | Entscheiden: `if let` (Verhalten festschreiben) oder `break` entfernen (Budget wirken lassen) |
+| medium | Build/CI | **`cargo clippy --all-targets -- -D warnings` schlägt fehl** — siehe §D.2 | Lint aus §D.1 auflösen, dann Warning-Schulden abtragen |
 | — | gesamtes Crate | **Null `unsafe`-Blöcke.** `unwrap`/`expect`-Dichte niedrig und auf Init-/Test-Pfade konzentriert (state.rs: 5, greedy.rs: 12, world/mod.rs: 19, region_file.rs: 14, chunkgen_worker.rs: 13) | keine Maßnahme |
+
+### 5.1 — Korrektur: „17 `create_buffer_init` pro Frame"
+
+Die ursprüngliche Formulierung zählte **Code-Stellen**, nicht Ausführungen pro Frame. Präzisiert:
+
+| Mesh | Cache-Gate | pro Frame? |
+|------|-----------|-----------|
+| Inventory-, Chat-, Hotbar-Overlay (6 Stellen) | ja (`*OverlayCacheKey`) | nur bei Änderung |
+| Particle (2) | nein | nur wenn Partikel existieren |
+| Precipitation (1) | nein | nur bei Niederschlag |
+| Generating-Overlay (2) | nein | nur im Ladebildschirm |
+| Menu-Overlay (2) | nein | nur im Menü |
+| Debug-Overlay (2) | nein | wenn Debug-HUD an (Text ändert sich ohnehin jeden Frame) |
+| First-Person-Overlay (2) | nein | **jeden Gameplay-Frame** |
+
+Im normalen Gameplay laufen also **2–7** Buffer-Erzeugungen pro Frame, nicht 17. Das First-Person-Overlay ist der einzige bedingungslose Fall. Die Einstufung *high* bleibt: Buffer-Erzeugung plus Freigabe am Frame-Ende erzeugt genau den Jitter, den das Designziel „stabile Frame-Zeiten" ausschließt — aber die Größenordnung war überzeichnet.
+
+### D.1 — `pump_removed_lighting_batches` verarbeitet nur einen Batch pro Frame
+
+**Severity:** medium · **Status:** CONFIRMED · **Gefunden:** beim Umsetzen von §2.2
+
+`src/render/state.rs:16157-16177`. Die Schleife sieht aus wie ein budgetierter Pump, endet aber mit einem **unbedingten `break`**:
+
+```rust
+while let Some(batch) = self.pending_removed_lighting_batches.pop_front() {
+    if started.elapsed() >= frame_budget {
+        self.pending_removed_lighting_batches.push_front(batch);
+        break;
+    }
+    // … genau ein Batch verarbeiten …
+    break;          // ← unbedingt
+}
+```
+
+Das `while let` ist damit faktisch ein `if let`: pro Frame wird **ein** Batch abgearbeitet, unabhängig vom Budget. Die Budget-Prüfung greift nur, wenn die Zeit schon beim Eintritt überschritten war.
+
+Clippy meldet das als `error: this loop never actually loops` — der einzige echte Lint-Error im Crate (siehe §D.2).
+
+**Bewertung:** kein akuter Schaden, in keinem der 10 Stall-Reports ist ein Removal-Backlog auffällig (die Chunk-Entladung erzeugt deutlich weniger Arbeit als das Streaming). Aber die Absicht des Codes und sein Verhalten widersprechen sich, und `STREAM_CHUNK_LIGHTING_REMOVED_FRAME_BUDGET_MS` verspricht mehr, als der Pump einlöst.
+
+**Fix — bewusste Entscheidung nötig, deshalb bei §2.2 nicht mitgeändert:**
+- *Verhalten festschreiben:* `while let` → `if let`. Null Risiko, Lint weg, Konstante wird zur reinen Einzel-Batch-Schranke.
+- *Budget wirken lassen:* das `break` entfernen. Baut Removal-Backlogs schneller ab, kostet aber bis zu `REMOVED_FRAME_BUDGET_MS` pro Frame statt einem Batch — Messung vorher sinnvoll.
+
+**Messung:** `pending_removed_lighting_batches.len()` in die Stall-Zeile aufnehmen (neben `lighting backlog`). Bleibt der Wert bei 0–1, ist Variante 1 richtig.
+
+### D.2 — Der dokumentierte Lint-Befehl schlägt fehl
+
+**Severity:** medium · **Status:** CONFIRMED
+
+`CLAUDE.md` nennt `cargo clippy --all-targets -- -D warnings` als Lint-Kommando. Das schlägt aktuell fehl, und zwar aus zwei unabhängigen Gründen:
+
+1. **Ein echter Lint-Error:** `this loop never actually loops` (§D.1). Der bricht den Build schon ohne `-D warnings`.
+2. **Warning-Schulden:** ~109 Warnungen im Crate (`cargo check`), unter Clippy ~205. Ganz überwiegend `never used` für Konstanten, Felder und Methoden (`src/perf/allocation_tracker.rs` komplett, `stall_file_path`, `gpu_csv_path`, `note_gpu_wait`, diverse UI-Konstanten). Mit `-D warnings` ist jede davon fatal.
+
+Beides ist vorbestehend und unabhängig von den bisherigen Fixes — gegengeprüft gegen `8f7634d`: dort identische Fehlerzahl.
+
+**Fix:** §D.1 auflösen, dann die Dead-Code-Warnungen in einem eigenen Durchgang abräumen (löschen oder `#[allow(dead_code)]` mit Begründung dort, wo bewusst Vorrat gehalten wird — z. B. `allocation_tracker`, das erst mit dem jetzt deklarierten Feature nutzbar wird). Solange das offen ist, ist der Lint-Befehl in `CLAUDE.md` irreführend.
 
 ---
 
@@ -560,6 +629,55 @@ Die **einzige** neue Sonde, die ich empfehle — ca. 4 Zeilen.
 Die neueste Aufzeichnung (`run_1787146900_888`, heute) und die beiden aus Mai/Juni sind zeitlich deutlich nach dem März-Batch — zeigen aber **dieselben** Backlog- und Wartezeit-Signaturen. Das sind also langjährige Zustände, keine Regressionen.
 
 Außerdem wurden mehrere Stall-Reports bei `menu=1` / `in_game=0` aufgenommen (z. B. `run_1773082954_380`), einige Frame-Zeiten dort sind also Menü-Frames, keine Gameplay-Frames. Alle oben zitierten `chunkgen pure_ms`- und `lighting backlog`-Werte stammen aus `in_game`/Streaming-Frames.
+
+---
+
+## UMSETZUNGSSTAND
+
+Der Report oben ist die Analyse auf `8f7634d`. Diese Tabelle hält nach, was davon umgesetzt ist.
+
+| § | Befund | Status | Wo |
+|---|--------|--------|-----|
+| §1.1 | Tracing bedingungslos aktiv, globaler Mutex über Datei-I/O | ✅ behoben | `188fdb8` |
+| §1.2 | `refresh_worldgen_warmup_tracking` O(n·m) pro Drain | ✅ behoben | `188fdb8` |
+| §2.1 | Provisorisches Licht unter Y=64 komplett 0 | ✅ behoben | working tree |
+| §2.2 | Lighting-Backlog wird nie abgebaut | 🟡 Durchsatz angehoben | working tree |
+| §2.3 | Remesh geparkt bis `Finalized` | ✅ behoben | working tree |
+| §2.4 | Startup-deferred-Set strandet | ✅ behoben | working tree |
+| §5 | Per-Frame-GPU-Buffer für Overlays/Partikel/Precipitation | ✅ behoben | working tree |
+| §1.5 | `eprintln!` in Hot Paths | ✅ behoben | working tree |
+| §1.3 | 512-Iterationen-Spin im Main-Thread | offen (Severity auf *low* korrigiert) | |
+| §1.4 | Mesh-Job-Priority-Inversion | offen | |
+| §2.5 | `blocks_skylight` vs. `OcclusionShape` | offen | |
+| §5 (Rest) | Chunk-Mesh-Suballocation statt Buffer pro Layer | offen | |
+| §D.1 | `pump_removed_lighting_batches` bricht nach einem Batch ab | offen (Entscheidung) | |
+| §D.2 | Lint-Befehl aus `CLAUDE.md` schlägt fehl | offen | |
+
+### Was konkret geändert wurde
+
+**§1.1 — Tracing.** Drei Stufen über `MC_KLON_TRACE=off|ring|full`; Cargo-Feature `perf_trace` verschiebt nur den Default, die Env-Var gewinnt. Neuer Default `ring`: Stall-Reports und GPU-CSV bleiben, der JSON-Eventstream ist opt-in. JSON-Serialisierung und Datei-I/O laufen im Thread `perf-trace-writer`, Übergabe per `bounded(16384)` + `try_send` — Producer blockieren nie, Überlauf wird gezählt und beim Shutdown gemeldet. GPU-CSV-Handle wird einmal geöffnet statt pro Frame `stat`+`open`+`close`. Thread-Label in einem `thread_local` gecacht. 4 Tests auf der Level-Logik.
+
+**§1.2 — Warmup-Tracking.** Der Kostentreiber war schlimmer als analysiert: `startup_section_has_completed_mesh` machte pro Section einen Linearscan über `mesh_upload_queue`, also O(n·m). Jetzt einmal ein `pending_uploads`-Set → O(n+m). Rescan max. einmal pro Frame (Reset in `begin_frame_profiling`, **nicht** über `frame_index` — der steht während `Generating` still). `generated_columns`-Clone-Roundtrip entfernt, Sets werden wiederverwendet, Phase-String nur bei geänderten `stats`.
+
+**§2.1 — Provisorisches Licht.** Statt `world_y >= 64` jetzt die Worldgen-Oberflächenschätzung dieser Chunk-Spalte (`estimated_surface_height_for_column_cached`, ein gecachtes Sample pro Spalte) als Startwert, dann pro Spalte von oben nach unten: Skylight endet am ersten Blocker, wie beim echten BFS-Seed. Korrigiert beide Fehlrichtungen — begrabene Luftblasen über Y=64 werden nicht mehr hell, freiliegendes Terrain unter Y=64 nicht mehr schwarz. `PENDING_LIGHTING_SKY_HEURISTIC_MIN_Y` entfernt.
+
+**§2.2 — Durchsatz.** `FRAME_BUDGET_MS 3.0 / STEP_BUDGET_MS 1.5` ergab exakt 2 Steps/Frame — genau der Messwert aus den Logs, während `MAX_STEPS_PER_FRAME = 4` nie band. Frame-Budget 3.0 → 6.0, Step-Cap 4 → 8, Job-Granularität 3 → 6 Primary / 14 → 24 Region. `pump_removed_lighting_batches` teilte sich die Konstante und hätte das Worst-Case-Lighting pro Frame verdoppelt → eigene Konstante, Verhalten unverändert. **Der strukturelle Fix steht weiter aus:** der `LightingWorkerPool` ist nach wie vor idle (`light_rx=0`), das inkrementelle Lighting läuft weiter auf dem Main-Thread.
+
+**§2.3 — Parking.** `mesh_should_await_lighting_finalization` parkt nur noch bei `Provisional` statt bis `Finalized`. Die Freigabe musste zusätzlich überhaupt erst auslösen: `maybe_release_mesh_after_lighting_finalization` → `…_after_lighting_progress`, aufgerufen bei **beiden** Vorwärtsübergängen sowie in `note_chunk_lighting_visual_ready`. Logik als freie Funktion `lighting_state_defers_remesh` extrahiert, 3 Regressionstests.
+
+**§2.4 — Stranden.** `startup_final_lighting_batch_ready()` liefert `true` statt `false`, wenn kein Worldgen-Task mehr existiert, plus expliziter Drain direkt nach `world_generation_task = None`.
+
+**§5 — Per-Frame-GPU-Buffer.** Neues `frame_mesh_slots: HashMap<&'static str, ChunkMesh>` auf `State` plus `upload_frame_mesh` / `clear_frame_mesh` / `frame_mesh_to_draw`. Die Uploads laufen über das vorhandene `upload_cpu_mesh_to_gpu_reuse`, das nur bei Kapazitätsmangel neu alloziert und sonst `write_buffer` benutzt. Umgestellt: Particle, Generating-, Menu-, Debug- und First-Person-Overlay (10 Stellen). Precipitation ist vertex-only (Line-List) und hat ein eigenes `precipitation_vertex_buffer` mit Grow-on-Demand (1 Stelle). Ein leeres Mesh setzt `index_count = 0` und behält die Allokation, statt sie freizugeben. Die drei cache-gated Overlays blieben unangetastet — sie erzeugen ohnehin nur bei Key-Änderung Buffer.
+
+Eine Falle dabei: `showing_pause_menu` wurde aus `menu_overlay_mesh.is_some()` abgeleitet, also aus der Existenz des gerade gebauten Mesh. Da das Mesh jetzt persistent ist, wird die Flag vor dem Konsumieren aus `menu_overlay.is_some()` genommen.
+
+**§1.5 — `eprintln!` in Hot Paths.** Zwei Stellen mit Log-Evidenz:
+- `rebuild_lighting_for_snapshot` (`src/world/mod.rs`) emittierte **sechs** `eprintln!` pro Aufruf, auf einem Lighting-Worker-Thread, jedes mit prozessweitem stderr-Lock und eigenem `write(2)`. Jetzt ein einzelnes `record_duration_ms`-Event mit denselben Zahlen — kostet nichts, wenn Tracing aus ist.
+- Die Mesh-Upload-Zeile feuerte bei `created_buffers > 0`, also während des Streamings praktisch jeden Frame. Die Bedingung ist jetzt rein zeitbasiert; die Buffer-Zahl steht ohnehin in `frame_perf.mesh_gpu_buffers_created` und damit im Stall-Report.
+
+### Testlage
+
+`cargo test`: 116 passed, 1 failed. Der Fehlschlag ist `world::config::tests::sea_level_comes_from_world_config_for_lakes_and_lava_constraints` und **vorbestehend** — gegen `8f7634d` mit identischer Meldung gegengeprüft (`water_y=84, sea_level=80`). Er ist unabhängig von allen hier beschriebenen Änderungen und noch offen.
 
 ---
 
@@ -716,11 +834,16 @@ VERTICAL_VIEW_RADIUS_CHUNKS                  = 4
 
 ## Empfohlene Reihenfolge der Umsetzung
 
-1. **§1.1 Tracing gaten** — größter Hebel, geringstes Risiko, macht alle weiteren Messungen erst aussagekräftig.
-2. **§6.1 Messung wiederholen** — bevor irgendetwas anderes angefasst wird.
-3. **§1.2 `refresh_worldgen_warmup_tracking` inkrementell** — zweitgrößter Hebel für Symptom 1.
-4. **§2.3 Parking auf `VisualReady` lösen** — kleinster Fix mit größter Wirkung auf Symptom 2/3.
-5. **§2.1 Provisorisches Skylight aus Heightmap** — behebt die Schwarz-Chunks an der Wurzel.
-6. **§2.2 Lighting auf den Worker-Pool** — strukturell, aber der Pool existiert schon.
-7. **§2.5 `blocks_skylight` aus `OcclusionShape` ableiten** — Contract-Bereinigung, mit Test absichern.
-8. **§1.3 / §1.4 / §5 GPU-Buffer** — danach, gemessen priorisiert.
+1. ~~**§1.1 Tracing gaten**~~ — ✅ erledigt.
+2. ~~**§1.2 `refresh_worldgen_warmup_tracking` inkrementell**~~ — ✅ erledigt.
+3. ~~**§2.3 Parking auf `VisualReady` lösen**~~ — ✅ erledigt.
+4. ~~**§2.1 Provisorisches Skylight aus Heightmap**~~ — ✅ erledigt (Worldgen-Schätzung statt Heightmap).
+5. ~~**§5 GPU-Buffer pro Frame**~~ — ✅ erledigt für Overlays/Partikel/Precipitation.
+6. ~~**§1.5 `eprintln!` aus den Hot Paths**~~ — ✅ erledigt.
+7. **§6.1 Messung nachholen** — ein Lauf mit dem neuen Default (`ring`) und Vergleich der `stall.txt` gegen `logs/run_1787146900_888.stall.txt`. **Jetzt fällig:** sämtliche Zahlen im Report stammen von vor den Fixes, weiteres Tuning ohne neue Messung wäre geraten.
+8. **§2.2 Lighting auf den Worker-Pool** — strukturell; bisher nur die Budgets angehoben, der Pool ist weiter idle.
+9. **§1.4 Mesh-Job-Priority-Inversion** — größerer Umbau (bounded Channel + umsortierbare Pending-Queue), vorher messen.
+10. **§5 (Rest) Chunk-Mesh-Suballocation** — bis zu 6 Buffer pro Chunk, `next_power_of_two` verschwendet bis zu 2× VRAM.
+11. **§2.5 `blocks_skylight` aus `OcclusionShape` ableiten** — Contract-Bereinigung, braucht visuelle Prüfung.
+12. **§D.1 / §D.2** — Verhalten festlegen bzw. Lint-Schulden abtragen.
+13. **§1.3 Spin-Loop** — niedrige Priorität, läuft nur einmal im Ladebildschirm.

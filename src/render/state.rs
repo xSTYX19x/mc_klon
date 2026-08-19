@@ -1239,6 +1239,16 @@ const STREAM_CHUNK_LIGHTING_REMOVED_FRAME_BUDGET_MS: f32 = 3.0;
 /// Must stay above `FRAME_BUDGET_MS / STEP_BUDGET_MS`, otherwise the step count
 /// becomes the binding limit instead of the time budget.
 const STREAM_CHUNK_LIGHTING_MAX_STEPS_PER_FRAME: usize = 8;
+// Slot labels for `State::frame_mesh_slots`. These are the meshes rebuilt every
+// frame; the cache-keyed overlays (inventory, chat, hotbar, block select) keep
+// their own fields because they only rebuild when their key changes.
+// Precipitation is vertex-only (line list) and keeps its own buffer instead.
+const FRAME_MESH_PARTICLES: &str = "Particle";
+const FRAME_MESH_GENERATING_OVERLAY: &str = "Generating Overlay";
+const FRAME_MESH_MENU_OVERLAY: &str = "Menu Overlay";
+const FRAME_MESH_DEBUG_OVERLAY: &str = "Debug Overlay";
+const FRAME_MESH_FIRST_PERSON_OVERLAY: &str = "First Person Overlay";
+
 const MESH_UPLOAD_LOG_THRESHOLD: Duration = Duration::from_millis(4);
 const BLOCK_EDIT_SIDEFX_BUDGET_MS: f32 = 1.5;
 const BLOCK_EDIT_SIDEFX_MAX_EDITS_PER_FRAME: usize = 8;
@@ -5336,7 +5346,17 @@ pub(crate) struct State {
     highlight_mesh: Option<ChunkMesh>,
     outline_target: Option<OutlineTarget>,
     outline_vertex_buffer: wgpu::Buffer,
+    /// Persistent vertex buffer for the precipitation line mesh (vertex-only, so
+    /// it cannot live in `frame_mesh_slots`). Grown on demand, never per frame.
+    precipitation_vertex_buffer: Option<(wgpu::Buffer, u64)>,
     crosshair_mesh: ChunkMesh,
+    /// Persistent GPU buffers for meshes that genuinely change every frame
+    /// (particles, precipitation, and the overlays without a cache key). Keyed by
+    /// a `&'static str` label; `upload_cpu_mesh_to_gpu_reuse` only allocates when
+    /// the new mesh outgrows the slot, otherwise it writes into the existing
+    /// buffers. Previously each of these built a fresh `wgpu::Buffer` pair per
+    /// frame and dropped it again at frame end.
+    frame_mesh_slots: HashMap<&'static str, ChunkMesh>,
     preview_mesh_cache: HashMap<BlockId, ChunkMesh>,
     hotbar_overlay_mesh: Option<ChunkMesh>,
     hotbar_overlay_cache: Option<HotbarOverlayCacheKey>,
@@ -9829,7 +9849,9 @@ impl State {
             highlight_mesh: None,
             outline_target: None,
             outline_vertex_buffer,
+            precipitation_vertex_buffer: None,
             crosshair_mesh,
+            frame_mesh_slots: HashMap::new(),
             preview_mesh_cache: HashMap::new(),
             hotbar_overlay_mesh: None,
             hotbar_overlay_cache: None,
@@ -10112,6 +10134,71 @@ impl State {
             vertex_capacity_bytes: std::mem::size_of_val(vertices.as_slice()) as u64,
             index_capacity_bytes: std::mem::size_of_val(indices.as_slice()) as u64,
         };
+    }
+
+    /// Uploads a per-frame mesh into its persistent slot, growing the buffers only
+    /// when the mesh no longer fits. An empty mesh keeps the slot (and its
+    /// allocation) but marks it as nothing-to-draw.
+    fn upload_frame_mesh(&mut self, label: &'static str, vertices: Vec<Vertex>, indices: Vec<u32>) {
+        if indices.is_empty() {
+            self.clear_frame_mesh(label);
+            return;
+        }
+        let existing = self.frame_mesh_slots.remove(label);
+        let (mesh, _stats) = upload_cpu_mesh_to_gpu_reuse(
+            &self.device,
+            &self.queue,
+            label,
+            CpuMeshData { vertices, indices },
+            existing,
+        );
+        if let Some(mesh) = mesh {
+            self.frame_mesh_slots.insert(label, mesh);
+        }
+    }
+
+    /// Writes the precipitation line vertices into the persistent buffer, growing
+    /// it only when the mesh no longer fits. Returns the vertex count to draw.
+    fn upload_precipitation_vertices(&mut self, vertices: &[OutlineVertex]) -> u32 {
+        if vertices.is_empty() {
+            return 0;
+        }
+        let bytes: &[u8] = bytemuck::cast_slice(vertices);
+        let needed = bytes.len() as u64;
+        let fits = self
+            .precipitation_vertex_buffer
+            .as_ref()
+            .is_some_and(|(_, capacity)| *capacity >= needed);
+        if !fits {
+            let capacity = needed.max(256).next_power_of_two();
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Precipitation Line Vertex Buffer"),
+                size: capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.precipitation_vertex_buffer = Some((buffer, capacity));
+        }
+        let (buffer, _) = self
+            .precipitation_vertex_buffer
+            .as_ref()
+            .expect("precipitation buffer just ensured");
+        self.queue.write_buffer(buffer, 0, bytes);
+        vertices.len() as u32
+    }
+
+    /// Marks a slot as nothing-to-draw without releasing its buffers, so the next
+    /// frame that needs it can write straight into the existing allocation.
+    fn clear_frame_mesh(&mut self, label: &'static str) {
+        if let Some(mesh) = self.frame_mesh_slots.get_mut(label) {
+            mesh.index_count = 0;
+        }
+    }
+
+    fn frame_mesh_to_draw(&self, label: &'static str) -> Option<&ChunkMesh> {
+        self.frame_mesh_slots
+            .get(label)
+            .filter(|mesh| mesh.index_count > 0)
     }
 
     fn ensure_preview_mesh_cached(&mut self, block: BlockId) {
@@ -17747,9 +17834,13 @@ impl State {
         self.frame_perf.mesh_gpu_buffers_created += upload_stats.created_buffers;
         self.frame_perf.mesh_gpu_reused_writes += upload_stats.reused_buffer_writes;
         self.frame_perf.pump_mesh_results_ms += total_time.as_secs_f32() * 1000.0;
+        // Only log on genuinely slow uploads. This used to also fire whenever a
+        // single buffer was created, i.e. on most frames while streaming — and
+        // `console_error!` is an unbuffered `eprintln!` that takes the global
+        // stderr lock. The buffer count is in `frame_perf.mesh_gpu_buffers_created`
+        // and shows up in the stall report, so nothing is lost.
         if processed > 0
             && (total_time >= MESH_UPLOAD_LOG_THRESHOLD
-                || upload_stats.created_buffers > 0
                 || upload_stats.buffer_create_time >= Duration::from_millis(1))
         {
             crate::console_error!(
@@ -19018,55 +19109,20 @@ impl State {
         let mut lod_drawcalls = 0usize;
         let mut world_drawcalls = 0usize;
 
-        let particle_mesh = if !draw_world_scene || self.particles.is_empty() {
-            None
+        if !draw_world_scene || self.particles.is_empty() {
+            self.clear_frame_mesh(FRAME_MESH_PARTICLES);
         } else {
             let (vertices, indices) = self.build_particle_mesh(camera);
-            if indices.is_empty() {
-                None
-            } else {
-                let vertex_buffer =
-                    self.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("Particle Vertex Buffer"),
-                            contents: bytemuck::cast_slice(&vertices),
-                            usage: wgpu::BufferUsages::VERTEX,
-                        });
-                let index_buffer =
-                    self.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("Particle Index Buffer"),
-                            contents: bytemuck::cast_slice(&indices),
-                            usage: wgpu::BufferUsages::INDEX,
-                        });
-                Some(ChunkMesh {
-                    vertex_buffer,
-                    index_buffer,
-                    index_count: indices.len() as u32,
-                    vertex_capacity_bytes: std::mem::size_of_val(vertices.as_slice()) as u64,
-                    index_capacity_bytes: std::mem::size_of_val(indices.as_slice()) as u64,
-                })
-            }
-        };
-        let precipitation_line_mesh: Option<(wgpu::Buffer, u32)> =
+            self.upload_frame_mesh(FRAME_MESH_PARTICLES, vertices, indices);
+        }
+        let precipitation_line_vertex_count: u32 =
             if !draw_world_scene || self.precipitation_strength() <= 0.02 {
-                None
+                0
             } else if let Some(kind) = self.active_precipitation_kind() {
                 let vertices = self.build_precipitation_vertices(camera, kind);
-                if vertices.is_empty() {
-                    None
-                } else {
-                    let vertex_buffer =
-                        self.device
-                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                label: Some("Precipitation Line Vertex Buffer"),
-                                contents: bytemuck::cast_slice(&vertices),
-                                usage: wgpu::BufferUsages::VERTEX,
-                            });
-                    Some((vertex_buffer, vertices.len() as u32))
-                }
+                self.upload_precipitation_vertices(&vertices)
             } else {
-                None
+                0
             };
         let ui_mesh_scope = perf_trace::scope("render.build_ui_meshes").with_counts(format!(
             "gen={} menu={} inv={} debug={} chat={} hotbar_slots={}",
@@ -19077,7 +19133,7 @@ impl State {
             chat_overlay.is_some() as u8,
             hotbar.len()
         ));
-        let generating_overlay_mesh = if let Some(overlay) = generation_overlay {
+        if let Some(overlay) = generation_overlay {
             let (vertices, indices) = build_generating_screen_mesh(
                 self.config.width,
                 self.config.height,
@@ -19088,31 +19144,14 @@ impl State {
                 overlay.phase,
                 overlay.stats,
             );
-            let vertex_buffer = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Generating Overlay Vertex Buffer"),
-                    contents: bytemuck::cast_slice(&vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-            let index_buffer = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Generating Overlay Index Buffer"),
-                    contents: bytemuck::cast_slice(&indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                });
-            Some(ChunkMesh {
-                vertex_buffer,
-                index_buffer,
-                index_count: indices.len() as u32,
-                vertex_capacity_bytes: std::mem::size_of_val(vertices.as_slice()) as u64,
-                index_capacity_bytes: std::mem::size_of_val(indices.as_slice()) as u64,
-            })
+            self.upload_frame_mesh(FRAME_MESH_GENERATING_OVERLAY, vertices, indices);
         } else {
-            None
-        };
-        let menu_overlay_mesh = if let Some(overlay) = menu_overlay {
+            self.clear_frame_mesh(FRAME_MESH_GENERATING_OVERLAY);
+        }
+        // Captured before the overlay is consumed below; this used to be derived
+        // from whether the (now persistent) menu mesh had just been built.
+        let showing_pause_menu = menu_overlay.is_some();
+        if let Some(overlay) = menu_overlay {
             let (vertices, indices) = build_menu_overlay_mesh(
                 self.config.width,
                 self.config.height,
@@ -19127,30 +19166,10 @@ impl State {
                 overlay.enabled,
                 overlay.footer,
             );
-            let vertex_buffer = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Menu Overlay Vertex Buffer"),
-                    contents: bytemuck::cast_slice(&vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-            let index_buffer = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Menu Overlay Index Buffer"),
-                    contents: bytemuck::cast_slice(&indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                });
-            Some(ChunkMesh {
-                vertex_buffer,
-                index_buffer,
-                index_count: indices.len() as u32,
-                vertex_capacity_bytes: std::mem::size_of_val(vertices.as_slice()) as u64,
-                index_capacity_bytes: std::mem::size_of_val(indices.as_slice()) as u64,
-            })
+            self.upload_frame_mesh(FRAME_MESH_MENU_OVERLAY, vertices, indices);
         } else {
-            None
-        };
+            self.clear_frame_mesh(FRAME_MESH_MENU_OVERLAY);
+        }
         self.block_select_overlay_mesh = None;
         self.block_select_overlay_cache = None;
         let showing_inventory = if let Some(overlay) = inventory_overlay {
@@ -19203,44 +19222,20 @@ impl State {
             self.inventory_overlay_cache = None;
             false
         };
-        let showing_pause_menu = menu_overlay_mesh.is_some();
         let allow_gameplay_ui =
             !showing_generation_screen && !showing_pause_menu && !showing_inventory;
-        let debug_overlay_mesh = if allow_gameplay_ui {
-            if let Some(overlay) = debug_overlay {
+        match debug_overlay.filter(|_| allow_gameplay_ui) {
+            Some(overlay) => {
                 let (vertices, indices) = build_debug_overlay_mesh(
                     self.config.width,
                     self.config.height,
                     &self.worldgen_font,
                     overlay.lines,
                 );
-                let vertex_buffer =
-                    self.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("Debug Overlay Vertex Buffer"),
-                            contents: bytemuck::cast_slice(&vertices),
-                            usage: wgpu::BufferUsages::VERTEX,
-                        });
-                let index_buffer =
-                    self.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("Debug Overlay Index Buffer"),
-                            contents: bytemuck::cast_slice(&indices),
-                            usage: wgpu::BufferUsages::INDEX,
-                        });
-                Some(ChunkMesh {
-                    vertex_buffer,
-                    index_buffer,
-                    index_count: indices.len() as u32,
-                    vertex_capacity_bytes: std::mem::size_of_val(vertices.as_slice()) as u64,
-                    index_capacity_bytes: std::mem::size_of_val(indices.as_slice()) as u64,
-                })
-            } else {
-                None
+                self.upload_frame_mesh(FRAME_MESH_DEBUG_OVERLAY, vertices, indices);
             }
-        } else {
-            None
-        };
+            None => self.clear_frame_mesh(FRAME_MESH_DEBUG_OVERLAY),
+        }
         if allow_gameplay_ui {
             if let Some(overlay) = chat_overlay {
                 let has_visible_lines = overlay.chat_open
@@ -19341,7 +19336,7 @@ impl State {
         }
         let show_first_person_overlay =
             !showing_generation_screen && !showing_pause_menu && !showing_inventory;
-        let first_person_overlay_mesh = if show_first_person_overlay {
+        if show_first_person_overlay {
             let held_block =
                 hotbar[selected_hotbar_slot.min(HUD_HOTBAR_SLOT_COUNT.saturating_sub(1))];
             let (vertices, indices) = build_first_person_overlay_mesh(
@@ -19351,34 +19346,10 @@ impl State {
                 self.first_person_arm_tweak,
                 held_block,
             );
-            if indices.is_empty() {
-                None
-            } else {
-                let vertex_buffer =
-                    self.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("First Person Overlay Vertex Buffer"),
-                            contents: bytemuck::cast_slice(&vertices),
-                            usage: wgpu::BufferUsages::VERTEX,
-                        });
-                let index_buffer =
-                    self.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("First Person Overlay Index Buffer"),
-                            contents: bytemuck::cast_slice(&indices),
-                            usage: wgpu::BufferUsages::INDEX,
-                        });
-                Some(ChunkMesh {
-                    vertex_buffer,
-                    index_buffer,
-                    index_count: indices.len() as u32,
-                    vertex_capacity_bytes: std::mem::size_of_val(vertices.as_slice()) as u64,
-                    index_capacity_bytes: std::mem::size_of_val(indices.as_slice()) as u64,
-                })
-            }
+            self.upload_frame_mesh(FRAME_MESH_FIRST_PERSON_OVERLAY, vertices, indices);
         } else {
-            None
-        };
+            self.clear_frame_mesh(FRAME_MESH_FIRST_PERSON_OVERLAY);
+        }
         let outline_target = if showing_generation_screen || showing_pause_menu || showing_inventory
         {
             None
@@ -19616,7 +19587,11 @@ impl State {
                         world_drawcalls += 1;
                     }
                 }
-                if let Some((vertex_buffer, vertex_count)) = &precipitation_line_mesh {
+                if let Some((vertex_buffer, _)) = self
+                    .precipitation_vertex_buffer
+                    .as_ref()
+                    .filter(|_| precipitation_line_vertex_count > 0)
+                {
                     let precipitation_pipeline = match self.active_precipitation_kind() {
                         Some(PrecipitationKind::Snow) => &self.snow_pipeline,
                         _ => &self.rain_pipeline,
@@ -19624,12 +19599,12 @@ impl State {
                     rpass.set_pipeline(precipitation_pipeline);
                     rpass.set_bind_group(0, &self.camera_bind_group, &[]);
                     rpass.set_vertex_buffer(0, vertex_buffer.slice(..));
-                    rpass.draw(0..*vertex_count, 0..1);
+                    rpass.draw(0..precipitation_line_vertex_count, 0..1);
                 }
 
                 // Partikel sind World-Space Billboards und nutzen dieselbe Kamera-Uniform.
                 // Keine zusätzliche Kamera-Offset-Logik: view_proj transformiert sie korrekt.
-                if let Some(mesh) = &particle_mesh {
+                if let Some(mesh) = self.frame_mesh_to_draw(FRAME_MESH_PARTICLES) {
                     rpass.set_pipeline(&self.highlight_pipeline);
                     rpass.set_bind_group(0, &self.camera_bind_group, &[]);
                     rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
@@ -19655,7 +19630,7 @@ impl State {
             }
         }
 
-        if let Some(mesh) = first_person_overlay_mesh.as_ref() {
+        if let Some(mesh) = self.frame_mesh_to_draw(FRAME_MESH_FIRST_PERSON_OVERLAY) {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("First Person Overlay Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -19747,12 +19722,12 @@ impl State {
                 rpass.draw_indexed(0..mesh.index_count, 0, 0..1);
             }
 
-            if let Some(mesh) = &generating_overlay_mesh {
+            if let Some(mesh) = self.frame_mesh_to_draw(FRAME_MESH_GENERATING_OVERLAY) {
                 rpass.set_bind_group(0, &self.worldgen_ui_texture_bind_group, &[]);
                 rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 rpass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 rpass.draw_indexed(0..mesh.index_count, 0, 0..1);
-            } else if let Some(mesh) = &menu_overlay_mesh {
+            } else if let Some(mesh) = self.frame_mesh_to_draw(FRAME_MESH_MENU_OVERLAY) {
                 rpass.set_bind_group(0, &self.worldgen_ui_texture_bind_group, &[]);
                 rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 rpass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -19784,7 +19759,7 @@ impl State {
                 rpass.set_bind_group(1, &self.camera_bind_group, &[]);
             }
 
-            if let Some(mesh) = &debug_overlay_mesh {
+            if let Some(mesh) = self.frame_mesh_to_draw(FRAME_MESH_DEBUG_OVERLAY) {
                 rpass.set_bind_group(0, &self.worldgen_ui_texture_bind_group, &[]);
                 rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 rpass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
