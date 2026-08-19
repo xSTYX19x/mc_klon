@@ -5358,6 +5358,12 @@ pub(crate) struct State {
     winter_surface_debug_counts: WinterSurfaceDebugCounts,
     chunk_lighting_progress: HashMap<ChunkCoord, ChunkLightingProgress>,
     frame_index: u64,
+    /// Whether the startup warmup sets were already rescanned this frame. The
+    /// scan is linear in `target_sections`, so it runs at most once per frame
+    /// instead of once per drained chunkgen/mesh batch. Reset in
+    /// `begin_frame_profiling` (not keyed on `frame_index`, which stops
+    /// advancing while the session is still `Generating`).
+    warmup_tracking_refreshed_this_frame: bool,
     // Frustum culling performance counters
     frustum_culled_chunks_total: u64,
     meshes_skipped_due_to_frustum: u64,
@@ -8025,6 +8031,7 @@ impl State {
 
     pub(crate) fn begin_frame_profiling(&mut self, frame_dt_ms: f32) {
         self.frame_perf.begin_frame(frame_dt_ms);
+        self.warmup_tracking_refreshed_this_frame = false;
         self.frame_perf.deferred_edits_pending_total = self.deferred_block_edits_total;
         if self.sim_system_last_frame_ms.len() != self.sim_systems.len() {
             self.sim_system_last_frame_ms
@@ -9844,6 +9851,7 @@ impl State {
             winter_surface_debug_counts: WinterSurfaceDebugCounts::default(),
             chunk_lighting_progress: HashMap::new(),
             frame_index: 0,
+            warmup_tracking_refreshed_this_frame: false,
             frustum_culled_chunks_total: 0,
             meshes_skipped_due_to_frustum: 0,
             fluid_mesh_coalesce: HashMap::new(),
@@ -11027,36 +11035,63 @@ impl State {
         )
     }
 
-    fn startup_section_has_completed_mesh(&self, coord: ChunkCoord) -> bool {
+    /// `pending_uploads` holds the `(coord, revision)` pairs currently sitting in
+    /// `mesh_upload_queue`. Passing it in keeps the warmup rescan linear: the old
+    /// version rescanned the whole upload queue for *every* target section.
+    fn startup_section_has_completed_mesh(
+        &self,
+        coord: ChunkCoord,
+        pending_uploads: &HashSet<(ChunkCoord, u64)>,
+    ) -> bool {
         if self.startup_section_has_uploaded_mesh(coord) {
             return true;
         }
-        let current_revision = self.world.get_chunk(coord).map(|chunk| chunk.revision);
-        self.mesh_upload_queue.iter().any(|queued| {
-            queued.result.coord == coord && current_revision == Some(queued.result.revision)
-        })
+        let Some(current_revision) = self.world.get_chunk(coord).map(|chunk| chunk.revision) else {
+            return false;
+        };
+        pending_uploads.contains(&(coord, current_revision))
     }
 
+    /// Throttled entry point: the sets feed a progress overlay and the 85 %
+    /// deferred-lighting trigger, neither of which needs sub-frame freshness.
     fn refresh_worldgen_warmup_tracking(&mut self) {
-        let Some(task_ref) = self.world_generation_task.as_ref() else {
+        if self.world_generation_task.is_none() {
+            return;
+        }
+        if self.warmup_tracking_refreshed_this_frame {
+            return;
+        }
+        self.refresh_worldgen_warmup_tracking_forced();
+    }
+
+    fn refresh_worldgen_warmup_tracking_forced(&mut self) {
+        let Some(task) = self.world_generation_task.as_mut() else {
             return;
         };
-        let target_sections: Vec<ChunkCoord> = task_ref
-            .startup_plan
-            .target_sections
-            .iter()
-            .copied()
-            .collect();
-        let generated_columns = task_ref.startup_plan.generated_columns.clone();
+        self.warmup_tracking_refreshed_this_frame = true;
 
-        let mut applied_sections = HashSet::with_capacity(target_sections.len());
-        let mut meshed_sections = HashSet::with_capacity(target_sections.len());
-        let mut uploaded_sections = HashSet::with_capacity(target_sections.len());
+        // Take the plan's own sets as scratch: they already have the right
+        // capacity, so refilling them allocates nothing.
+        let mut applied_sections = std::mem::take(&mut task.startup_plan.applied_sections);
+        let mut meshed_sections = std::mem::take(&mut task.startup_plan.meshed_sections);
+        let mut uploaded_sections = std::mem::take(&mut task.startup_plan.uploaded_sections);
+        applied_sections.clear();
+        meshed_sections.clear();
+        uploaded_sections.clear();
+        let target_sections: Vec<ChunkCoord> =
+            task.startup_plan.target_sections.iter().copied().collect();
+
+        let pending_uploads: HashSet<(ChunkCoord, u64)> = self
+            .mesh_upload_queue
+            .iter()
+            .map(|queued| (queued.result.coord, queued.result.revision))
+            .collect();
+
         for coord in target_sections {
             if self.chunk_is_generation_satisfied(coord) {
                 applied_sections.insert(coord);
             }
-            if self.startup_section_has_completed_mesh(coord) {
+            if self.startup_section_has_completed_mesh(coord, &pending_uploads) {
                 meshed_sections.insert(coord);
             }
             if self.startup_section_has_uploaded_mesh(coord) {
@@ -11067,7 +11102,6 @@ impl State {
         let Some(task) = self.world_generation_task.as_mut() else {
             return;
         };
-        task.startup_plan.generated_columns = generated_columns;
         task.startup_plan.applied_sections = applied_sections;
         task.startup_plan.meshed_sections = meshed_sections;
         task.startup_plan.uploaded_sections = uploaded_sections;
@@ -11095,6 +11129,13 @@ impl State {
             + meshed_progress * 0.25
             + uploaded_progress * 0.20)
             .clamp(0.0, 1.0);
+        // `phase` and `progress_permille` are pure functions of `stats`, so when
+        // the stats are unchanged nothing below can change either. Bail out
+        // before building the strings.
+        if task.last_reported_stats == stats && !task.last_reported_phase.is_empty() {
+            self.maybe_enqueue_startup_deferred_final_lighting();
+            return;
+        }
         let phase = if stats.generated_columns < target_columns {
             format!(
                 "Generating startup columns {}/{}",
@@ -14103,7 +14144,9 @@ impl State {
         self.pump_chunkgen_results();
         self.pump_storage_load_results();
         self.pump_lighting_results();
-        self.refresh_worldgen_warmup_tracking();
+        // Completion is decided directly from these sets, so this caller needs
+        // them fresh even if the throttled path already ran this frame.
+        self.refresh_worldgen_warmup_tracking_forced();
         let task = self.world_generation_task.as_ref()?;
         if task.startup_plan.generated_columns.len() < task.startup_plan.target_columns.len()
             || task.startup_plan.applied_sections.len() < task.startup_plan.target_sections.len()

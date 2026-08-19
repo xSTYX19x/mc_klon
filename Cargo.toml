@@ -3,6 +3,15 @@ name = "mc_klon"
 version = "0.0.1"
 edition = "2024"
 
+[features]
+default = []
+# Makes the JSON event stream (logs/run_*.trace.json) the default for this build.
+# MC_KLON_TRACE=off|ring|full always overrides it at runtime.
+perf_trace = []
+# Referenced by src/meshing/liquids.rs; was never declared, so the feature could
+# not be enabled at all.
+allocation_tracking = []
+
 [dependencies]
 winit = "0.30"
 wgpu = "28"
