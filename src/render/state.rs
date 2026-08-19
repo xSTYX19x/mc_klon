@@ -619,6 +619,43 @@ const fn startup_mesh_upload_complete(
     }
 }
 
+/// Whether a chunk's lighting readiness is still too raw to redraw with.
+///
+/// Only `Provisional` defers. `VisualReady` used to defer as well, which meant a
+/// chunk whose neighbours never all settled kept its stale (usually unlit) mesh
+/// indefinitely, because `Finalized` was the sole release condition.
+const fn lighting_state_defers_remesh(state: ChunkLightingReadiness) -> bool {
+    matches!(state, ChunkLightingReadiness::Provisional)
+}
+
+#[cfg(test)]
+mod lighting_readiness_tests {
+    use super::{ChunkLightingReadiness, lighting_state_defers_remesh};
+
+    #[test]
+    fn provisional_lighting_defers_the_remesh() {
+        assert!(lighting_state_defers_remesh(
+            ChunkLightingReadiness::Provisional
+        ));
+    }
+
+    #[test]
+    fn visually_ready_lighting_releases_the_remesh() {
+        // The regression this guards: waiting for `Finalized` stranded every
+        // chunk at the edge of the loaded region, leaving it rendered unlit.
+        assert!(!lighting_state_defers_remesh(
+            ChunkLightingReadiness::VisualReady
+        ));
+    }
+
+    #[test]
+    fn finalized_lighting_releases_the_remesh() {
+        assert!(!lighting_state_defers_remesh(
+            ChunkLightingReadiness::Finalized
+        ));
+    }
+}
+
 #[cfg(test)]
 mod startup_mesh_tracking_tests {
     use super::{ChunkMeshState, startup_mesh_upload_complete};
@@ -1181,13 +1218,27 @@ const LIGHTING_RESULTS_PER_FRAME: usize = 2;
 const LIGHTING_CHANGED_CHUNK_DIRTY_APPLY_PER_FRAME: usize = 64;
 const LIGHTING_CHANGED_CHUNK_DIRTY_APPLY_BUDGET_MS: f32 = 0.5;
 const LIGHTING_REBUILD_DEBOUNCE_MS: u64 = 75;
-const STREAM_CHUNK_LIGHTING_MAX_PRIMARY_CHUNKS_PER_JOB: usize = 3;
-const STREAM_CHUNK_LIGHTING_MAX_REGION_CHUNKS_PER_JOB: usize = 14;
+// Job granularity. Bigger jobs amortize the per-job fixed cost (region
+// collection plus the finalize/dirty sweep in `commit_incremental_lighting_result`)
+// without making an individual step longer — steps stay bounded by
+// `MAX_VOXELS_PER_STEP` / `STEP_BUDGET_MS` regardless of job size.
+const STREAM_CHUNK_LIGHTING_MAX_PRIMARY_CHUNKS_PER_JOB: usize = 6;
+const STREAM_CHUNK_LIGHTING_MAX_REGION_CHUNKS_PER_JOB: usize = 24;
 const STREAM_CHUNK_LIGHTING_MAX_VOXELS_PER_STEP: u64 = 48_000;
+/// Caps how long one step can stall the frame. Deliberately unchanged.
 const STREAM_CHUNK_LIGHTING_STEP_BUDGET_MS: f32 = 1.5;
-const STREAM_CHUNK_LIGHTING_FRAME_BUDGET_MS: f32 = 3.0;
-const STREAM_CHUNK_LIGHTING_MAX_STEPS_PER_FRAME: usize = 4;
-const PENDING_LIGHTING_SKY_HEURISTIC_MIN_Y: i32 = 64;
+/// Per-frame budget for streaming-chunk lighting. At the old 3.0 ms this allowed
+/// exactly `3.0 / STEP_BUDGET_MS` = 2 steps per frame, which is what the stall
+/// reports measured, while the backlog sat at 190-218 jobs and never drained.
+const STREAM_CHUNK_LIGHTING_FRAME_BUDGET_MS: f32 = 6.0;
+/// Separate budget for the chunk-removal batches, so raising the streaming budget
+/// above does not also double the worst-case lighting frame. Note that
+/// `pump_removed_lighting_batches` additionally breaks after a single batch, so
+/// this bounds that one batch rather than a sequence of them.
+const STREAM_CHUNK_LIGHTING_REMOVED_FRAME_BUDGET_MS: f32 = 3.0;
+/// Must stay above `FRAME_BUDGET_MS / STEP_BUDGET_MS`, otherwise the step count
+/// becomes the binding limit instead of the time budget.
+const STREAM_CHUNK_LIGHTING_MAX_STEPS_PER_FRAME: usize = 8;
 const MESH_UPLOAD_LOG_THRESHOLD: Duration = Duration::from_millis(4);
 const BLOCK_EDIT_SIDEFX_BUDGET_MS: f32 = 1.5;
 const BLOCK_EDIT_SIDEFX_MAX_EDITS_PER_FRAME: usize = 8;
@@ -14172,6 +14223,10 @@ impl State {
         let spawn = Vec3::new(spawn_x as f32 + 0.5, terrain_y + 2.0, spawn_z as f32 + 0.5);
 
         self.world_generation_task = None;
+        // Sections applied between the 85 % trigger and here were re-deferred and
+        // would otherwise never get a lighting job, because the periodic drain is
+        // only reached while a worldgen task exists.
+        self.maybe_enqueue_startup_deferred_final_lighting();
         self.saved_loads_paused = false;
         self.startup_saved_load_bypass_logged = false;
         self.transition_world_session(WorldSessionState::Active, "startup_ready");
@@ -14770,6 +14825,14 @@ impl State {
         }
     }
 
+    /// Whether a lighting-only remesh should be held back for now.
+    ///
+    /// This used to wait for `Finalized`, which requires all six neighbours to be
+    /// loaded and settled. Chunks at the edge of the loaded region never reach
+    /// that while the player keeps moving, so their remesh was parked forever and
+    /// the stale (often unlit) mesh stayed on screen. `VisualReady` is by
+    /// definition good enough to display, so only genuinely provisional lighting
+    /// defers the remesh now; a later job still refines it.
     fn mesh_should_await_lighting_finalization(
         &self,
         coord: ChunkCoord,
@@ -14780,7 +14843,7 @@ impl State {
         }
         self.chunk_lighting_progress
             .get(&coord)
-            .is_some_and(|progress| progress.state != ChunkLightingReadiness::Finalized)
+            .is_some_and(|progress| lighting_state_defers_remesh(progress.state))
     }
 
     fn enqueue_dirty_chunk_coord(&mut self, coord: ChunkCoord) {
@@ -14909,7 +14972,10 @@ impl State {
         self.mark_chunk_dirty_with_reasons(coord, MeshDirtyReasons::DEBUG);
     }
 
-    fn maybe_release_mesh_after_lighting_finalization(&mut self, coord: ChunkCoord) {
+    /// Releases a lighting remesh that was parked while the chunk's lighting was
+    /// still provisional. Called on every forward transition (`VisualReady` and
+    /// `Finalized`), not just on finalization.
+    fn maybe_release_mesh_after_lighting_progress(&mut self, coord: ChunkCoord) {
         let should_release = self.mesh_schedule.get(&coord).is_some_and(|entry| {
             entry.state == ChunkMeshState::AwaitingLightingFinalization && !entry.pending.is_empty()
         }) && !self
@@ -15587,6 +15653,9 @@ impl State {
                     ChunkLightingReadiness::VisualReady.as_str()
                 ),
             );
+            // `VisualReady` already releases a parked lighting remesh, so a chunk
+            // that reaches it without ever being finalized still gets redrawn.
+            self.maybe_release_mesh_after_lighting_progress(coord);
         }
     }
 
@@ -15596,11 +15665,14 @@ impl State {
 
     fn startup_final_lighting_batch_ready(&self) -> bool {
         let Some(task) = self.world_generation_task.as_ref() else {
-            return false;
+            // Startup is over. Anything still deferred was never given a lighting
+            // job, so it has to be flushed now — otherwise those chunks keep the
+            // provisional light they were seeded with, forever.
+            return true;
         };
         let target_sections = task.startup_plan.target_sections.len();
         if target_sections == 0 {
-            return false;
+            return true;
         }
         let applied_sections = task.startup_plan.applied_sections.len();
         applied_sections.saturating_mul(100)
@@ -15689,9 +15761,9 @@ impl State {
                 next_state.as_str()
             ),
         );
-        if next_state == ChunkLightingReadiness::Finalized {
-            self.maybe_release_mesh_after_lighting_finalization(coord);
-        }
+        // Both forward states release the parked remesh: waiting for `Finalized`
+        // stranded every chunk whose neighbours never all settled.
+        self.maybe_release_mesh_after_lighting_progress(coord);
     }
 
     fn commit_incremental_lighting_result(
@@ -16081,8 +16153,9 @@ impl State {
 
     fn pump_removed_lighting_batches(&mut self) {
         let started = Instant::now();
-        let frame_budget =
-            Duration::from_secs_f32((STREAM_CHUNK_LIGHTING_FRAME_BUDGET_MS / 1000.0).max(0.0));
+        let frame_budget = Duration::from_secs_f32(
+            (STREAM_CHUNK_LIGHTING_REMOVED_FRAME_BUDGET_MS / 1000.0).max(0.0),
+        );
         while let Some(batch) = self.pending_removed_lighting_batches.pop_front() {
             if started.elapsed() >= frame_budget {
                 self.pending_removed_lighting_batches.push_front(batch);
@@ -16816,25 +16889,39 @@ impl State {
         }
     }
 
-    fn seed_pending_lighting_for_chunk(&self, coord: ChunkCoord, chunk: &mut Chunk) {
+    /// Provisional light for a freshly generated chunk, shown until the real
+    /// incremental lighting job for it runs.
+    ///
+    /// This used to gate skylight on a flat `world_y >= 64`, which made *every*
+    /// section below Y=64 uniformly pitch black — the chunk was meshed and
+    /// uploaded with that baked in, so it rendered at roughly 1 % brightness.
+    /// It also lit air pockets buried deep inside terrain above Y=64.
+    ///
+    /// Both directions are fixed by using the worldgen's own surface estimate for
+    /// this chunk column (one cached sample per chunk column, not per block) and
+    /// then walking each column top-down: skylight stops at the first blocker,
+    /// exactly like the real BFS seed does.
+    fn seed_pending_lighting_for_chunk(&mut self, coord: ChunkCoord, chunk: &mut Chunk) {
         if !chunk.light.iter().all(|&v| v == 0) {
             return;
         }
 
+        let surface_y = self.estimated_surface_height_for_column_cached(coord.x, coord.z);
         let base_y = coord.y * CHUNK_SIZE;
+        // Sky can only enter this chunk from above if its top reaches past the
+        // estimated surface; a fully buried section starts closed.
+        let top_is_open = base_y + CHUNK_SIZE - 1 > surface_y;
         let light = Arc::make_mut(&mut chunk.light);
-        for y in 0..CHUNK_SIZE {
-            let world_y = base_y + y;
-            let sky_fill = if world_y >= PENDING_LIGHTING_SKY_HEURISTIC_MIN_Y {
-                15
-            } else {
-                0
-            };
-            for z in 0..CHUNK_SIZE {
-                for x in 0..CHUNK_SIZE {
+        for z in 0..CHUNK_SIZE {
+            for x in 0..CHUNK_SIZE {
+                let mut sky_open = top_is_open;
+                for y in (0..CHUNK_SIZE).rev() {
                     let idx = Chunk::index(x, y, z);
                     let block = chunk.blocks[idx];
-                    let sky = if block.blocks_skylight() { 0 } else { sky_fill };
+                    if block.blocks_skylight() {
+                        sky_open = false;
+                    }
+                    let sky = if sky_open { 15 } else { 0 };
                     light[idx] = LightLevel::new(sky, block.emitted_light()).pack();
                 }
             }
