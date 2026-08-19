@@ -1232,9 +1232,10 @@ const STREAM_CHUNK_LIGHTING_STEP_BUDGET_MS: f32 = 1.5;
 /// reports measured, while the backlog sat at 190-218 jobs and never drained.
 const STREAM_CHUNK_LIGHTING_FRAME_BUDGET_MS: f32 = 6.0;
 /// Separate budget for the chunk-removal batches, so raising the streaming budget
-/// above does not also double the worst-case lighting frame. Note that
-/// `pump_removed_lighting_batches` additionally breaks after a single batch, so
-/// this bounds that one batch rather than a sequence of them.
+/// above does not also double the worst-case lighting frame. This is now a real
+/// budget: `pump_removed_lighting_batches` used to `break` after a single batch
+/// regardless, which only worked because chunk eviction repaired its own lighting
+/// synchronously. It no longer does.
 const STREAM_CHUNK_LIGHTING_REMOVED_FRAME_BUDGET_MS: f32 = 3.0;
 /// Must stay above `FRAME_BUDGET_MS / STEP_BUDGET_MS`, otherwise the step count
 /// becomes the binding limit instead of the time budget.
@@ -8148,19 +8149,27 @@ impl State {
     }
 
     pub(crate) fn format_stall_report(&self, frame_dt_ms: f32) -> String {
+        // `unload` has its own bucket because the removal lighting it triggers
+        // lands in `rebuild_world_lighting_ms`. Without it a 188 ms unload frame
+        // reads as `lighting=188.0ms`, pointing the investigation at the wrong
+        // subsystem — which is exactly what happened.
         let mut scopes = [
             ("chunkgen", self.frame_perf.pump_chunkgen_results_ms),
             ("mesh", self.frame_perf.pump_mesh_results_ms),
             ("autosave", self.frame_perf.autosave_total_ms),
             ("storage", self.frame_perf.pump_storage_save_results_ms),
             ("lighting", self.frame_perf.rebuild_world_lighting_ms),
+            (
+                "unload",
+                self.frame_perf.proc_unload_chunks_outside_keep_radius_ms,
+            ),
             ("stream", self.frame_perf.enqueue_chunks_within_view_ms),
             ("saved_load", self.frame_perf.ensure_saved_column_load_ms),
         ];
         scopes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let top_scopes = scopes
             .iter()
-            .take(3)
+            .take(4)
             .filter(|(_, ms)| *ms > 0.05)
             .map(|(name, ms)| format!("{name}={ms:.1}ms"))
             .collect::<Vec<_>>()
@@ -13489,6 +13498,9 @@ impl State {
             let removed_chunk = self.world.chunks.remove(&coord).is_some();
             let had_mesh = self.chunk_meshes.remove(&coord).is_some();
             self.uploaded_final_lighting_chunks.remove(&coord);
+            // The lighting repair is deferred now, so drop the readiness entry
+            // here instead of leaving a stale one until the batch is processed.
+            self.chunk_lighting_progress.remove(&coord);
             self.full_solid_mesh_skip_set.remove(&coord);
             self.generated_empty_chunks.remove(&coord);
             self.chunk_origin.remove(&coord);
@@ -13513,7 +13525,12 @@ impl State {
         }
 
         if removed_any_loaded_chunk {
-            self.run_incremental_chunk_removed_lighting(&removed_chunk_coords, "stream_unload");
+            // The eviction loop above is budgeted, but this repair used to run
+            // synchronously right after it — one measured frame spent 188 ms here
+            // visiting 165 857 voxels for a single batch of evictions. Hand it to
+            // the queue that `pump_removed_lighting_batches` drains under a budget
+            // instead; the work is identical, just spread over frames.
+            self.enqueue_removed_lighting_batches(&removed_chunk_coords, "stream_unload");
         }
 
         if removed_chunks > 0
@@ -16263,7 +16280,6 @@ impl State {
                     batch.enqueued_at.elapsed().as_secs_f32() * 1000.0
                 ),
             );
-            break;
         }
     }
 

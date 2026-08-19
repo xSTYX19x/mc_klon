@@ -549,13 +549,31 @@ Das `while let` ist damit faktisch ein `if let`: pro Frame wird **ein** Batch ab
 
 Clippy meldet das als `error: this loop never actually loops` — der einzige echte Lint-Error im Crate (siehe §D.2).
 
-**Bewertung:** kein akuter Schaden, in keinem der 10 Stall-Reports ist ein Removal-Backlog auffällig (die Chunk-Entladung erzeugt deutlich weniger Arbeit als das Streaming). Aber die Absicht des Codes und sein Verhalten widersprechen sich, und `STREAM_CHUNK_LIGHTING_REMOVED_FRAME_BUDGET_MS` verspricht mehr, als der Pump einlöst.
+**Warum das lange folgenlos blieb:** die Queue war fast immer leer, weil der Unload-Pfad seine Lighting-Reparatur gar nicht einreihte, sondern synchron erledigte — siehe §D.3. Damit war der Pump nur für Saved-Load-Batches zuständig und ein Batch pro Frame reichte.
 
-**Fix — bewusste Entscheidung nötig, deshalb bei §2.2 nicht mitgeändert:**
-- *Verhalten festschreiben:* `while let` → `if let`. Null Risiko, Lint weg, Konstante wird zur reinen Einzel-Batch-Schranke.
-- *Budget wirken lassen:* das `break` entfernen. Baut Removal-Backlogs schneller ab, kostet aber bis zu `REMOVED_FRAME_BUDGET_MS` pro Frame statt einem Batch — Messung vorher sinnvoll.
+**Status: ✅ behoben.** Mit §D.3 füllt der Unload-Pfad die Queue jetzt tatsächlich (bis zu `STREAM_EVICT_CHUNKS_PER_FRAME` = 24 Batches pro Frame), also *muss* sie auch abgebaut werden dürfen. Das `break` ist entfernt, `STREAM_CHUNK_LIGHTING_REMOVED_FRAME_BUDGET_MS` ist damit ein echtes Budget. Nebeneffekt: der einzige Clippy-**Error** im Crate ist weg (siehe §D.2).
 
-**Messung:** `pending_removed_lighting_batches.len()` in die Stall-Zeile aufnehmen (neben `lighting backlog`). Bleibt der Wert bei 0–1, ist Variante 1 richtig.
+### D.3 — Chunk-Entladung repariert Lighting synchron und unbudgetiert
+
+**Severity:** high · **Status:** CONFIRMED · **Gefunden:** in `logs/run_1787160799_221` (Lauf nach den §1.1/§1.2-Fixes) · **Status: ✅ behoben**
+
+Gemessen:
+
+```
+frame=215.4ms  tops=[lighting=188.0ms,...]
+  proc.unload_chunks_outside_keep_radius = 188.6 ms
+  lighting(voxels=165857, inc_chunks=10, backlog=673)
+```
+
+`unload_chunks_outside_keep_radius` (`src/render/state.rs`) budgetiert seine Evict-Schleife sauber (`STREAM_EVICT_CHUNKS_PER_FRAME` = 24, `STREAM_EVICT_BUDGET_MS` = 1.5). **Nach** der Schleife rief es aber `run_incremental_chunk_removed_lighting(&removed_chunk_coords, …)` — synchron, für alle in diesem Frame entfernten Chunks auf einmal, ohne jedes Budget. Ein Frame verbrachte dort 188.6 ms und besuchte 165 857 Voxel.
+
+**Nicht neu:** derselbe Peak steht mit **192.9 ms** schon im Vorlauf `run_1787146900_888`, also vor allen Fixes. Er war nur unsichtbar, weil der Tracing-Overhead (§1.1) alles überlagerte. Keine Regression — ein freigelegter Altbestand.
+
+**Fix:** `enqueue_removed_lighting_batches(…)` statt des synchronen Aufrufs. Damit landet die Arbeit in genau der Queue, die `pump_removed_lighting_batches` unter Budget abbaut — die Infrastruktur existierte bereits, der Unload-Pfad umging sie nur. Zwingend dazu gehört §D.1 (das `break` musste weg). Die Readiness-Einträge der evakuierten Chunks werden jetzt direkt beim Evict entfernt, statt auf das verzögerte Lighting zu warten.
+
+**Wirkung:** die Spitze fällt von 188 ms auf ~8–19 ms pro Frame (Batch-Größe ist `SAVED_LOAD_APPLY_LIGHTING_BATCH_PER_STEP` = 1 Chunk, gemessene Kosten ≈ 8–19 ms pro Chunk).
+
+**Was noch offen ist:** das Budget wird *vor* jedem Batch geprüft, ein einzelner Batch kann es also weiterhin überschreiten. Wirklich gedeckelt wäre die Removal-Reparatur erst, wenn sie wie der Added-Pfad über `begin_incremental_region_lighting_task` + `step_incremental_lighting_task` läuft (dort greifen `MAX_VOXELS_PER_STEP` und `STEP_BUDGET_MS` innerhalb eines Jobs). `lighting_on_chunks_removed` ist bisher One-Shot.
 
 ### D.2 — Der dokumentierte Lint-Befehl schlägt fehl
 
@@ -563,12 +581,22 @@ Clippy meldet das als `error: this loop never actually loops` — der einzige ec
 
 `CLAUDE.md` nennt `cargo clippy --all-targets -- -D warnings` als Lint-Kommando. Das schlägt aktuell fehl, und zwar aus zwei unabhängigen Gründen:
 
-1. **Ein echter Lint-Error:** `this loop never actually loops` (§D.1). Der bricht den Build schon ohne `-D warnings`.
-2. **Warning-Schulden:** ~109 Warnungen im Crate (`cargo check`), unter Clippy ~205. Ganz überwiegend `never used` für Konstanten, Felder und Methoden (`src/perf/allocation_tracker.rs` komplett, `stall_file_path`, `gpu_csv_path`, `note_gpu_wait`, diverse UI-Konstanten). Mit `-D warnings` ist jede davon fatal.
+1. ~~**Ein echter Lint-Error:** `this loop never actually loops` (§D.1). Der bricht den Build schon ohne `-D warnings`.~~ → **✅ behoben** mit §D.1. `cargo clippy --all-targets` läuft jetzt fehlerfrei durch (0 Errors, vorher 3).
+2. **Warning-Schulden:** ~109 Warnungen im Crate (`cargo check`), unter Clippy ~205. Ganz überwiegend `never used` für Konstanten, Felder und Methoden (`src/perf/allocation_tracker.rs` komplett, `stall_file_path`, `gpu_csv_path`, `note_gpu_wait`, diverse UI-Konstanten). Mit `-D warnings` ist jede davon fatal. **Noch offen.**
 
-Beides ist vorbestehend und unabhängig von den bisherigen Fixes — gegengeprüft gegen `8f7634d`: dort identische Fehlerzahl.
+Beides war vorbestehend und unabhängig von den Fixes — gegengeprüft gegen `8f7634d`: dort identische Fehlerzahl.
 
-**Fix:** §D.1 auflösen, dann die Dead-Code-Warnungen in einem eigenen Durchgang abräumen (löschen oder `#[allow(dead_code)]` mit Begründung dort, wo bewusst Vorrat gehalten wird — z. B. `allocation_tracker`, das erst mit dem jetzt deklarierten Feature nutzbar wird). Solange das offen ist, ist der Lint-Befehl in `CLAUDE.md` irreführend.
+**Rest-Fix:** die Dead-Code-Warnungen in einem eigenen Durchgang abräumen (löschen oder `#[allow(dead_code)]` mit Begründung dort, wo bewusst Vorrat gehalten wird — z. B. `allocation_tracker`, das erst mit dem jetzt deklarierten Feature nutzbar wird). Solange das offen ist, ist `-D warnings` in `CLAUDE.md` irreführend.
+
+### D.4 — Die oberste `tops`-Kategorie hatte keinen Unload-Bucket
+
+**Severity:** low (Instrumentierung) · **Status:** CONFIRMED · **Status: ✅ behoben**
+
+`format_stall_report` baut zwei Listen: eine grobe Kategorienliste (`tops=[…]`) und eine feine `proc.*`-Liste. Die feine Liste enthielt `proc.unload_chunks_outside_keep_radius` von Anfang an und hat den 188-ms-Posten auch korrekt ausgewiesen. Der **groben** Liste fehlte ein Unload-Bucket — und weil die vom Unload ausgelöste Removal-Reparatur in `rebuild_world_lighting_ms` landet, las sich der Frame als `tops=[lighting=188.0ms]`. Das zeigt auf das falsche Subsystem.
+
+**Fix:** eigener `unload`-Bucket in der Kategorienliste, und `take(3)` → `take(4)`, weil die Liste jetzt acht Einträge hat.
+
+> **Korrektur zu einer früheren Aussage von mir:** ich hatte behauptet, die `tops`-Liste führe Unload „gar nicht auf". Das stimmt so nicht — die `proc.*`-Liste tut es. Der eigentliche Grund, warum das Audit den Posten übersah: ich habe mich auf die `summary:`-Zeilen verlassen, die nur die Zähler *des einen* auslösenden Frames enthalten. Die 192.9-ms-Spitze im Vorlauf lag in einem anderen Frame und stand nur im Ring-Buffer. Für künftige Analysen: immer auch den Ring-Buffer nach den größten Scopes durchsuchen, nicht nur die Summary lesen.
 
 ---
 
@@ -650,8 +678,10 @@ Der Report oben ist die Analyse auf `8f7634d`. Diese Tabelle hält nach, was dav
 | §1.4 | Mesh-Job-Priority-Inversion | offen | |
 | §2.5 | `blocks_skylight` vs. `OcclusionShape` | offen | |
 | §5 (Rest) | Chunk-Mesh-Suballocation statt Buffer pro Layer | offen | |
-| §D.1 | `pump_removed_lighting_batches` bricht nach einem Batch ab | offen (Entscheidung) | |
-| §D.2 | Lint-Befehl aus `CLAUDE.md` schlägt fehl | offen | |
+| §D.1 | `pump_removed_lighting_batches` bricht nach einem Batch ab | ✅ behoben | working tree |
+| §D.2 | Lint-Befehl aus `CLAUDE.md` schlägt fehl | 🟡 Clippy-Errors weg, Warning-Schulden offen | working tree |
+| §D.3 | Chunk-Entladung repariert Lighting synchron (188 ms) | ✅ behoben | working tree |
+| §D.4 | `tops`-Kategorienliste ohne Unload-Bucket | ✅ behoben | working tree |
 
 ### Was konkret geändert wurde
 
@@ -674,6 +704,33 @@ Eine Falle dabei: `showing_pause_menu` wurde aus `menu_overlay_mesh.is_some()` a
 **§1.5 — `eprintln!` in Hot Paths.** Zwei Stellen mit Log-Evidenz:
 - `rebuild_lighting_for_snapshot` (`src/world/mod.rs`) emittierte **sechs** `eprintln!` pro Aufruf, auf einem Lighting-Worker-Thread, jedes mit prozessweitem stderr-Lock und eigenem `write(2)`. Jetzt ein einzelnes `record_duration_ms`-Event mit denselben Zahlen — kostet nichts, wenn Tracing aus ist.
 - Die Mesh-Upload-Zeile feuerte bei `created_buffers > 0`, also während des Streamings praktisch jeden Frame. Die Bedingung ist jetzt rein zeitbasiert; die Buffer-Zahl steht ohnehin in `frame_perf.mesh_gpu_buffers_created` und damit im Stall-Report.
+
+### Messlauf nach §1.1/§1.2 — `logs/run_1787160799_221`
+
+Erster Lauf mit dem neuen Tracing-Default. Belege:
+
+**Kein `trace.json`.** Der Vorlauf `run_1787146900_888` schrieb 558 MB, dieser Lauf null. Nur `stall.txt` + `gpu.csv`. §1.1 ist aktiv.
+
+**Chunk-Apply auf dem Main-Thread** (`pure_ms / applied` aus den `summary:`-Zeilen):
+
+| Lauf | applied | pure_ms | pro Chunk |
+|---|---|---|---|
+| `run_1773085075_183` | 1 | 100.9 | 100.9 ms |
+| `run_1781101083_106` | 3 | 312.9 | 104.3 ms |
+| `run_1779800309_641` | 17 | 201.4 | 11.8 ms |
+| `run_1773087313_576` | 3 | 20.9 | 7.0 ms |
+| `run_1773082954_380` | 9 | 21.5 | 2.4 ms |
+| **`run_1787160799_221`** | **25** | **12.7** | **0.51 ms** |
+
+Der neue Lauf appliziert 25 Chunks in 12.7 ms, wo die alten 1–17 Chunks für 17–313 ms brauchten. Faktor 5–200 je nach Vergleichslauf.
+
+**`cpu_render_ms`, session-weit** (`gpu.csv`, 10 018 bzw. 205 064 Frames): max **158.4 → 57.8 ms**, mean 5.23 → 4.46 ms. Der Median ist minimal schlechter (3.61 → 3.91 ms) — bei unterschiedlichen Sessions und Spielsituationen Rauschen, kein Signal.
+
+**Nicht belastbar:** ein Vergleich von `frame.total` aus den Ring-Buffern. Der Ring erfasst per Konstruktion nur die 10 Sekunden **um einen Stall herum**, in beiden Läufen aus verschiedenen Szenarien. Daraus lässt sich weder Verbesserung noch Verschlechterung ableiten.
+
+**Neuer Hauptverursacher:** §D.3 (Unload-Lighting, 188.6 ms) — vorbestehend, vorher vom Tracing-Overhead verdeckt.
+
+**Nebenbefund:** `lighting.chunk_finalized` meldet Latenzen von **100–113 Sekunden** von `provisional` bis `finalized`. Keine Frame-Kosten, aber ein Beleg dafür, wie weit die Finalisierung hinterherhinkt. Dass die Chunks trotzdem nicht dunkel bleiben, liegt am §2.3-Fix — sie werden schon bei `VisualReady` neu gemesht.
 
 ### Testlage
 
@@ -840,10 +897,13 @@ VERTICAL_VIEW_RADIUS_CHUNKS                  = 4
 4. ~~**§2.1 Provisorisches Skylight aus Heightmap**~~ — ✅ erledigt (Worldgen-Schätzung statt Heightmap).
 5. ~~**§5 GPU-Buffer pro Frame**~~ — ✅ erledigt für Overlays/Partikel/Precipitation.
 6. ~~**§1.5 `eprintln!` aus den Hot Paths**~~ — ✅ erledigt.
-7. **§6.1 Messung nachholen** — ein Lauf mit dem neuen Default (`ring`) und Vergleich der `stall.txt` gegen `logs/run_1787146900_888.stall.txt`. **Jetzt fällig:** sämtliche Zahlen im Report stammen von vor den Fixes, weiteres Tuning ohne neue Messung wäre geraten.
-8. **§2.2 Lighting auf den Worker-Pool** — strukturell; bisher nur die Budgets angehoben, der Pool ist weiter idle.
-9. **§1.4 Mesh-Job-Priority-Inversion** — größerer Umbau (bounded Channel + umsortierbare Pending-Queue), vorher messen.
-10. **§5 (Rest) Chunk-Mesh-Suballocation** — bis zu 6 Buffer pro Chunk, `next_power_of_two` verschwendet bis zu 2× VRAM.
-11. **§2.5 `blocks_skylight` aus `OcclusionShape` ableiten** — Contract-Bereinigung, braucht visuelle Prüfung.
-12. **§D.1 / §D.2** — Verhalten festlegen bzw. Lint-Schulden abtragen.
-13. **§1.3 Spin-Loop** — niedrige Priorität, läuft nur einmal im Ladebildschirm.
+7. ~~**§6.1 Messung nachholen**~~ — ✅ erledigt, siehe [Messlauf](#messlauf-nach-1112--logsrun_1787160799_221).
+8. ~~**§D.3 Unload-Lighting budgetieren**~~ + ~~**§D.1**~~ + ~~**§D.4**~~ — ✅ erledigt.
+9. **Messlauf wiederholen** — nach §D.3/§5/§1.5 erneut messen, bevor weiter getunt wird.
+10. **§D.3 (Rest) Removal-Lighting stufen** — `lighting_on_chunks_removed` ist One-Shot; erst über die Step-API ist ein einzelner Batch wirklich gedeckelt.
+11. **§2.2 Lighting auf den Worker-Pool** — strukturell; bisher nur die Budgets angehoben, der Pool ist weiter idle.
+12. **§1.4 Mesh-Job-Priority-Inversion** — größerer Umbau (bounded Channel + umsortierbare Pending-Queue), vorher messen.
+13. **§5 (Rest) Chunk-Mesh-Suballocation** — bis zu 6 Buffer pro Chunk, `next_power_of_two` verschwendet bis zu 2× VRAM.
+14. **§2.5 `blocks_skylight` aus `OcclusionShape` ableiten** — Contract-Bereinigung, braucht visuelle Prüfung.
+15. **§D.2 (Rest) Warning-Schulden** — damit `-D warnings` wieder benutzbar wird.
+16. **§1.3 Spin-Loop** — niedrige Priorität, läuft nur einmal im Ladebildschirm.
