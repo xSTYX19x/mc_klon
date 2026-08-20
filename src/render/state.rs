@@ -6523,7 +6523,7 @@ impl State {
             };
             sections.push(ColumnSaveSectionSnapshot {
                 cy,
-                blocks: Arc::clone(&chunk.blocks),
+                blocks: chunk.blocks.clone(),
                 data: Arc::clone(&chunk.block_data),
                 revision: chunk.revision,
             });
@@ -17414,7 +17414,7 @@ impl State {
                 let mut sky_open = top_is_open;
                 for y in (0..CHUNK_SIZE).rev() {
                     let idx = Chunk::index(x, y, z);
-                    let block = chunk.blocks[idx];
+                    let block = chunk.blocks.get(idx);
                     if block.blocks_skylight() {
                         sky_open = false;
                     }

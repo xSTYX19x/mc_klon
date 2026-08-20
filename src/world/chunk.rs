@@ -6,7 +6,7 @@ use super::CHUNK_SIZE;
 
 #[derive(Debug)]
 pub(crate) struct Chunk {
-    pub(crate) blocks: Arc<Vec<BlockId>>,
+    pub(crate) blocks: ChunkBlocks,
     pub(crate) block_data: Arc<Vec<u8>>,
     pub(crate) light: Arc<Vec<u8>>, // packed nibbles: high=sky, low=block
     pub(crate) revision: u64,
@@ -45,7 +45,9 @@ impl Chunk {
 
     pub(crate) fn new_empty() -> Self {
         Self {
-            blocks: Arc::new(vec![BlockId::Air; Self::BLOCK_COUNT]),
+            // Starts flat: this exists to be written into immediately, so
+            // compacting here would only cost a copy-on-write materialize.
+            blocks: ChunkBlocks::flat(vec![BlockId::Air; Self::BLOCK_COUNT]),
             block_data: Arc::new(vec![0; Self::BLOCK_COUNT]),
             light: Arc::new(vec![0; Self::BLOCK_COUNT]),
             revision: 0,
@@ -55,7 +57,7 @@ impl Chunk {
     }
 
     pub(crate) fn from_parts(
-        blocks: Arc<Vec<BlockId>>,
+        blocks: ChunkBlocks,
         block_data: Arc<Vec<u8>>,
         light: Arc<Vec<u8>>,
         revision: u64,
@@ -76,7 +78,7 @@ impl Chunk {
     }
 
     pub(crate) fn from_parts_readonly(
-        blocks: Arc<Vec<BlockId>>,
+        blocks: ChunkBlocks,
         block_data: Arc<Vec<u8>>,
         light: Arc<Vec<u8>>,
         revision: u64,
@@ -95,7 +97,7 @@ impl Chunk {
     }
 
     pub(crate) fn from_generated_parts(
-        blocks: Arc<Vec<BlockId>>,
+        blocks: ChunkBlocks,
         block_data: Arc<Vec<u8>>,
         filled_voxel_count: u16,
         solid_voxel_count: u16,
@@ -122,7 +124,7 @@ impl Chunk {
 
     pub(crate) fn get(&self, x: i32, y: i32, z: i32) -> BlockId {
         if Self::in_bounds(x, y, z) {
-            self.blocks[Self::index(x, y, z)]
+            self.blocks.get(Self::index(x, y, z))
         } else {
             BlockId::Air
         }
@@ -131,7 +133,7 @@ impl Chunk {
     pub(crate) fn set(&mut self, x: i32, y: i32, z: i32, id: BlockId) {
         if Self::in_bounds(x, y, z) {
             let i = Self::index(x, y, z);
-            let blocks = Arc::make_mut(&mut self.blocks);
+            let blocks = self.blocks.make_flat_mut();
             let old = blocks[i];
             if old != id {
                 blocks[i] = id;
@@ -221,7 +223,7 @@ impl Chunk {
     pub(crate) fn recompute_cached_block_classification(&mut self) {
         let mut filled = 0u16;
         let mut solid = 0u16;
-        for &block in self.blocks.iter() {
+        for block in self.blocks.iter() {
             if block.is_voxel_filled() {
                 filled = filled.saturating_add(1);
             }
@@ -244,34 +246,194 @@ fn shared_zero_block_data() -> &'static Arc<Vec<u8>> {
     ZERO_BLOCK_DATA.get_or_init(|| Arc::new(vec![0; Chunk::BLOCK_COUNT]))
 }
 
-fn shared_uniform_blocks(block: BlockId) -> Arc<Vec<BlockId>> {
-    static UNIFORM_BLOCKS: [OnceLock<Arc<Vec<BlockId>>>; 256] = [const { OnceLock::new() }; 256];
-    UNIFORM_BLOCKS[block.to_u8() as usize]
-        .get_or_init(|| Arc::new(vec![block; Chunk::BLOCK_COUNT]))
-        .clone()
+/// Bitpacked block storage for one chunk section.
+///
+/// Sections average 2.0 distinct block states, so a palette plus a few bits per
+/// voxel replaces the 4 KiB flat array with ~679 B (see the `memory_report` and
+/// `palette_probe` tests).
+#[derive(Clone, Debug)]
+pub(crate) struct PalettedBlocks {
+    palette: Vec<BlockId>,
+    bits: u8,
+    words: Vec<u64>,
 }
 
-/// Wraps a freshly built `blocks` buffer, collapsing single-block sections onto
-/// one shared allocation per block id.
-///
-/// About half of all stored sections hold exactly one block state — solid rock
-/// below the surface, mostly (measured, see the `memory_report` test). Those
-/// need no private array at all. Same copy-on-write contract as
-/// [`block_data_arc`]: the first edit inside such a section clones the buffer,
-/// so sharing is invisible to every reader and writer.
-///
-/// `Chunk::new_empty` deliberately keeps its own buffer — it exists to be filled
-/// immediately, so sharing would only add a copy-on-write memcpy.
-pub(crate) fn blocks_arc(blocks: Vec<BlockId>) -> Arc<Vec<BlockId>> {
-    debug_assert_eq!(blocks.len(), Chunk::BLOCK_COUNT);
-    if blocks.len() == Chunk::BLOCK_COUNT
-        && let Some(&first) = blocks.first()
-        && blocks.iter().all(|&block| block == first)
-    {
-        return shared_uniform_blocks(first);
+impl PalettedBlocks {
+    fn encode(blocks: &[BlockId]) -> Self {
+        debug_assert_eq!(blocks.len(), Chunk::BLOCK_COUNT);
+        let mut palette: Vec<BlockId> = Vec::with_capacity(8);
+        let mut index_of = [u16::MAX; 256];
+        let mut indices = Vec::with_capacity(blocks.len());
+        for &block in blocks {
+            let slot = &mut index_of[block.to_u8() as usize];
+            if *slot == u16::MAX {
+                *slot = palette.len() as u16;
+                palette.push(block);
+            }
+            indices.push(u32::from(*slot));
+        }
+
+        let bits = (usize::BITS - (palette.len().max(2) - 1).leading_zeros()).max(1) as u8;
+        let mut words = vec![0u64; Chunk::BLOCK_COUNT * bits as usize / 64];
+        for (i, &index) in indices.iter().enumerate() {
+            let bit = i * bits as usize;
+            words[bit / 64] |= u64::from(index) << (bit % 64);
+        }
+        Self {
+            palette,
+            bits,
+            words,
+        }
     }
-    Arc::new(blocks)
+
+    #[inline(always)]
+    fn get(&self, voxel: usize) -> BlockId {
+        let bit = voxel * self.bits as usize;
+        let mask = (1u64 << self.bits) - 1;
+        let raw = (self.words[bit / 64] >> (bit % 64)) & mask;
+        self.palette[raw as usize]
+    }
+
+    fn decode_into(&self, dst: &mut [BlockId]) {
+        let mask = (1u64 << self.bits) - 1;
+        for (i, slot) in dst.iter_mut().enumerate() {
+            let bit = i * self.bits as usize;
+            let raw = (self.words[bit / 64] >> (bit % 64)) & mask;
+            *slot = self.palette[raw as usize];
+        }
+    }
+
+    #[cfg(test)]
+    fn heap_bytes(&self) -> usize {
+        self.palette.len() + self.words.len() * 8
+    }
 }
+
+/// How a chunk's blocks are stored.
+///
+/// Generated and loaded chunks land in the compact variants; anything that
+/// mutates falls back to [`ChunkBlocks::Flat`], which behaves exactly as the
+/// plain `Arc<Vec<BlockId>>` this replaced. A chunk therefore stays compact
+/// until it is actually edited, and edited chunks keep today's write speed.
+///
+/// Read costs, measured in `palette_probe`: a bulk `decode_into` (what the
+/// mesher's padded staging buffer needs) costs +3.6 us per mesh job, 0.03 % of
+/// a mesh pass. A random single-voxel `get` costs +30 % at realistic resident
+/// size — which is why `World::build_lighting_snapshot` decodes to flat once
+/// rather than letting the light BFS pay it per read.
+#[derive(Clone, Debug)]
+pub(crate) enum ChunkBlocks {
+    /// One block for the whole section — about half of all stored sections.
+    /// Costs no heap at all, which beats even a shared flat buffer.
+    Uniform(BlockId),
+    Paletted(Arc<PalettedBlocks>),
+    Flat(Arc<Vec<BlockId>>),
+}
+
+impl ChunkBlocks {
+    /// Compacts a freshly built section. Use this on every path that produces a
+    /// finished chunk (worldgen, save loading); use [`ChunkBlocks::flat`] only
+    /// where the buffer is about to be written to.
+    pub(crate) fn compact(blocks: Vec<BlockId>) -> Self {
+        debug_assert_eq!(blocks.len(), Chunk::BLOCK_COUNT);
+        match blocks.first() {
+            Some(&first) if blocks.iter().all(|&block| block == first) => Self::Uniform(first),
+            Some(_) => Self::Paletted(Arc::new(PalettedBlocks::encode(&blocks))),
+            None => Self::Flat(Arc::new(blocks)),
+        }
+    }
+
+    pub(crate) fn flat(blocks: Vec<BlockId>) -> Self {
+        Self::Flat(Arc::new(blocks))
+    }
+
+    #[inline(always)]
+    pub(crate) fn get(&self, index: usize) -> BlockId {
+        match self {
+            Self::Uniform(block) => *block,
+            Self::Paletted(paletted) => paletted.get(index),
+            Self::Flat(blocks) => blocks[index],
+        }
+    }
+
+    /// Bulk unpack into a caller-owned buffer. `dst` must be exactly one
+    /// section long.
+    pub(crate) fn decode_into(&self, dst: &mut [BlockId]) {
+        debug_assert_eq!(dst.len(), Chunk::BLOCK_COUNT);
+        match self {
+            Self::Uniform(block) => dst.fill(*block),
+            Self::Paletted(paletted) => paletted.decode_into(dst),
+            Self::Flat(blocks) => dst.clone_from_slice(blocks),
+        }
+    }
+
+    /// Copies one contiguous run out, for callers staging partial faces.
+    pub(crate) fn copy_range_into(&self, start: usize, dst: &mut [BlockId]) {
+        match self {
+            Self::Uniform(block) => dst.fill(*block),
+            Self::Paletted(paletted) => {
+                for (offset, slot) in dst.iter_mut().enumerate() {
+                    *slot = paletted.get(start + offset);
+                }
+            }
+            Self::Flat(blocks) => dst.clone_from_slice(&blocks[start..start + dst.len()]),
+        }
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = BlockId> + '_ {
+        (0..self.len()).map(|index| self.get(index))
+    }
+
+    pub(crate) fn to_vec(&self) -> Vec<BlockId> {
+        let mut out = vec![BlockId::Air; Chunk::BLOCK_COUNT];
+        self.decode_into(&mut out);
+        out
+    }
+
+    /// Materializes into the flat variant and hands out the mutable buffer.
+    /// The chunk stays flat afterwards, so repeated edits cost what they
+    /// always did.
+    pub(crate) fn make_flat_mut(&mut self) -> &mut Vec<BlockId> {
+        if !matches!(self, Self::Flat(_)) {
+            *self = Self::Flat(Arc::new(self.to_vec()));
+        }
+        let Self::Flat(blocks) = self else {
+            unreachable!("just materialized to flat");
+        };
+        Arc::make_mut(blocks)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Uniform(_) | Self::Paletted(_) => Chunk::BLOCK_COUNT,
+            Self::Flat(blocks) => blocks.len(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Uniform(_) => 0,
+            Self::Paletted(paletted) => paletted.heap_bytes(),
+            Self::Flat(blocks) => blocks.len(),
+        }
+    }
+}
+
+impl PartialEq for ChunkBlocks {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Uniform(a), Self::Uniform(b)) => a == b,
+            (Self::Flat(a), Self::Flat(b)) => a == b,
+            // Representations are not canonical — the same section can arrive
+            // flat from an edit and paletted from a reload — so fall back to
+            // comparing contents rather than shapes.
+            _ => (0..self.len()).all(|i| self.get(i) == other.get(i)),
+        }
+    }
+}
+
+impl Eq for ChunkBlocks {}
 
 /// Wraps a freshly built `block_data` buffer, collapsing the all-zero case onto
 /// one shared allocation.
@@ -300,10 +462,14 @@ pub(crate) struct ChunkCoord {
 }
 
 #[cfg(test)]
-mod block_data_sharing_tests {
-    use super::{Chunk, block_data_arc, blocks_arc};
+mod block_storage_tests {
+    use super::{Chunk, ChunkBlocks, block_data_arc};
     use crate::blocks::BlockId;
     use std::sync::Arc;
+
+    fn flat_section(fill: BlockId) -> Vec<BlockId> {
+        vec![fill; Chunk::BLOCK_COUNT]
+    }
 
     #[test]
     fn all_zero_block_data_collapses_onto_one_allocation() {
@@ -325,51 +491,82 @@ mod block_data_sharing_tests {
     }
 
     #[test]
-    fn uniform_sections_share_one_buffer_per_block_id() {
-        let stone_a = blocks_arc(vec![BlockId::Stone; Chunk::BLOCK_COUNT]);
-        let stone_b = blocks_arc(vec![BlockId::Stone; Chunk::BLOCK_COUNT]);
-        let dirt = blocks_arc(vec![BlockId::Dirt; Chunk::BLOCK_COUNT]);
-        assert!(Arc::ptr_eq(&stone_a, &stone_b));
-        assert!(
-            !Arc::ptr_eq(&stone_a, &dirt),
-            "each block id needs its own shared buffer"
-        );
-        assert!(dirt.iter().all(|&block| block == BlockId::Dirt));
+    fn uniform_sections_cost_no_heap_at_all() {
+        let uniform = ChunkBlocks::compact(flat_section(BlockId::Stone));
+        assert!(matches!(uniform, ChunkBlocks::Uniform(BlockId::Stone)));
+        assert_eq!(uniform.heap_bytes(), 0);
+        assert_eq!(uniform.get(1234), BlockId::Stone);
+    }
 
-        let mut mixed = vec![BlockId::Stone; Chunk::BLOCK_COUNT];
-        mixed[Chunk::BLOCK_COUNT - 1] = BlockId::Dirt;
-        let mixed = blocks_arc(mixed);
+    #[test]
+    fn varied_sections_palette_and_round_trip_exactly() {
+        let mut blocks = flat_section(BlockId::Stone);
+        blocks[0] = BlockId::Dirt;
+        blocks[1] = BlockId::OakPlanks;
+        blocks[Chunk::BLOCK_COUNT - 1] = BlockId::Air;
+
+        let compact = ChunkBlocks::compact(blocks.clone());
+        assert!(matches!(compact, ChunkBlocks::Paletted(_)));
         assert!(
-            !Arc::ptr_eq(&stone_a, &mixed),
-            "a section with more than one block must own its buffer"
+            compact.heap_bytes() < Chunk::BLOCK_COUNT,
+            "paletted storage must be smaller than the flat array"
+        );
+        assert_eq!(compact.to_vec(), blocks);
+        for (index, &block) in blocks.iter().enumerate() {
+            assert_eq!(compact.get(index), block, "mismatch at {index}");
+        }
+
+        // Partial-range staging is what the meshing neighborhood uses.
+        let mut range = vec![BlockId::Air; 16];
+        compact.copy_range_into(0, &mut range);
+        assert_eq!(range, blocks[..16]);
+    }
+
+    #[test]
+    fn equality_compares_contents_not_representation() {
+        let blocks = flat_section(BlockId::Stone);
+        assert_eq!(
+            ChunkBlocks::compact(blocks.clone()),
+            ChunkBlocks::flat(blocks.clone()),
+            "a uniform and a flat section with the same contents are equal"
+        );
+
+        let mut other = blocks;
+        other[9] = BlockId::Dirt;
+        assert_ne!(
+            ChunkBlocks::compact(other.clone()),
+            ChunkBlocks::flat(flat_section(BlockId::Stone))
         );
     }
 
     #[test]
-    fn editing_a_uniform_section_copies_instead_of_corrupting_its_neighbours() {
+    fn editing_a_compact_section_materializes_without_touching_its_neighbours() {
         let mut first = Chunk::from_parts(
-            blocks_arc(vec![BlockId::Stone; Chunk::BLOCK_COUNT]),
+            ChunkBlocks::compact(flat_section(BlockId::Stone)),
             block_data_arc(vec![0; Chunk::BLOCK_COUNT]),
             Arc::new(vec![0; Chunk::BLOCK_COUNT]),
             0,
         );
         let second = Chunk::from_parts(
-            blocks_arc(vec![BlockId::Stone; Chunk::BLOCK_COUNT]),
+            ChunkBlocks::compact(flat_section(BlockId::Stone)),
             block_data_arc(vec![0; Chunk::BLOCK_COUNT]),
             Arc::new(vec![0; Chunk::BLOCK_COUNT]),
             0,
         );
-        assert!(Arc::ptr_eq(&first.blocks, &second.blocks));
 
         first.set(4, 5, 6, BlockId::Air);
 
+        assert!(
+            matches!(first.blocks, ChunkBlocks::Flat(_)),
+            "an edited section falls back to the flat array"
+        );
         assert_eq!(first.get(4, 5, 6), BlockId::Air);
         assert_eq!(
             second.get(4, 5, 6),
             BlockId::Stone,
-            "the shared uniform buffer must survive an edit in another section"
+            "the compact neighbour must be unaffected"
         );
-        // Cached voxel counts are per chunk, so they must not follow the sharing.
+        // Cached voxel counts are per chunk, so they must not follow the storage.
         assert_eq!(first.solid_voxel_count, Chunk::BLOCK_COUNT as u16 - 1);
         assert_eq!(second.solid_voxel_count, Chunk::BLOCK_COUNT as u16);
     }
@@ -377,13 +574,13 @@ mod block_data_sharing_tests {
     #[test]
     fn writing_block_data_copies_instead_of_corrupting_shared_sections() {
         let mut first = Chunk::from_parts(
-            Arc::new(vec![BlockId::Stone; Chunk::BLOCK_COUNT]),
+            ChunkBlocks::compact(flat_section(BlockId::Stone)),
             block_data_arc(vec![0; Chunk::BLOCK_COUNT]),
             Arc::new(vec![0; Chunk::BLOCK_COUNT]),
             0,
         );
         let second = Chunk::from_parts(
-            Arc::new(vec![BlockId::Stone; Chunk::BLOCK_COUNT]),
+            ChunkBlocks::compact(flat_section(BlockId::Stone)),
             block_data_arc(vec![0; Chunk::BLOCK_COUNT]),
             Arc::new(vec![0; Chunk::BLOCK_COUNT]),
             0,
@@ -399,84 +596,43 @@ mod block_data_sharing_tests {
             "make_mut must have copied; the shared zero buffer stays untouched"
         );
         assert!(!Arc::ptr_eq(&first.block_data, &second.block_data));
-        // The shared buffer itself must still be all zero for every future section.
-        let fresh = block_data_arc(vec![0; Chunk::BLOCK_COUNT]);
-        assert!(Arc::ptr_eq(&second.block_data, &fresh));
-        assert!(fresh.iter().all(|&value| value == 0));
     }
 }
 
-/// Sizes the in-memory chunk storage before the `BlockStateId` migration in
-/// `docs/TODO.md` touches every hot loop.
+/// Sizes the in-memory chunk storage and the cost of its compact form.
 ///
-/// The migration has two halves that are easy to conflate: merging
-/// `blocks` + `block_data` into one state id, and palette/bitpacking at
-/// runtime. They pay off very differently, and only one of them is worth the
-/// churn — the numbers below say which. Run with
-/// `cargo test world::chunk::memory_report -- --nocapture`.
+/// Both halves of the `docs/TODO.md` storage item are measured here: how much
+/// [`ChunkBlocks`] actually saves, and what its reads cost compared to a plain
+/// array. Run with
+/// `cargo test --release world::chunk::storage_report -- --nocapture`; timings
+/// from a debug build are meaningless.
 #[cfg(test)]
-mod memory_report {
-    use super::Chunk;
+mod storage_report {
+    use super::ChunkBlocks;
+    use crate::blocks::BlockId;
     use crate::world::{CHUNK_SIZE, World, WorldConfig};
     use crate::worldgen::WorldgenPreset;
-    use std::collections::HashSet;
+    use std::time::Instant;
 
     const VOXELS: usize = (CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE) as usize;
-    /// `blocks` (1 B/voxel) + `block_data` (1 B) + `light` (1 B).
-    const CURRENT_BYTES_PER_SECTION: usize = VOXELS * 3;
-
-    #[derive(Clone, Copy, Debug, Default)]
-    struct Stats {
-        sections: usize,
-        columns: usize,
-        block_ids: usize,
-        states: usize,
-        uniform_sections: usize,
-        zero_data_sections: usize,
-        packed_blocks: usize,
-        packed_states: usize,
-    }
-
-    fn bits_for(distinct: usize) -> usize {
-        let mut bits = 1;
-        while (1usize << bits) < distinct.max(2) {
-            bits += 1;
-        }
-        bits
-    }
-
-    /// Palette plus bitpacked indices, the representation the TODO's second
-    /// half proposes. Light stays a plain byte array either way.
-    fn packed_bytes(distinct: usize, entry_bytes: usize) -> usize {
-        distinct * entry_bytes + VOXELS * bits_for(distinct) / 8
-    }
-
-    fn measure(chunk: &Chunk, stats: &mut Stats) {
-        let mut block_ids: HashSet<u8> = HashSet::new();
-        let mut states: HashSet<u16> = HashSet::new();
-        let mut any_data = false;
-        for (i, &block) in chunk.blocks.iter().enumerate() {
-            let data = chunk.block_data[i];
-            any_data |= data != 0;
-            block_ids.insert(block.to_u8());
-            states.insert(u16::from(block.to_u8()) << 8 | u16::from(data));
-        }
-
-        stats.sections += 1;
-        stats.block_ids += block_ids.len();
-        stats.states += states.len();
-        stats.uniform_sections += usize::from(states.len() == 1);
-        stats.zero_data_sections += usize::from(!any_data);
-        stats.packed_blocks += packed_bytes(block_ids.len(), 1);
-        stats.packed_states += packed_bytes(states.len(), 2);
-    }
 
     fn mib(bytes: usize) -> f64 {
         bytes as f64 / (1024.0 * 1024.0)
     }
 
+    fn generated_sections(preset: WorldgenPreset) -> Vec<Vec<BlockId>> {
+        let mut world = World::new();
+        world.configure_world_config(WorldConfig::default(), preset);
+        for cx in 0..4 {
+            for cz in 0..4 {
+                world.ensure_column_generated(cx * CHUNK_SIZE, cz * CHUNK_SIZE);
+            }
+        }
+        world.chunks.values().map(|c| c.blocks.to_vec()).collect()
+    }
+
     #[test]
-    fn memory_report() {
+    fn storage_report() {
         let presets = [
             ("flatish", WorldgenPreset::Flatish),
             ("classic_flatter", WorldgenPreset::ClassicFlatter),
@@ -484,115 +640,156 @@ mod memory_report {
             ("hilly", WorldgenPreset::Hilly),
         ];
 
-        let mut all = Stats::default();
+        let mut all_sections = 0usize;
+        let mut all_uniform = 0usize;
+        let mut all_bytes = 0usize;
+
         println!(
-            "\n{:<16} {:>5} {:>9} {:>8} {:>8} {:>7} {:>9} {:>9}",
-            "preset", "secs", "secs/col", "ids/sec", "states", "uniform", "cur B/sec", "packed"
+            "\n{:<16} {:>6} {:>9} {:>12} {:>10}",
+            "preset", "secs", "uniform", "flat B/sec", "compact"
         );
-
         for (label, preset) in presets {
-            let mut world = World::new();
-            world.configure_world_config(WorldConfig::default(), preset);
-            let mut stats = Stats::default();
+            let sections = generated_sections(preset);
+            let compact: Vec<ChunkBlocks> = sections
+                .iter()
+                .map(|blocks| ChunkBlocks::compact(blocks.clone()))
+                .collect();
+            let uniform = compact
+                .iter()
+                .filter(|b| matches!(b, ChunkBlocks::Uniform(_)))
+                .count();
+            let bytes: usize = compact.iter().map(ChunkBlocks::heap_bytes).sum();
 
-            for cx in 0..4 {
-                for cz in 0..4 {
-                    world.ensure_column_generated(cx * CHUNK_SIZE + 512, cz * CHUNK_SIZE - 512);
-                    stats.columns += 1;
-                }
-            }
-            for chunk in world.chunks.values() {
-                measure(chunk, &mut stats);
+            // Every representation must decode back to exactly what went in.
+            for (blocks, stored) in sections.iter().zip(&compact) {
+                assert_eq!(&stored.to_vec(), blocks, "{label}: round trip must be exact");
             }
 
-            let secs = stats.sections.max(1);
             println!(
-                "{:<16} {:>5} {:>9.1} {:>8.1} {:>8.1} {:>6.0}% {:>9} {:>9.0}",
+                "{:<16} {:>6} {:>8.0}% {:>12} {:>10.0}",
                 label,
-                stats.sections,
-                stats.sections as f64 / stats.columns.max(1) as f64,
-                stats.block_ids as f64 / secs as f64,
-                stats.states as f64 / secs as f64,
-                stats.uniform_sections as f64 * 100.0 / secs as f64,
-                CURRENT_BYTES_PER_SECTION,
-                stats.packed_blocks as f64 / secs as f64,
+                sections.len(),
+                uniform as f64 * 100.0 / sections.len().max(1) as f64,
+                VOXELS,
+                bytes as f64 / sections.len().max(1) as f64,
             );
 
-            all.sections += stats.sections;
-            all.columns += stats.columns;
-            all.block_ids += stats.block_ids;
-            all.states += stats.states;
-            all.uniform_sections += stats.uniform_sections;
-            all.zero_data_sections += stats.zero_data_sections;
-            all.packed_blocks += stats.packed_blocks;
-            all.packed_states += stats.packed_states;
+            all_sections += sections.len();
+            all_uniform += uniform;
+            all_bytes += bytes;
         }
 
-        let secs = all.sections.max(1);
-        let sections_per_column = all.sections as f64 / all.columns.max(1) as f64;
+        let per_section = all_bytes as f64 / all_sections.max(1) as f64;
         println!(
-            "\ntotals: {} sections over {} columns ({:.1} non-empty sections/column), {:.0}% carry only zero block_data",
-            all.sections,
-            all.columns,
-            sections_per_column,
-            all.zero_data_sections as f64 * 100.0 / secs as f64,
+            "\ntotals: {} sections, {:.0}% uniform, {:.0} B/section ({:.1}x smaller than flat)",
+            all_sections,
+            all_uniform as f64 * 100.0 / all_sections.max(1) as f64,
+            per_section,
+            VOXELS as f64 / per_section.max(1.0),
         );
 
-        // Per-section averages for the three candidate layouts.
-        let cur_blocks = VOXELS;
-        let cur_pair = VOXELS * 2;
-        let merged_state = VOXELS * 2; // one u16 BlockStateId per voxel
-        let packed_blocks = all.packed_blocks / secs;
-        let packed_states = all.packed_states / secs;
-        println!(
-            "per section: blocks+data now {} B | merged u16 BlockStateId {} B ({:+.0} B) | palette blocks {} B | palette states {} B",
-            cur_pair,
-            merged_state,
-            merged_state as f64 - cur_pair as f64,
-            packed_blocks,
-            packed_states,
-        );
-
-        // Resident-memory projection. Sections are only stored when non-empty,
-        // so scale by the measured non-empty rate rather than world height.
-        // `block_data_arc` and `blocks_arc` collapse all-zero data and
-        // single-block sections onto shared buffers, so only sections that are
-        // actually varied still pay for a private array.
-        let non_zero_rate = 1.0 - all.zero_data_sections as f64 / secs as f64;
-        let varied_rate = 1.0 - all.uniform_sections as f64 / secs as f64;
-        println!("\nresident block storage (light excluded):");
+        // Resident-memory projection. Only non-empty sections are stored, so
+        // scale by the measured non-empty rate rather than world height.
+        let sections_per_column = all_sections as f64 / (4 * 4 * presets.len()) as f64;
+        println!("\nresident block storage (block_data and light excluded):");
         for (label, view) in [("Normal", 8i32), ("Far", 12), ("Extreme", 16), ("Insane", 32)] {
             let columns = ((view * 2 + 1) * (view * 2 + 1)) as f64;
             let sections = (columns * sections_per_column) as usize;
-            let before = sections * cur_pair;
-            let shipped = (sections as f64 * varied_rate) as usize * cur_blocks
-                + (sections as f64 * non_zero_rate) as usize * cur_blocks;
-            let merged = sections * merged_state;
-            let packed = sections * packed_states;
             println!(
-                "  {:<8} view {:>2} -> {:>6} sections | before {:>7.1} MiB | shared buffers {:>7.1} MiB | merged u16 {:>7.1} MiB | palette states {:>7.1} MiB",
+                "  {:<8} view {:>2} -> {:>6} sections | flat {:>7.1} MiB | compact {:>7.1} MiB",
                 label,
                 view,
                 sections,
-                mib(before),
-                mib(shipped),
-                mib(merged),
-                mib(packed),
+                mib(sections * VOXELS),
+                mib((sections as f64 * per_section) as usize),
             );
         }
-        println!();
 
-        // Guard the premise, not the numbers: if sections ever stop being
-        // low-entropy, palette compression stops being the obvious win and the
-        // migration needs re-measuring before anyone starts it.
-        let states_per_section = all.states as f64 / secs as f64;
         assert!(
-            states_per_section < 32.0,
-            "sections now average {states_per_section:.1} distinct block states; re-measure the storage migration"
+            per_section < VOXELS as f64 / 2.0,
+            "compact storage lost its advantage: {per_section:.0} B/section"
         );
-        assert!(
-            all.packed_states < all.sections * cur_pair,
-            "palette-packing must be smaller than the two plain arrays"
+    }
+
+    #[test]
+    fn read_cost_report() {
+        let sections = generated_sections(WorldgenPreset::Hilly);
+        let flat: Vec<ChunkBlocks> = sections
+            .iter()
+            .map(|blocks| ChunkBlocks::flat(blocks.clone()))
+            .collect();
+        let compact: Vec<ChunkBlocks> = sections
+            .iter()
+            .map(|blocks| ChunkBlocks::compact(blocks.clone()))
+            .collect();
+
+        // Debug builds run this ~100x slower and their timings say nothing
+        // anyway; keep the round trip covered without stalling the suite.
+        let rounds = if cfg!(debug_assertions) { 2 } else { 200 };
+        let mut scratch = vec![BlockId::Air; VOXELS];
+
+        let bulk_ns = |storage: &[ChunkBlocks], scratch: &mut Vec<BlockId>| {
+            let start = Instant::now();
+            for _ in 0..rounds {
+                for stored in storage {
+                    stored.decode_into(scratch);
+                    std::hint::black_box(&scratch);
+                }
+            }
+            start.elapsed().as_nanos() as f64 / (rounds * storage.len()) as f64
+        };
+        let flat_bulk = bulk_ns(&flat, &mut scratch);
+        let compact_bulk = bulk_ns(&compact, &mut scratch);
+
+        // Scattered single reads at a realistic resident size — the pattern the
+        // light BFS uses, and the only one where the compact form costs.
+        let resident = 6857;
+        let big_flat: Vec<ChunkBlocks> = (0..resident)
+            .map(|i| ChunkBlocks::flat(sections[i % sections.len()].clone()))
+            .collect();
+        let big_compact: Vec<ChunkBlocks> = (0..resident)
+            .map(|i| ChunkBlocks::compact(sections[i % sections.len()].clone()))
+            .collect();
+        let probes: Vec<(usize, usize)> = {
+            let mut rng = 0x2545_F491_4F6C_DD1Du64;
+            (0..16384)
+                .map(|_| {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    ((rng as usize) % resident, ((rng >> 20) as usize) % VOXELS)
+                })
+                .collect()
+        };
+        let big_rounds = rounds.min(20);
+        let random_ns = |storage: &[ChunkBlocks]| {
+            let start = Instant::now();
+            for _ in 0..big_rounds {
+                let mut acc = 0u32;
+                for &(section, voxel) in &probes {
+                    acc = acc.wrapping_add(storage[section].get(voxel).to_u8() as u32);
+                }
+                std::hint::black_box(acc);
+            }
+            start.elapsed().as_nanos() as f64 / (big_rounds * probes.len()) as f64
+        };
+        let flat_random = random_ns(&big_flat);
+        let compact_random = random_ns(&big_compact);
+
+        println!(
+            "\nbulk decode into the meshing staging buffer: flat {:.2} us | compact {:.2} us ({:+.2} us per mesh job, {:.3} % of a 12.9 ms mesh pass)",
+            flat_bulk / 1000.0,
+            compact_bulk / 1000.0,
+            (compact_bulk - flat_bulk) / 1000.0,
+            (compact_bulk - flat_bulk) / 1000.0 / 12_900.0 * 100.0,
+        );
+        println!(
+            "random single-voxel read over {} sections ({:.1} MiB flat): flat {:.2} ns | compact {:.2} ns ({:+.0} %)\n",
+            resident,
+            mib(resident * VOXELS),
+            flat_random,
+            compact_random,
+            (compact_random - flat_random) / flat_random * 100.0,
         );
     }
 }

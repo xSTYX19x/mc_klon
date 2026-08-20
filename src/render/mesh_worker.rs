@@ -214,7 +214,7 @@ mod tests {
             .get_chunk(coord)
             .expect("missing center chunk for meshing snapshot");
         let center_snapshot = ChunkSnapshot {
-            blocks: Arc::clone(&center.blocks),
+            blocks: center.blocks.clone(),
             block_data: Arc::clone(&center.block_data),
             light: Arc::clone(&center.light),
         };
@@ -252,7 +252,7 @@ mod tests {
         ]
         .map(|neighbor_coord| {
             world.get_chunk(neighbor_coord).map(|chunk| ChunkSnapshot {
-                blocks: Arc::clone(&chunk.blocks),
+                blocks: chunk.blocks.clone(),
                 block_data: Arc::clone(&chunk.block_data),
                 light: Arc::clone(&chunk.light),
             })

@@ -105,7 +105,9 @@ impl ChunkColumn {
             let dst_end = dst_start + Self::LAYER_AREA;
             let src_start = (local_y as usize) * Self::LAYER_AREA;
             let src_end = src_start + Self::LAYER_AREA;
-            self.blocks[dst_start..dst_end].copy_from_slice(&chunk.blocks[src_start..src_end]);
+            chunk
+                .blocks
+                .copy_range_into(src_start, &mut self.blocks[dst_start..dst_end]);
             self.data[dst_start..dst_end].copy_from_slice(&chunk.block_data[src_start..src_end]);
         }
     }
@@ -115,7 +117,7 @@ impl ChunkColumn {
         if !(0..Self::chunk_count_y()).contains(&chunk_y) {
             return chunk;
         }
-        let blocks = std::sync::Arc::make_mut(&mut chunk.blocks);
+        let blocks = chunk.blocks.make_flat_mut();
         let data = std::sync::Arc::make_mut(&mut chunk.block_data);
 
         let base_world_y = chunk_y * CHUNK_SIZE;

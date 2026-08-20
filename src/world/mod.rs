@@ -27,7 +27,7 @@ pub(crate) mod ticking_areas;
 pub(crate) mod time;
 
 pub(crate) use block_access::BlockAccess;
-pub(crate) use chunk::{Chunk, ChunkCoord, LightLevel, block_data_arc, blocks_arc};
+pub(crate) use chunk::{Chunk, ChunkBlocks, ChunkCoord, LightLevel, block_data_arc};
 pub(crate) use config::WorldConfig;
 pub(crate) use environment::{PrecipitationKind, WorldEnvironment};
 pub(crate) use fluids::FluidKind;
@@ -410,7 +410,11 @@ pub(crate) struct BlockEntityBlockChange {
 
 #[derive(Clone)]
 pub(crate) struct SnapshotLightingChunk {
-    pub(crate) blocks: Arc<Vec<BlockId>>,
+    // Kept compact rather than decoded: the light BFS reads scattered single
+    // voxels, and at realistic resident size that is *faster* on the compact
+    // form than on flat arrays because the working set is ~10x smaller (see
+    // `read_cost_report`).
+    pub(crate) blocks: ChunkBlocks,
     pub(crate) block_data: Arc<Vec<u8>>,
     pub(crate) light: Vec<u8>,
     // Per local (x,z) column: highest local y that blocks skylight, or -1 if none.
@@ -451,7 +455,7 @@ impl SnapshotWorldLighting {
         let chunk_coord = World::world_to_chunk_coord(world_pos);
         let local = World::world_to_local(world_pos);
         self.chunks.get(&chunk_coord).map_or(BlockId::Air, |chunk| {
-            chunk.blocks[Chunk::index(local.x, local.y, local.z)]
+            chunk.blocks.get(Chunk::index(local.x, local.y, local.z))
         })
     }
 
@@ -1629,13 +1633,13 @@ fn snapshot_chunk_column_index(lx: i32, lz: i32) -> usize {
     (lx + lz * CHUNK_SIZE) as usize
 }
 
-fn build_snapshot_sky_blocker_top(blocks: &[BlockId]) -> [i16; 256] {
+fn build_snapshot_sky_blocker_top(blocks: &ChunkBlocks) -> [i16; 256] {
     let mut out = [-1i16; 256];
     for lz in 0..CHUNK_SIZE {
         for lx in 0..CHUNK_SIZE {
             let col_idx = snapshot_chunk_column_index(lx, lz);
             for ly in (0..CHUNK_SIZE).rev() {
-                if blocks[Chunk::index(lx, ly, lz)].blocks_skylight() {
+                if blocks.get(Chunk::index(lx, ly, lz)).blocks_skylight() {
                     out[col_idx] = ly as i16;
                     break;
                 }
@@ -1685,7 +1689,7 @@ impl LightEngine {
             }
 
             let chunk_base_y = coord.y * CHUNK_SIZE;
-            for (idx, &local_top) in build_snapshot_sky_blocker_top(chunk.blocks.as_slice())
+            for (idx, &local_top) in build_snapshot_sky_blocker_top(&chunk.blocks)
                 .iter()
                 .enumerate()
             {
@@ -2727,11 +2731,11 @@ impl World {
     pub(crate) fn build_lighting_snapshot(&self) -> SnapshotWorldLighting {
         let mut chunks = HashMap::with_capacity(self.chunks.len());
         for (&coord, chunk) in &self.chunks {
-            let sky_blocker_top = build_snapshot_sky_blocker_top(chunk.blocks.as_slice());
+            let sky_blocker_top = build_snapshot_sky_blocker_top(&chunk.blocks);
             chunks.insert(
                 coord,
                 SnapshotLightingChunk {
-                    blocks: Arc::clone(&chunk.blocks),
+                    blocks: chunk.blocks.clone(),
                     block_data: Arc::clone(&chunk.block_data),
                     light: vec![0; chunk.light.len()],
                     sky_blocker_top,

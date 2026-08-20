@@ -3,11 +3,11 @@ use std::sync::Arc;
 use glam::IVec3;
 
 use crate::blocks::BlockId;
-use crate::world::{BlockAccess, CHUNK_SIZE, Chunk, ChunkCoord};
+use crate::world::{BlockAccess, CHUNK_SIZE, Chunk, ChunkBlocks, ChunkCoord};
 
 #[derive(Clone)]
 pub(crate) struct ChunkSnapshot {
-    pub(crate) blocks: Arc<Vec<BlockId>>,
+    pub(crate) blocks: ChunkBlocks,
     pub(crate) block_data: Arc<Vec<u8>>,
     pub(crate) light: Arc<Vec<u8>>,
 }
@@ -151,7 +151,7 @@ impl MeshingNeighborhoodScratch {
         }
 
         let center_chunk = Chunk::from_parts_readonly(
-            snapshot.center.blocks,
+            snapshot.center.blocks.clone(),
             snapshot.center.block_data,
             snapshot.center.light,
             0,
@@ -225,7 +225,9 @@ fn copy_full_chunk(
             let dst = padded_index(dst_x, dst_y + y, dst_z + z);
             let src_end = src + CHUNK_SIZE as usize;
             let dst_end = dst + CHUNK_SIZE as usize;
-            blocks[dst..dst_end].clone_from_slice(&snapshot.blocks[src..src_end]);
+            snapshot
+                .blocks
+                .copy_range_into(src, &mut blocks[dst..dst_end]);
             block_data[dst..dst_end].copy_from_slice(&snapshot.block_data[src..src_end]);
             light[dst..dst_end].copy_from_slice(&snapshot.light[src..src_end]);
         }
@@ -244,7 +246,7 @@ fn copy_x_face(
         for z in 0..CHUNK_SIZE {
             let src = Chunk::index(src_x, y, z);
             let dst = padded_index(dst_x, y, z);
-            blocks[dst] = snapshot.blocks[src];
+            blocks[dst] = snapshot.blocks.get(src);
             block_data[dst] = snapshot.block_data[src];
             light[dst] = snapshot.light[src];
         }
@@ -264,7 +266,9 @@ fn copy_y_face(
         let dst = padded_index(0, dst_y, z);
         let src_end = src + CHUNK_SIZE as usize;
         let dst_end = dst + CHUNK_SIZE as usize;
-        blocks[dst..dst_end].clone_from_slice(&snapshot.blocks[src..src_end]);
+        snapshot
+            .blocks
+            .copy_range_into(src, &mut blocks[dst..dst_end]);
         block_data[dst..dst_end].copy_from_slice(&snapshot.block_data[src..src_end]);
         light[dst..dst_end].copy_from_slice(&snapshot.light[src..src_end]);
     }
@@ -283,7 +287,9 @@ fn copy_z_face(
         let dst = padded_index(0, y, dst_z);
         let src_end = src + CHUNK_SIZE as usize;
         let dst_end = dst + CHUNK_SIZE as usize;
-        blocks[dst..dst_end].clone_from_slice(&snapshot.blocks[src..src_end]);
+        snapshot
+            .blocks
+            .copy_range_into(src, &mut blocks[dst..dst_end]);
         block_data[dst..dst_end].copy_from_slice(&snapshot.block_data[src..src_end]);
         light[dst..dst_end].copy_from_slice(&snapshot.light[src..src_end]);
     }

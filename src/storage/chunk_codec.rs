@@ -33,7 +33,7 @@ use crate::perf::trace as perf_trace;
 use crate::storage::format::{
     COLUMN_PAYLOAD_FORMAT_VERSION, COLUMN_PAYLOAD_MAGIC, SECTION_BLOCK_COUNT,
 };
-use crate::world::{Chunk, ChunkCoord, World, block_data_arc, blocks_arc};
+use crate::world::{Chunk, ChunkBlocks, ChunkCoord, World, block_data_arc};
 
 const COLUMN_RESERVED0_V1: u16 = 0;
 const SECTION_FLAGS_V1: u8 = 0;
@@ -58,7 +58,7 @@ pub(crate) struct ColumnBlob {
 #[derive(Clone, Debug)]
 pub(crate) struct ColumnSaveSectionSnapshot {
     pub(crate) cy: i32,
-    pub(crate) blocks: Arc<Vec<BlockId>>,
+    pub(crate) blocks: ChunkBlocks,
     pub(crate) data: Arc<Vec<u8>>,
     pub(crate) revision: u64,
 }
@@ -292,7 +292,10 @@ pub(crate) fn encode_column(world: &World, cx: i32, cz: i32) -> io::Result<Vec<u
     }
 
     let block_registry = BlockRegistry::new();
-    let mut section_inputs = Vec::new();
+    // The encoder works on slices, so paletted sections are decoded once per
+    // saved column. Decoding is done up front because `section_inputs` borrows
+    // from it. Saving is background work, not a frame-path cost.
+    let mut decoded: Vec<(i32, Vec<BlockId>, &[u8])> = Vec::new();
     for cy in min_section_y..=max_section_y {
         let coord = ChunkCoord {
             x: cx,
@@ -302,17 +305,15 @@ pub(crate) fn encode_column(world: &World, cx: i32, cz: i32) -> io::Result<Vec<u
         let Some(chunk) = world.get_chunk(coord) else {
             continue;
         };
-        let mut any_non_air = false;
-        for &block in chunk.blocks.iter() {
-            any_non_air |= block != BlockId::Air;
-        }
-        section_inputs.push((
-            cy,
-            chunk.blocks.as_slice(),
-            chunk.block_data.as_slice(),
-            any_non_air,
-        ));
+        decoded.push((cy, chunk.blocks.to_vec(), chunk.block_data.as_slice()));
     }
+    let section_inputs = decoded
+        .iter()
+        .map(|(cy, blocks, data)| {
+            let any_non_air = blocks.iter().any(|&block| block != BlockId::Air);
+            (*cy, blocks.as_slice(), *data, any_non_air)
+        })
+        .collect();
 
     encode_column_from_sections(
         cx,
@@ -330,19 +331,25 @@ pub(crate) fn encode_column(world: &World, cx: i32, cz: i32) -> io::Result<Vec<u
 
 pub(crate) fn encode_column_snapshot(snapshot: &ColumnSaveSnapshot) -> io::Result<Vec<u8>> {
     let block_registry = BlockRegistry::new();
-    let mut section_inputs = Vec::with_capacity(snapshot.sections.len());
-    for section in &snapshot.sections {
-        let mut any_non_air = false;
-        for &block in section.blocks.iter() {
-            any_non_air |= block != BlockId::Air;
-        }
-        section_inputs.push((
-            section.cy,
-            section.blocks.as_slice(),
-            section.data.as_slice(),
-            any_non_air,
-        ));
-    }
+    // Same decode-up-front reason as `encode_column`: the inputs borrow slices.
+    let decoded: Vec<(i32, Vec<BlockId>, &[u8])> = snapshot
+        .sections
+        .iter()
+        .map(|section| {
+            (
+                section.cy,
+                section.blocks.to_vec(),
+                section.data.as_slice(),
+            )
+        })
+        .collect();
+    let section_inputs = decoded
+        .iter()
+        .map(|(cy, blocks, data)| {
+            let any_non_air = blocks.iter().any(|&block| block != BlockId::Air);
+            (*cy, blocks.as_slice(), *data, any_non_air)
+        })
+        .collect();
     encode_column_from_sections(
         snapshot.cx,
         snapshot.cz,
@@ -709,7 +716,7 @@ pub(crate) fn decode_chunk_from_section_blob(
     }
 
     Ok(Some(Chunk::from_parts(
-        blocks_arc(blocks),
+        ChunkBlocks::compact(blocks),
         block_data_arc(data_bytes),
         Arc::new(vec![0; SECTION_BLOCK_COUNT]),
         0,

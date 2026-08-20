@@ -104,7 +104,7 @@ impl WorldgenPipeline {
     }
 
     pub fn generate_chunk(&self, seed: u64, coord: ChunkCoord, out: &mut Chunk) {
-        Arc::make_mut(&mut out.blocks).fill(BlockId::Air);
+        out.blocks.make_flat_mut().fill(BlockId::Air);
         Arc::make_mut(&mut out.block_data).fill(0);
 
         let chunk_world_y0 = coord.y * CHUNK_SIZE;
@@ -200,7 +200,7 @@ impl WorldgenPipeline {
             }
         }
 
-        let out_blocks = Arc::make_mut(&mut out.blocks);
+        let out_blocks = out.blocks.make_flat_mut();
         for local_z in 0..CHUNK_SIZE {
             let world_z = coord.z * CHUNK_SIZE + local_z;
             for local_x in 0..CHUNK_SIZE {
@@ -325,7 +325,8 @@ mod tests {
             fallback_pipeline.generate_chunk(seed, coord, &mut fallback_chunk);
 
             assert_eq!(
-                &*fast_chunk.blocks, &*fallback_chunk.blocks,
+                fast_chunk.blocks.to_vec(),
+                fallback_chunk.blocks.to_vec(),
                 "block mismatch at {:?}",
                 coord
             );
