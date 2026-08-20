@@ -12,6 +12,8 @@ use winit::{
     window::{Window, WindowId},
 };
 
+use std::path::PathBuf;
+
 use crate::blocks::{BlockId, CLASSIC_PALETTE};
 use crate::camera::{Camera, ViewBobbing};
 use crate::commands::{self, Command};
@@ -29,6 +31,7 @@ use crate::render::state::{
     pause_menu_item_at_pos_px,
 };
 use crate::settings::{AppSettings, InputAction, SettingsScope, keycode_label};
+use crate::storage::world_meta;
 use crate::world::ticking_areas::{TICKING_AREA_MAX_RADIUS_CHUNKS, TickingArea, TickingFlags};
 use crate::world::{FluidKind, World, WorldEnvironment};
 use crate::worldgen::ClassicLevelSize;
@@ -131,6 +134,7 @@ enum GameState {
         selected: usize,
     },
     Options(OptionsMenuState),
+    WorldActions(WorldActionsMenuState),
     TickingAreas(TickingAreaMenuState),
     Inventory {
         selected_palette: usize,
@@ -143,16 +147,17 @@ enum GameState {
 /// One node in the menu navigation stack. Carries just enough to re-enter a
 /// screen; the screen's live data (world list, area snapshot, ...) is rebuilt on
 /// restore so it never goes stale while sitting on the stack.
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 enum MenuScreen {
     MainMenu,
     PauseMenu,
     LoadLevel,
+    WorldActions(PathBuf),
     Options(OptionsScreen),
     TickingAreas(TickingAreaScreen),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct MenuStackEntry {
     screen: MenuScreen,
     selected: usize,
@@ -204,6 +209,27 @@ struct OptionsMenuState {
     status_line: Option<String>,
     /// Armed by the first activation of a reset row; the second activation performs it.
     pending_reset: Option<SettingsScope>,
+}
+
+const WORLD_ACTION_ROW_LOAD: usize = 0;
+const WORLD_ACTION_ROW_RENAME: usize = 1;
+const WORLD_ACTION_ROW_DELETE: usize = 2;
+const WORLD_ACTION_ROW_BACK: usize = 3;
+const WORLD_ACTION_ROW_COUNT: usize = 4;
+
+/// Per-world management screen reached from the load-level list.
+struct WorldActionsMenuState {
+    save_root: PathBuf,
+    display_name: String,
+    details: String,
+    is_active: bool,
+    can_delete: bool,
+    selected: usize,
+    status_line: Option<String>,
+    /// Armed by the first activation of the delete row; the second one performs it.
+    pending_delete: bool,
+    /// `Some` while the rename text box has focus; swallows menu navigation keys.
+    rename_input: Option<String>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -426,6 +452,7 @@ impl App {
             GameState::Paused { .. } => Some(MenuScreen::PauseMenu),
             GameState::LoadLevelMenu { .. } => Some(MenuScreen::LoadLevel),
             GameState::Options(options) => Some(MenuScreen::Options(options.screen)),
+            GameState::WorldActions(menu) => Some(MenuScreen::WorldActions(menu.save_root.clone())),
             GameState::TickingAreas(menu) => Some(MenuScreen::TickingAreas(menu.screen)),
             _ => None,
         }
@@ -435,7 +462,11 @@ impl App {
     /// loaded or not), which drives the panorama background and pause handling.
     fn menu_root_screen(&self) -> Option<MenuScreen> {
         let current = self.current_menu_screen()?;
-        Some(self.nav_stack.first().map_or(current, |entry| entry.screen))
+        Some(
+            self.nav_stack
+                .first()
+                .map_or(current, |entry| entry.screen.clone()),
+        )
     }
 
     fn is_main_menu(&self) -> bool {
@@ -932,6 +963,51 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// Rebuilds the per-world screen from the on-disk listing so a stale entry
+    /// (renamed or deleted elsewhere) cannot offer actions on a missing world.
+    fn build_world_actions_state(
+        &self,
+        save_root: PathBuf,
+        selected: usize,
+    ) -> WorldActionsMenuState {
+        let summary = self.state.as_ref().and_then(|state| {
+            state
+                .list_saved_worlds()
+                .into_iter()
+                .find(|world| world.save_root == save_root)
+        });
+        match summary {
+            Some(summary) => {
+                let is_active = summary.is_active;
+                WorldActionsMenuState {
+                    can_delete: !is_active && !State::is_default_save_root(&summary.save_root),
+                    display_name: summary.display_name,
+                    details: summary.details,
+                    is_active,
+                    save_root: summary.save_root,
+                    selected,
+                    status_line: None,
+                    pending_delete: false,
+                    rename_input: None,
+                }
+            }
+            None => WorldActionsMenuState {
+                display_name: save_root
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| save_root.display().to_string()),
+                details: String::new(),
+                is_active: false,
+                can_delete: false,
+                save_root,
+                selected,
+                status_line: Some("This world is no longer available.".to_string()),
+                pending_delete: false,
+                rename_input: None,
+            },
+        }
+    }
+
     /// Descends one level: remembers the current screen (and its highlighted
     /// row) on the stack, then shows `screen` with its first row selected.
     fn push_menu_screen(&mut self, screen: MenuScreen) {
@@ -992,6 +1068,9 @@ impl App {
                 status_line: None,
                 pending_reset: None,
             }),
+            MenuScreen::WorldActions(save_root) => {
+                GameState::WorldActions(self.build_world_actions_state(save_root, entry.selected))
+            }
             MenuScreen::TickingAreas(screen) => {
                 let areas = self
                     .state
@@ -1021,6 +1100,7 @@ impl App {
             GameState::Paused { .. } => PAUSE_MENU_ITEMS.len(),
             GameState::LoadLevelMenu { worlds, .. } => worlds.len().max(1) + 1,
             GameState::Options(options) => options.screen.item_count(),
+            GameState::WorldActions(_) => WORLD_ACTION_ROW_COUNT,
             GameState::TickingAreas(menu) => menu.item_count(),
             _ => 0,
         }
@@ -1032,6 +1112,7 @@ impl App {
             GameState::Paused { selected } => Some(*selected),
             GameState::LoadLevelMenu { selected, .. } => Some(*selected),
             GameState::Options(options) => Some(options.selected),
+            GameState::WorldActions(menu) => Some(menu.selected),
             GameState::TickingAreas(menu) => Some(menu.selected),
             _ => None,
         }
@@ -1050,6 +1131,12 @@ impl App {
                 }
                 options.selected = selected;
             }
+            GameState::WorldActions(menu) => {
+                if menu.selected != selected {
+                    menu.pending_delete = false;
+                }
+                menu.selected = selected;
+            }
             GameState::TickingAreas(menu) => {
                 if menu.selected != selected {
                     menu.pending_delete = None;
@@ -1063,6 +1150,7 @@ impl App {
     fn clear_pending_reset(&mut self) {
         match &mut self.game_state {
             GameState::Options(options) => options.pending_reset = None,
+            GameState::WorldActions(menu) => menu.pending_delete = false,
             GameState::TickingAreas(menu) => menu.pending_delete = None,
             _ => {}
         }
@@ -1258,25 +1346,195 @@ impl App {
         }
     }
 
-    fn activate_load_level_menu_selected(&mut self) {
-        let save_root = match &self.game_state {
+    fn selected_saved_world_root(&self) -> Option<PathBuf> {
+        match &self.game_state {
             GameState::LoadLevelMenu { selected, worlds } => worlds
                 .get(*selected)
                 .map(|entry| entry.summary.save_root.clone()),
+            _ => None,
+        }
+    }
+
+    fn activate_load_level_menu_selected(&mut self) {
+        let Some(save_root) = self.selected_saved_world_root() else {
+            // The "Back" row (and the empty-list placeholder) land here.
+            self.pop_menu_screen();
+            return;
+        };
+        self.push_menu_screen(MenuScreen::WorldActions(save_root));
+    }
+
+    fn activate_world_action_selected(&mut self) {
+        let GameState::WorldActions(menu) = &self.game_state else {
+            return;
+        };
+        if menu.rename_input.is_some() {
+            return;
+        }
+        let selected = menu.selected;
+        let save_root = menu.save_root.clone();
+
+        match selected {
+            WORLD_ACTION_ROW_LOAD => self.load_selected_world(save_root),
+            WORLD_ACTION_ROW_RENAME => {
+                if let GameState::WorldActions(menu) = &mut self.game_state {
+                    menu.rename_input = Some(menu.display_name.clone());
+                    menu.pending_delete = false;
+                    menu.status_line =
+                        Some("Type a new name. Enter confirms, Escape cancels.".to_string());
+                }
+            }
+            WORLD_ACTION_ROW_DELETE => self.activate_world_delete(save_root),
+            _ => {
+                self.pop_menu_screen();
+            }
+        }
+    }
+
+    /// Two-step delete, same confirmation pattern as the options reset.
+    fn activate_world_delete(&mut self, save_root: PathBuf) {
+        let (armed, can_delete, is_active) = match &self.game_state {
+            GameState::WorldActions(menu) => (menu.pending_delete, menu.can_delete, menu.is_active),
             _ => return,
         };
 
-        if save_root.is_none() {
-            self.pop_menu_screen();
+        if !can_delete {
+            let reason = if is_active {
+                "Cannot delete the world that is loaded. Load another world first."
+            } else {
+                "Cannot delete the main save directory."
+            };
+            if let GameState::WorldActions(menu) = &mut self.game_state {
+                menu.pending_delete = false;
+                menu.status_line = Some(reason.to_string());
+            }
             return;
         }
 
+        if !armed {
+            if let GameState::WorldActions(menu) = &mut self.game_state {
+                menu.pending_delete = true;
+                menu.status_line =
+                    Some("Delete this world permanently? Activate again to confirm.".to_string());
+            }
+            return;
+        }
+
+        let result = self
+            .state
+            .as_mut()
+            .map(|state| state.delete_saved_world(&save_root));
+        match result {
+            Some(Ok(())) => {
+                // Back to the list, which `show_menu_screen` rebuilds from disk.
+                self.pop_menu_screen();
+                if let GameState::LoadLevelMenu { .. } = &self.game_state {
+                    crate::console_info!("Deleted world {}", save_root.display());
+                }
+            }
+            Some(Err(err)) => {
+                if let GameState::WorldActions(menu) = &mut self.game_state {
+                    menu.pending_delete = false;
+                    menu.status_line = Some(format!("Delete failed: {err}"));
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn commit_world_rename(&mut self) {
+        let (save_root, raw) = match &self.game_state {
+            GameState::WorldActions(menu) => match &menu.rename_input {
+                Some(raw) => (menu.save_root.clone(), raw.clone()),
+                None => return,
+            },
+            _ => return,
+        };
+
+        let result = self
+            .state
+            .as_mut()
+            .map(|state| state.rename_saved_world(&save_root, &raw));
+        let GameState::WorldActions(menu) = &mut self.game_state else {
+            return;
+        };
+        match result {
+            Some(Ok((new_root, moved))) => {
+                menu.rename_input = None;
+                menu.display_name = raw.trim().to_string();
+                menu.save_root = new_root;
+                menu.status_line = Some(if moved {
+                    format!("Renamed to '{}'.", menu.display_name)
+                } else {
+                    format!(
+                        "Renamed to '{}' (save folder unchanged).",
+                        menu.display_name
+                    )
+                });
+            }
+            Some(Err(err)) => {
+                menu.status_line = Some(format!("Rename failed: {err}"));
+            }
+            None => {
+                menu.rename_input = None;
+            }
+        }
+    }
+
+    /// Keyboard handling while the rename text box has focus. Returns true when
+    /// the key was consumed so menu navigation never sees it.
+    fn handle_world_rename_key(&mut self, code: Option<KeyCode>, text: Option<&str>) -> bool {
+        let GameState::WorldActions(menu) = &mut self.game_state else {
+            return false;
+        };
+        if menu.rename_input.is_none() {
+            return false;
+        }
+        match code {
+            Some(KeyCode::Escape) => {
+                menu.rename_input = None;
+                menu.status_line = Some("Rename cancelled.".to_string());
+                return true;
+            }
+            Some(KeyCode::Enter | KeyCode::NumpadEnter) => {
+                self.commit_world_rename();
+                return true;
+            }
+            Some(KeyCode::Backspace) => {
+                if let Some(input) = menu.rename_input.as_mut() {
+                    input.pop();
+                }
+                return true;
+            }
+            _ => {}
+        }
+        if let Some(text) = text
+            && let Some(input) = menu.rename_input.as_mut()
+        {
+            for ch in text.chars().filter(|ch| !ch.is_control()) {
+                if input.chars().count() >= world_meta::WORLD_NAME_MAX_LEN {
+                    break;
+                }
+                input.push(ch);
+            }
+        }
+        // Swallow everything while typing, so Space/WASD do not navigate the menu.
+        true
+    }
+
+    fn load_selected_world(&mut self, save_root: PathBuf) {
         let Some(state) = self.state.as_mut() else {
             return;
         };
-        match state.begin_load_world(save_root.expect("save_root already checked")) {
+        match state.begin_load_world(save_root) {
             Ok(()) => self.enter_world_loading_screen("Loading level", "Preparing spawn area"),
-            Err(err) => crate::console_error!("load level failed: {}", err),
+            Err(err) => {
+                let message = format!("Load failed: {err}");
+                crate::console_error!("load level failed: {}", err);
+                if let GameState::WorldActions(menu) = &mut self.game_state {
+                    menu.status_line = Some(message);
+                }
+            }
         }
     }
 
@@ -1610,6 +1868,18 @@ impl App {
                 }
                 false
             }
+            GameState::WorldActions(menu) => {
+                if menu.rename_input.take().is_some() {
+                    menu.status_line = Some("Rename cancelled.".to_string());
+                    return true;
+                }
+                if menu.pending_delete {
+                    menu.pending_delete = false;
+                    menu.status_line = Some("Delete cancelled.".to_string());
+                    return true;
+                }
+                false
+            }
             GameState::TickingAreas(menu) => {
                 if menu.pending_delete.take().is_some() {
                     menu.status_line = Some("Delete cancelled.".to_string());
@@ -1767,6 +2037,7 @@ impl App {
                 } else {
                     Some("Saved worlds live under save/worlds.".to_string())
                 };
+                let footer = footer.map(|text| format!("{text}  |  Enter: manage / load"));
                 Some(MenuScreenContent {
                     title: "Load level".to_string(),
                     items,
@@ -1882,8 +2153,48 @@ impl App {
                     show_panorama: self.is_main_menu(),
                 })
             }
+            GameState::WorldActions(menu) => Some(Self::world_actions_menu_content(menu)),
             GameState::TickingAreas(menu) => Some(self.ticking_area_menu_content(menu)),
             _ => None,
+        }
+    }
+
+    fn world_actions_menu_content(menu: &WorldActionsMenuState) -> MenuScreenContent {
+        let mut items = Vec::with_capacity(WORLD_ACTION_ROW_COUNT);
+        items.push(if menu.is_active {
+            "Load world (already loaded)".to_string()
+        } else {
+            "Load world".to_string()
+        });
+        items.push(match &menu.rename_input {
+            Some(input) => format!("Name: {input}_"),
+            None => format!("Rename: {}", menu.display_name),
+        });
+        items.push(if menu.pending_delete {
+            "Delete world - confirm?".to_string()
+        } else {
+            "Delete world".to_string()
+        });
+        items.push("Back".to_string());
+
+        let mut enabled = vec![true; items.len()];
+        enabled[WORLD_ACTION_ROW_DELETE] = menu.can_delete;
+
+        let footer = menu.status_line.clone().or_else(|| {
+            if menu.details.is_empty() {
+                None
+            } else {
+                Some(format!("{} | {}", menu.details, menu.save_root.display()))
+            }
+        });
+
+        MenuScreenContent {
+            title: menu.display_name.clone(),
+            selected: menu.selected,
+            enabled,
+            items,
+            footer,
+            show_panorama: false,
         }
     }
 
@@ -1979,6 +2290,7 @@ impl App {
             GameState::Paused { .. } => self.activate_pause_menu_selected(event_loop),
             GameState::LoadLevelMenu { .. } => self.activate_load_level_menu_selected(),
             GameState::Options(_) => self.activate_options_selected(),
+            GameState::WorldActions(_) => self.activate_world_action_selected(),
             GameState::TickingAreas(_) => self.activate_ticking_area_selected(),
             _ => {}
         }
@@ -2429,6 +2741,13 @@ impl ApplicationHandler for App {
                 let forward_key = self.settings.controls.key_for(InputAction::MoveForward);
                 let backward_key = self.settings.controls.key_for(InputAction::MoveBackward);
                 let sneak_key = self.settings.controls.key_for(InputAction::Sneak);
+
+                if event.state == ElementState::Pressed
+                    && matches!(&self.game_state, GameState::WorldActions(menu) if menu.rename_input.is_some())
+                    && self.handle_world_rename_key(code, event.text.as_deref())
+                {
+                    return;
+                }
 
                 if options_open
                     && event.state == ElementState::Pressed
@@ -3308,6 +3627,7 @@ impl ApplicationHandler for App {
                         | GameState::LoadLevelMenu { .. }
                         | GameState::Paused { .. }
                         | GameState::Options(_)
+                        | GameState::WorldActions(_)
                         | GameState::TickingAreas(_)
                         | GameState::Inventory { .. } => None,
                     };

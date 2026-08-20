@@ -5810,14 +5810,16 @@ impl State {
                 let modified = fs::metadata(&meta_path)
                     .and_then(|meta| meta.modified())
                     .unwrap_or(SystemTime::UNIX_EPOCH);
-                let display_name = if save_root == default_root {
-                    "Current world".to_string()
-                } else {
-                    save_root
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| save_root.display().to_string())
-                };
+                let display_name = meta.display_name.clone().unwrap_or_else(|| {
+                    if save_root == default_root {
+                        "Current world".to_string()
+                    } else {
+                        save_root
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| save_root.display().to_string())
+                    }
+                });
                 let size_label = ClassicLevelSize::infer_from_boundary_radius_chunks(
                     meta.boundary_radius_chunks,
                 )
@@ -5850,6 +5852,63 @@ impl State {
                 .then_with(|| world_a.display_name.cmp(&world_b.display_name))
         });
         worlds.into_iter().map(|(_, world)| world).collect()
+    }
+
+    pub(crate) fn is_active_save_root(&self, save_root: &Path) -> bool {
+        save_root == self.save_root
+    }
+
+    pub(crate) fn is_default_save_root(save_root: &Path) -> bool {
+        save_root == Self::default_save_root()
+    }
+
+    /// Renames a saved world. The display name always lands in `world.meta`;
+    /// the directory is only moved for inactive worlds under `save/worlds/`,
+    /// so the active session and the top-level `save/` root stay untouched.
+    pub(crate) fn rename_saved_world(
+        &mut self,
+        save_root: &Path,
+        new_name: &str,
+    ) -> io::Result<(PathBuf, bool)> {
+        let trimmed = new_name.trim();
+        if trimmed.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "world name must not be empty",
+            ));
+        }
+
+        // Write the display name first: if the folder move fails or is not
+        // allowed, the world is still renamed as far as the UI is concerned.
+        world_meta::set_display_name(&Self::world_meta_path_for(save_root), Some(trimmed))?;
+
+        let may_move = !self.is_active_save_root(save_root)
+            && !Self::is_default_save_root(save_root)
+            && save_root.parent() == Some(&Self::default_save_root().join("worlds"));
+        let Some(dir_name) = world_meta::sanitize_world_dir_name(trimmed).filter(|_| may_move)
+        else {
+            return Ok((save_root.to_path_buf(), false));
+        };
+        let moved = world_meta::rename_world_dir(save_root, &dir_name)?;
+        Ok((moved, true))
+    }
+
+    /// Permanently deletes a saved world. Refuses the active session and the
+    /// top-level `save/` root (which also holds settings and every other world).
+    pub(crate) fn delete_saved_world(&mut self, save_root: &Path) -> io::Result<()> {
+        if self.is_active_save_root(save_root) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot delete the world that is currently loaded",
+            ));
+        }
+        if Self::is_default_save_root(save_root) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot delete the main save directory",
+            ));
+        }
+        world_meta::delete_world_dir(save_root)
     }
 
     fn restore_world_definition_from_save_root(&mut self, save_root: &Path) -> io::Result<()> {

@@ -26,6 +26,8 @@ pub(crate) struct WorldMeta {
     pub(crate) block_id_version: u16,
     pub(crate) save_format_version: u16,
     pub(crate) block_registry_hash: Option<String>,
+    /// User-facing name. `None` falls back to the save directory's name.
+    pub(crate) display_name: Option<String>,
 }
 
 impl WorldMeta {
@@ -54,6 +56,7 @@ impl WorldMeta {
             block_id_version: BLOCK_ID_MAPPING_VERSION,
             save_format_version: 2,
             block_registry_hash: None,
+            display_name: None,
         };
         validate(&meta)?;
         Ok(meta)
@@ -82,6 +85,8 @@ struct WorldMetaWire {
     save_format_version: u16,
     #[serde(default)]
     block_registry_hash: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
 }
 
 pub(crate) fn save_atomic(path: &Path, meta: &WorldMeta) -> io::Result<()> {
@@ -106,6 +111,7 @@ pub(crate) fn save_atomic(path: &Path, meta: &WorldMeta) -> io::Result<()> {
         block_id_version: meta.block_id_version,
         save_format_version: meta.save_format_version,
         block_registry_hash: meta.block_registry_hash.clone(),
+        display_name: meta.display_name.clone(),
     };
 
     let mut bytes = serde_json::to_vec_pretty(&wire)
@@ -176,10 +182,89 @@ pub(crate) fn load(path: &Path) -> io::Result<Option<WorldMeta>> {
         block_id_version: wire.block_id_version,
         save_format_version: wire.save_format_version,
         block_registry_hash: wire.block_registry_hash,
+        display_name: wire.display_name,
     };
     validate(&meta)?;
 
     Ok(Some(meta))
+}
+
+/// Longest name the UI accepts; keeps directory names well inside filesystem limits.
+pub(crate) const WORLD_NAME_MAX_LEN: usize = 48;
+
+/// Turns a user-typed world name into a safe directory name, or `None` when
+/// nothing usable is left. Only `[A-Za-z0-9._-]` survives; runs of anything else
+/// collapse into a single `-`.
+pub(crate) fn sanitize_world_dir_name(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len());
+    let mut pending_sep = false;
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-' {
+            if pending_sep && !out.is_empty() {
+                out.push('-');
+            }
+            pending_sep = false;
+            out.push(ch);
+        } else {
+            pending_sep = true;
+        }
+        if out.len() >= WORLD_NAME_MAX_LEN {
+            break;
+        }
+    }
+    // "." and ".." would escape or alias the worlds directory.
+    let trimmed = out.trim_matches('.').trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+/// Rewrites only the display name of an existing `world.meta`.
+pub(crate) fn set_display_name(path: &Path, display_name: Option<&str>) -> io::Result<()> {
+    let mut meta = load(path)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("missing world meta at {}", path.display()),
+        )
+    })?;
+    meta.display_name = display_name.map(str::to_string);
+    save_atomic(path, &meta)
+}
+
+/// Moves a world directory to a sibling with `new_dir_name`. Fails if the target
+/// already exists so an unrelated world can never be overwritten.
+pub(crate) fn rename_world_dir(save_root: &Path, new_dir_name: &str) -> io::Result<PathBuf> {
+    let parent = save_root.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("world path '{}' has no parent", save_root.display()),
+        )
+    })?;
+    let target = parent.join(new_dir_name);
+    if target == save_root {
+        return Ok(target);
+    }
+    if target.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("'{}' already exists", target.display()),
+        ));
+    }
+    fs::rename(save_root, &target)?;
+    Ok(target)
+}
+
+/// Permanently removes a world directory and everything under it.
+pub(crate) fn delete_world_dir(save_root: &Path) -> io::Result<()> {
+    if !save_root.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("'{}' is not a world directory", save_root.display()),
+        ));
+    }
+    fs::remove_dir_all(save_root)
 }
 
 fn validate(meta: &WorldMeta) -> io::Result<()> {
@@ -345,6 +430,46 @@ mod tests {
         let loaded = load(&path).unwrap().unwrap();
         assert_eq!(loaded, meta);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sanitizes_world_names() {
+        use super::sanitize_world_dir_name;
+        assert_eq!(sanitizes("My World"), "My-World");
+        assert_eq!(sanitizes("a///b"), "a-b");
+        assert_eq!(sanitizes("  spaced  "), "spaced");
+        assert_eq!(sanitizes("keep_this.one-ok"), "keep_this.one-ok");
+        assert_eq!(sanitize_world_dir_name(".."), None);
+        assert_eq!(sanitize_world_dir_name("///"), None);
+        assert_eq!(sanitize_world_dir_name(""), None);
+    }
+
+    fn sanitizes(raw: &str) -> String {
+        super::sanitize_world_dir_name(raw).expect("expected a usable name")
+    }
+
+    #[test]
+    fn rename_refuses_existing_target() {
+        let base = std::env::temp_dir().join(format!(
+            "mc_klon_rename_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let from = base.join("from");
+        let to = base.join("to");
+        fs::create_dir_all(&from).unwrap();
+        fs::create_dir_all(&to).unwrap();
+
+        let err = super::rename_world_dir(&from, "to").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(from.is_dir());
+
+        let moved = super::rename_world_dir(&from, "fresh").unwrap();
+        assert!(moved.is_dir());
+        assert!(!from.exists());
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]

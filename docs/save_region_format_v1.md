@@ -43,8 +43,13 @@ Required fields:
 Optional:
 
 - `block_registry_hash` (manifest signature for drift detection)
+- `display_name` (user-facing world name; falls back to the save directory name)
 
-Validation is strict (`deny_unknown_fields` in the wire type).
+Validation is strict (`deny_unknown_fields` in the wire type). Optional fields are
+additive: older saves load unchanged, but a `world.meta` written by a newer build
+is rejected by builds that predate the field, so `format_version` stays at `1`
+(bumping it would invalidate every existing save, since `validate` requires an
+exact match).
 
 Important validation rules:
 
