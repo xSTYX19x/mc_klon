@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -12,7 +12,18 @@ use crossbeam_channel::{Receiver, Sender, TrySendError};
 use serde_json::json;
 
 const RING_RETENTION: Duration = Duration::from_secs(10);
-const RING_MAX_EVENTS: usize = 8192;
+
+/// Memory ceiling for the ring, not an event count.
+///
+/// The old cap was a flat 8192 events. Under streaming load the trace produces
+/// ~9 k events/s, so that cap collapsed the retained window to ~900 ms: whatever
+/// caused a stall had already been evicted by the time the report was written.
+/// Evicting by bytes keeps the window governed by `RING_RETENTION` and lets the
+/// event rate vary, while still bounding memory. Override with
+/// `MC_KLON_TRACE_RING_MB`.
+const RING_DEFAULT_BUDGET_BYTES: usize = 16 * 1024 * 1024;
+const RING_MIN_BUDGET_BYTES: usize = 256 * 1024;
+const RING_MAX_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 /// Bounded hand-off to the writer thread. Producers never block: once this is
 /// full the event is dropped and counted, so a slow disk can throttle the trace
@@ -71,10 +82,76 @@ impl TraceLevel {
 #[derive(Clone, Debug)]
 struct RingEvent {
     t_ms: f64,
-    thread: String,
+    thread: Arc<str>,
     tag: String,
     duration_ms: f64,
     counts: String,
+}
+
+impl RingEvent {
+    /// What one event costs the ring. The thread label is shared between every
+    /// event of that thread, so it is not charged here.
+    fn footprint(&self) -> usize {
+        std::mem::size_of::<Self>() + self.tag.len() + self.counts.len()
+    }
+}
+
+/// Time-windowed event ring with a byte budget as the backstop.
+struct RingBuffer {
+    events: VecDeque<RingEvent>,
+    bytes: usize,
+    budget_bytes: usize,
+    /// Events evicted because the budget ran out rather than because they aged
+    /// out. Non-zero means the report covers less than `RING_RETENTION`.
+    dropped_by_budget: u64,
+}
+
+impl RingBuffer {
+    fn new(budget_bytes: usize) -> Self {
+        Self {
+            events: VecDeque::new(),
+            bytes: 0,
+            budget_bytes,
+            dropped_by_budget: 0,
+        }
+    }
+
+    fn push(&mut self, event: RingEvent, now_ms: f64) {
+        self.bytes += event.footprint();
+        self.events.push_back(event);
+
+        let cutoff_ms = now_ms - RING_RETENTION.as_secs_f64() * 1000.0;
+        while self.events.front().is_some_and(|e| e.t_ms < cutoff_ms) {
+            self.pop_front();
+        }
+        while self.bytes > self.budget_bytes && self.events.len() > 1 {
+            self.pop_front();
+            self.dropped_by_budget += 1;
+        }
+    }
+
+    fn pop_front(&mut self) {
+        if let Some(e) = self.events.pop_front() {
+            self.bytes = self.bytes.saturating_sub(e.footprint());
+        }
+    }
+
+    /// Wall-clock span the retained events actually cover, in ms.
+    fn span_ms(&self) -> f64 {
+        match (self.events.front(), self.events.back()) {
+            (Some(first), Some(last)) => (last.t_ms - first.t_ms).max(0.0),
+            _ => 0.0,
+        }
+    }
+}
+
+/// `MC_KLON_TRACE_RING_MB`, clamped to something that can neither be useless
+/// nor eat the heap.
+fn ring_budget_bytes(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+        .unwrap_or(RING_DEFAULT_BUDGET_BYTES)
+        .clamp(RING_MIN_BUDGET_BYTES, RING_MAX_BUDGET_BYTES)
 }
 
 /// One event on its way to the writer thread. Owns its strings so the producer
@@ -82,7 +159,7 @@ struct RingEvent {
 struct WriterEvent {
     tag: String,
     counts: String,
-    thread: String,
+    thread: Arc<str>,
     tid: u64,
     ts_us: u64,
     /// `None` marks an instant event, `Some` a complete (duration) event.
@@ -141,7 +218,7 @@ fn run_writer_thread(mut writer: TraceWriter, rx: Receiver<WriterMsg>, pid: u32)
                 "dur": dur_us,
                 "pid": pid,
                 "tid": event.tid,
-                "args": { "counts": event.counts, "thread": event.thread },
+                "args": { "counts": event.counts, "thread": &*event.thread },
             }),
             None => json!({
                 "name": event.tag,
@@ -151,7 +228,7 @@ fn run_writer_thread(mut writer: TraceWriter, rx: Receiver<WriterMsg>, pid: u32)
                 "ts": event.ts_us,
                 "pid": pid,
                 "tid": event.tid,
-                "args": { "counts": event.counts, "thread": event.thread },
+                "args": { "counts": event.counts, "thread": &*event.thread },
             }),
         };
         if writer.write_event(value).is_err() {
@@ -173,7 +250,7 @@ struct TraceRuntime {
     event_tx: Option<Sender<WriterMsg>>,
     writer_join: Mutex<Option<thread::JoinHandle<()>>>,
     dropped_events: AtomicU64,
-    ring: Mutex<VecDeque<RingEvent>>,
+    ring: Mutex<RingBuffer>,
     /// Held open for the whole run; the old code re-opened (and stat'd) this file
     /// once per frame on the render thread.
     gpu_csv: Mutex<Option<BufWriter<File>>>,
@@ -200,36 +277,32 @@ impl TraceRuntime {
         (self.started_at.elapsed().as_secs_f64() * 1_000_000.0) as u64
     }
 
-    fn push_ring(&self, event: RingEvent) {
+    /// `now_ms` is the caller's already-taken timestamp; the old code read the
+    /// clock a second time here for every event.
+    fn push_ring(&self, event: RingEvent, now_ms: f64) {
         let Ok(mut ring) = self.ring.lock() else {
             return;
         };
-        ring.push_back(event);
-        let cutoff_ms = self.started_at.elapsed().as_secs_f64() * 1000.0
-            - RING_RETENTION.as_secs_f64() * 1000.0;
-        while ring
-            .front()
-            .is_some_and(|e| e.t_ms < cutoff_ms || ring.len() > RING_MAX_EVENTS)
-        {
-            ring.pop_front();
-        }
+        ring.push(event, now_ms);
     }
 }
 
 thread_local! {
     /// `thread::current().name()` plus an FNV hash used to be recomputed for every
     /// single event. It cannot change for the life of a thread, so cache it.
-    static THREAD_IDENTITY: RefCell<Option<(String, u64)>> = const { RefCell::new(None) };
+    static THREAD_IDENTITY: RefCell<Option<(Arc<str>, u64)>> = const { RefCell::new(None) };
 }
 
-fn thread_label_and_tid() -> (String, u64) {
+/// The label is an `Arc<str>` so every event of a thread shares one allocation
+/// instead of cloning a `String` per event.
+fn thread_label_and_tid() -> (Arc<str>, u64) {
     THREAD_IDENTITY.with(|cell| {
         let mut cell = cell.borrow_mut();
         if cell.is_none() {
-            let label = std::thread::current()
+            let label: Arc<str> = std::thread::current()
                 .name()
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("tid:{:?}", std::thread::current().id()));
+                .map(Arc::<str>::from)
+                .unwrap_or_else(|| Arc::from(format!("tid:{:?}", std::thread::current().id())));
             let mut h = 1469598103934665603u64;
             for b in label.as_bytes() {
                 h ^= *b as u64;
@@ -238,7 +311,7 @@ fn thread_label_and_tid() -> (String, u64) {
             *cell = Some((label, h));
         }
         let (label, tid) = cell.as_ref().expect("thread identity just initialized");
-        (label.clone(), *tid)
+        (Arc::clone(label), *tid)
     })
 }
 
@@ -305,7 +378,9 @@ pub(crate) fn trace_init() -> io::Result<()> {
         event_tx,
         writer_join: Mutex::new(writer_join),
         dropped_events: AtomicU64::new(0),
-        ring: Mutex::new(VecDeque::with_capacity(RING_MAX_EVENTS.min(2048))),
+        ring: Mutex::new(RingBuffer::new(ring_budget_bytes(
+            std::env::var("MC_KLON_TRACE_RING_MB").ok().as_deref(),
+        ))),
         gpu_csv: Mutex::new(None),
     };
     let _ = TRACE_RUNTIME.set(rt);
@@ -388,25 +463,33 @@ pub(crate) fn scope(tag: impl Into<String>) -> TraceScope {
 fn emit(rt: &TraceRuntime, tag: &str, counts: &str, ts_us: u64, dur_us: Option<u64>) {
     let (thread, tid) = thread_label_and_tid();
 
+    let t_ms = ts_us as f64 / 1000.0;
+
     let Some(tx) = rt.event_tx.as_ref() else {
         // Ring-only: hand the strings straight over, no clones.
-        rt.push_ring(RingEvent {
-            t_ms: ts_us as f64 / 1000.0,
-            thread,
-            tag: tag.to_string(),
-            duration_ms: dur_us.unwrap_or(0) as f64 / 1000.0,
-            counts: counts.to_string(),
-        });
+        rt.push_ring(
+            RingEvent {
+                t_ms,
+                thread,
+                tag: tag.to_string(),
+                duration_ms: dur_us.unwrap_or(0) as f64 / 1000.0,
+                counts: counts.to_string(),
+            },
+            t_ms,
+        );
         return;
     };
 
-    rt.push_ring(RingEvent {
-        t_ms: ts_us as f64 / 1000.0,
-        thread: thread.clone(),
-        tag: tag.to_string(),
-        duration_ms: dur_us.unwrap_or(0) as f64 / 1000.0,
-        counts: counts.to_string(),
-    });
+    rt.push_ring(
+        RingEvent {
+            t_ms,
+            thread: Arc::clone(&thread),
+            tag: tag.to_string(),
+            duration_ms: dur_us.unwrap_or(0) as f64 / 1000.0,
+            counts: counts.to_string(),
+        },
+        t_ms,
+    );
 
     let event = WriterEvent {
         tag: tag.to_string(),
@@ -454,9 +537,14 @@ pub(crate) fn write_stall_report(stall_summary: &str) -> io::Result<()> {
     let Some(rt) = TRACE_RUNTIME.get() else {
         return Ok(());
     };
-    let ring_snapshot = {
+    let (ring_snapshot, ring_span_ms, ring_dropped, ring_budget_mb) = {
         let ring = rt.ring.lock().expect("trace ring poisoned");
-        ring.iter().cloned().collect::<Vec<_>>()
+        (
+            ring.events.iter().cloned().collect::<Vec<_>>(),
+            ring.span_ms(),
+            ring.dropped_by_budget,
+            ring.budget_bytes as f64 / (1024.0 * 1024.0),
+        )
     };
     let mut file = OpenOptions::new()
         .create(true)
@@ -473,10 +561,16 @@ pub(crate) fn write_stall_report(stall_summary: &str) -> io::Result<()> {
         )?;
     }
     writeln!(file, "gpu_csv: {}", rt.gpu_csv_path.display())?;
+    // Print what the window actually covers, not what it was meant to cover:
+    // a truncated ring used to look identical to a complete one in the report.
     writeln!(
         file,
-        "-- ring-buffer (last {:.1}s) --",
-        RING_RETENTION.as_secs_f32()
+        "-- ring-buffer (target {:.1}s, actual {:.2}s, {} events, budget {:.0}MB, dropped_by_budget={}) --",
+        RING_RETENTION.as_secs_f32(),
+        ring_span_ms / 1000.0,
+        ring_snapshot.len(),
+        ring_budget_mb,
+        ring_dropped
     )?;
     for e in ring_snapshot {
         writeln!(
@@ -521,6 +615,124 @@ pub(crate) fn note_gpu_wait(reason: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Event volume measured under streaming load (~9 k events/s), the case the
+    /// old 8192-event cap could not hold.
+    const STREAMING_EVENTS_PER_SEC: usize = 9_100;
+
+    fn streaming_event(t_ms: f64) -> RingEvent {
+        RingEvent {
+            t_ms,
+            thread: Arc::from("main"),
+            tag: "state.process_dirty_chunk_meshes".to_string(),
+            duration_ms: 0.4,
+            counts: "chunks=3 verts=18432 inflight(mesh=148) up=2".to_string(),
+        }
+    }
+
+    fn fill_at_streaming_rate(ring: &mut RingBuffer, seconds: f64) {
+        let total = (STREAMING_EVENTS_PER_SEC as f64 * seconds) as usize;
+        let step_ms = 1000.0 / STREAMING_EVENTS_PER_SEC as f64;
+        for i in 0..total {
+            let t_ms = i as f64 * step_ms;
+            ring.push(streaming_event(t_ms), t_ms);
+        }
+    }
+
+    #[test]
+    fn ring_holds_the_full_retention_window_under_streaming_load() {
+        // The regression: a flat 8192-event cap left the report covering ~900 ms
+        // of a 10 s window, so the cause of a stall was already evicted.
+        let mut ring = RingBuffer::new(RING_DEFAULT_BUDGET_BYTES);
+        fill_at_streaming_rate(&mut ring, 12.0);
+
+        let span_s = ring.span_ms() / 1000.0;
+        assert!(
+            span_s >= 9.5,
+            "ring covered only {span_s:.2}s of the intended {:.1}s window ({} events, {} dropped by budget)",
+            RING_RETENTION.as_secs_f32(),
+            ring.events.len(),
+            ring.dropped_by_budget
+        );
+        assert_eq!(
+            ring.dropped_by_budget, 0,
+            "the default budget must fit a full retention window at streaming rates"
+        );
+    }
+
+    #[test]
+    fn old_event_count_cap_would_not_have_covered_the_window() {
+        // Pins the reason the cap changed: 8192 events is under a second here.
+        let covered_s = 8192.0 / STREAMING_EVENTS_PER_SEC as f64;
+        assert!(
+            covered_s < 1.0,
+            "expected the old cap to cover under a second, got {covered_s:.2}s"
+        );
+    }
+
+    #[test]
+    fn events_older_than_the_retention_window_are_evicted() {
+        let mut ring = RingBuffer::new(RING_DEFAULT_BUDGET_BYTES);
+        ring.push(streaming_event(0.0), 0.0);
+        ring.push(streaming_event(5_000.0), 5_000.0);
+
+        let now_ms = 12_000.0;
+        ring.push(streaming_event(now_ms), now_ms);
+
+        assert_eq!(ring.events.len(), 2, "the 0 ms event is outside the window");
+        assert!(ring.events.iter().all(|e| e.t_ms >= now_ms - 10_000.0));
+        assert_eq!(
+            ring.dropped_by_budget, 0,
+            "aging out is not a budget drop and must not be reported as one"
+        );
+    }
+
+    #[test]
+    fn budget_bounds_memory_and_is_reported() {
+        let budget = RING_MIN_BUDGET_BYTES;
+        let mut ring = RingBuffer::new(budget);
+        // Fat counts strings: the budget, not the event count, has to hold.
+        for i in 0..20_000 {
+            let t_ms = i as f64 * 0.01;
+            let mut event = streaming_event(t_ms);
+            event.counts = "x".repeat(512);
+            ring.push(event, t_ms);
+        }
+
+        assert!(
+            ring.bytes <= budget,
+            "ring used {} bytes over a {budget}-byte budget",
+            ring.bytes
+        );
+        assert!(
+            ring.dropped_by_budget > 0,
+            "budget eviction must be visible in the report"
+        );
+    }
+
+    #[test]
+    fn accounted_bytes_track_the_retained_events() {
+        let mut ring = RingBuffer::new(RING_DEFAULT_BUDGET_BYTES);
+        fill_at_streaming_rate(&mut ring, 11.0);
+        let recomputed: usize = ring.events.iter().map(RingEvent::footprint).sum();
+        assert_eq!(
+            ring.bytes, recomputed,
+            "byte accounting drifted from the retained events"
+        );
+    }
+
+    #[test]
+    fn ring_budget_env_is_parsed_and_clamped() {
+        assert_eq!(ring_budget_bytes(None), RING_DEFAULT_BUDGET_BYTES);
+        assert_eq!(ring_budget_bytes(Some("garbage")), RING_DEFAULT_BUDGET_BYTES);
+        assert_eq!(ring_budget_bytes(Some(" 32 ")), 32 * 1024 * 1024);
+        assert_eq!(ring_budget_bytes(Some("0")), RING_MIN_BUDGET_BYTES);
+        assert_eq!(
+            ring_budget_bytes(Some("999999")),
+            RING_MAX_BUDGET_BYTES,
+            "an absurd override must not be able to eat the heap"
+        );
+    }
 
     #[test]
     fn unset_env_keeps_the_compiled_default() {
