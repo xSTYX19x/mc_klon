@@ -69,8 +69,7 @@ impl TerrainGenerator {
 
 impl ChunkGenerator for TerrainGenerator {
     fn generate_chunk(&self, coord: ChunkCoord, out: &mut Chunk) {
-        self.pipeline
-            .generate_chunk(self.world_cfg.seed, coord, out);
+        self.pipeline.generate_chunk(coord, out);
     }
 
     fn estimate_surface_height(&self, world_x: i32, world_z: i32, world_max_y: i32) -> i32 {

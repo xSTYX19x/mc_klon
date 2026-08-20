@@ -195,23 +195,6 @@ impl Chunk {
         }
     }
 
-    pub(crate) fn set_light(&mut self, x: i32, y: i32, z: i32, light: LightLevel) {
-        self.set_light_packed(x, y, z, light.pack());
-    }
-
-    pub(crate) fn clear_light(&mut self) {
-        let mut changed = false;
-        for v in Arc::make_mut(&mut self.light).iter_mut() {
-            if *v != 0 {
-                *v = 0;
-                changed = true;
-            }
-        }
-        if changed {
-            self.revision = self.revision.wrapping_add(1);
-        }
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
         self.filled_voxel_count == 0
     }

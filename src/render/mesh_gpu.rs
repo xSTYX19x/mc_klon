@@ -287,15 +287,6 @@ pub(crate) fn upload_cpu_mesh_to_gpu_reuse(
     )
 }
 
-pub(crate) fn upload_cpu_mesh_to_gpu(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    label_prefix: &str,
-    mesh: CpuMeshData,
-) -> Option<ChunkMesh> {
-    upload_cpu_mesh_to_gpu_reuse(device, queue, label_prefix, mesh, None).0
-}
-
 pub(crate) fn upload_world_cpu_mesh_to_gpu_reuse(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -384,21 +375,6 @@ pub(crate) fn upload_world_cpu_mesh_to_gpu_reuse(
     )
 }
 
-pub(crate) fn upload_layered_chunk_mesh_to_gpu_reuse(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    layered: LayeredChunkGeometry,
-    existing: Option<LayeredChunkMesh>,
-) -> (Option<LayeredChunkMesh>, MeshUploadStats) {
-    upload_layered_chunk_mesh_layers_to_gpu_reuse(
-        device,
-        queue,
-        layered,
-        MeshLayerMask::ALL,
-        existing,
-    )
-}
-
 pub(crate) fn upload_layered_chunk_mesh_layers_to_gpu_reuse(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -434,12 +410,4 @@ pub(crate) fn upload_layered_chunk_mesh_layers_to_gpu_reuse(
     } else {
         (Some(layered_mesh), stats)
     }
-}
-
-pub(crate) fn upload_layered_chunk_mesh_to_gpu(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    layered: LayeredChunkGeometry,
-) -> Option<LayeredChunkMesh> {
-    upload_layered_chunk_mesh_to_gpu_reuse(device, queue, layered, None).0
 }

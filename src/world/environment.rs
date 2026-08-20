@@ -5,8 +5,6 @@ pub(crate) enum WorldEnvironment {
 }
 
 impl WorldEnvironment {
-    pub(crate) const ALL: [Self; 2] = [Self::Temperate, Self::Winter];
-
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Temperate => "Temperate",

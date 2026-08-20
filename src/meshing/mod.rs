@@ -13,18 +13,11 @@ pub(crate) mod pool;
 #[cfg(test)]
 mod pool_regression_test;
 
-#[cfg(test)]
-pub(crate) use greedy::build_chunk_mesh_greedy;
 pub(crate) use greedy::{face_corner_ao_shades, face_from_normal, face_shade};
-#[cfg(test)]
-pub(crate) use liquids::{
-    LIQUID_EPS, LIQUID_SOURCE_HEIGHT, effective_cell_height, fluid_surface_height,
-    liquid_fill_height_at_point, surface_height, wall_height,
-};
 pub(crate) use liquids::{fluid_kind_at_point, liquid_height_at_point};
 pub(crate) use neighborhood::{ChunkSnapshot, MeshingNeighborhoodScratch, NeighborhoodSnapshot};
 
-// Export the new pooled meshing functions
+#[cfg(test)]
 pub(crate) use greedy::{build_chunk_mesh_greedy_layered, build_chunk_mesh_layered_naive};
 
 /// Legacy vertex used for UI, sky, LOD and overlay meshes (44 bytes).
@@ -120,11 +113,6 @@ impl LayeredChunkGeometry {
             RenderLayer::Cutout => std::mem::take(&mut self.cutout),
             RenderLayer::Transparent => std::mem::take(&mut self.transparent),
         }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn total_vertex_count(&self) -> usize {
-        self.opaque.vertices.len() + self.cutout.vertices.len() + self.transparent.vertices.len()
     }
 
     pub(crate) fn total_index_count(&self) -> usize {

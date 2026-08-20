@@ -619,63 +619,6 @@ fn cube_face_vertex_shade_and_light(
 }
 
 #[inline]
-fn face_vertex_shade_and_light_local(
-    neighborhood: &MeshingNeighborhood<'_>,
-    texture_lookup: &BlockTextureLookup,
-    block_pos: IVec3,
-    face: Face,
-    render_bounds: RenderBounds,
-    vertex_local: [f32; 3],
-) -> (f32, u32) {
-    let sample_offsets = occlusion_offsets_for_vertex(face, render_bounds, vertex_local);
-    let mut occluded = [false; 4];
-    let mut raw_lights = [0u8; 4];
-    for (index, cell_offset) in sample_offsets.iter().enumerate() {
-        let sample_pos = block_pos + *cell_offset;
-        let local_point = sample_local_point(vertex_local, *cell_offset);
-        occluded[index] = texture_lookup
-            .info_for(neighborhood.block_local(sample_pos.x, sample_pos.y, sample_pos.z))
-            .occlusion_shape
-            .occludes_ao_sample(local_point);
-        raw_lights[index] = neighborhood.light_local(sample_pos.x, sample_pos.y, sample_pos.z);
-    }
-
-    let side1_occ = occluded[1];
-    let side2_occ = occluded[2];
-    let corner_occ = occluded[3];
-    let ao = if debug_disable_ao() {
-        1.0
-    } else {
-        validated_ao_factor(side1_occ, side2_occ, corner_occ)
-    };
-
-    let light = averaged_vertex_light_from_samples(raw_lights, occluded);
-    (face_shade(face) * ao, light)
-}
-
-#[inline]
-fn cube_face_vertex_shade_and_light_local(
-    neighborhood: &MeshingNeighborhood<'_>,
-    texture_lookup: &BlockTextureLookup,
-    block_pos: IVec3,
-    face: Face,
-    corner_pos: IVec3,
-) -> (f32, u32) {
-    face_vertex_shade_and_light_local(
-        neighborhood,
-        texture_lookup,
-        block_pos,
-        face,
-        RenderBounds::UNIT_CUBE,
-        [
-            (corner_pos.x - block_pos.x) as f32,
-            (corner_pos.y - block_pos.y) as f32,
-            (corner_pos.z - block_pos.z) as f32,
-        ],
-    )
-}
-
-#[inline]
 fn face_vertex_shade_and_light_local_fast(
     neighborhood: &MeshingNeighborhood<'_>,
     texture_lookup: &BlockTextureLookup,
@@ -749,43 +692,6 @@ fn cube_face_vertex_shade_and_light_local_fast(
             (corner_pos[1] - block_pos[1]) as f32,
             (corner_pos[2] - block_pos[2]) as f32,
         ],
-    )
-}
-
-#[inline]
-fn should_emit_cube_face_local(
-    neighborhood: &MeshingNeighborhood<'_>,
-    texture_lookup: &BlockTextureLookup,
-    current_local: IVec3,
-    current: BlockId,
-    face: Face,
-) -> bool {
-    let normal = face.normal_i32();
-    let neighbor = neighborhood.block_local(
-        current_local.x + normal[0],
-        current_local.y + normal[1],
-        current_local.z + normal[2],
-    );
-    if !neighbor.is_voxel_filled() {
-        return true;
-    }
-
-    let neighbor_info = texture_lookup.info_for(neighbor);
-    let current_group = texture_lookup.cull_group_for(current);
-    if current_group != CullGroup::None && current_group == neighbor_info.cull_group {
-        if neighbor_covers_boundary(
-            neighbor_info.occlusion_shape,
-            face.opposite(),
-            FaceCoverage::Full,
-        ) {
-            return false;
-        }
-    }
-
-    !neighbor_covers_boundary(
-        neighbor_info.occlusion_shape,
-        face.opposite(),
-        FaceCoverage::Full,
     )
 }
 
@@ -1920,19 +1826,6 @@ fn build_chunk_mesh_greedy_layered_internal(
     );
 }
 
-#[cfg(test)]
-pub(crate) fn build_chunk_mesh_greedy(
-    world: &World,
-    coord: ChunkCoord,
-    texture_lookup: &BlockTextureLookup,
-) -> (Vec<WorldVertex>, Vec<u32>) {
-    flatten_layered_geometry(build_chunk_mesh_greedy_layered(
-        world,
-        coord,
-        texture_lookup,
-    ))
-}
-
 /// SIMD-optimized vertex creation for quads
 /// Reduces temporary allocations and improves cache performance
 #[inline]
@@ -2029,69 +1922,6 @@ pub(super) fn push_textured_quad(
     tint_kind: u32,
 ) {
     push_textured_quad_simd(mesh, positions, uvs, tex_layer, tint_kind)
-}
-
-/// Batch quad creation that reserves memory upfront for better performance
-/// Use this for large numbers of quads to reduce reallocations
-#[inline]
-pub(super) fn push_textured_quads_batch(
-    mesh: &mut WorldCpuMeshData,
-    quads: &[([[f32; 3]; 4], [[f32; 2]; 4], u32, u32)], // (positions, uvs, tex_layer, tint_kind)
-) {
-    let quad_count = quads.len();
-
-    mesh.vertices.reserve(quad_count * 4);
-    mesh.indices.reserve(quad_count * 6);
-
-    let light = FULLBRIGHT_LIGHT_PACKED as u8;
-
-    for (positions, uvs, tex_layer, tint_kind) in quads {
-        let base = mesh.vertices.len() as u32;
-        let tk = *tint_kind as u8;
-
-        mesh.vertices.extend_from_slice(&[
-            WorldVertex {
-                position: positions[0],
-                uv: pack_uv(uvs[0][0], uvs[0][1]),
-                tex_layer: *tex_layer,
-                shade: 255,
-                tint_kind: tk,
-                light_packed: light,
-                _pad: 0,
-            },
-            WorldVertex {
-                position: positions[1],
-                uv: pack_uv(uvs[1][0], uvs[1][1]),
-                tex_layer: *tex_layer,
-                shade: 255,
-                tint_kind: tk,
-                light_packed: light,
-                _pad: 0,
-            },
-            WorldVertex {
-                position: positions[2],
-                uv: pack_uv(uvs[2][0], uvs[2][1]),
-                tex_layer: *tex_layer,
-                shade: 255,
-                tint_kind: tk,
-                light_packed: light,
-                _pad: 0,
-            },
-            WorldVertex {
-                position: positions[3],
-                uv: pack_uv(uvs[3][0], uvs[3][1]),
-                tex_layer: *tex_layer,
-                shade: 255,
-                tint_kind: tk,
-                light_packed: light,
-                _pad: 0,
-            },
-        ]);
-
-        // Add indices
-        mesh.indices
-            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-    }
 }
 
 #[cfg(test)]

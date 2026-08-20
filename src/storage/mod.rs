@@ -948,9 +948,6 @@ fn get_worker_error(last_error: &Arc<Mutex<Option<String>>>) -> Option<String> {
     last_error.lock().ok().and_then(|guard| guard.clone())
 }
 
-#[allow(dead_code)]
-fn _assert_send_sync<T: Send + Sync>() {}
-
 #[cfg(test)]
 mod tests {
     use super::{LruCache, RegionStorage, WorldStorage};

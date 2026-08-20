@@ -1,6 +1,5 @@
 use super::noise::NoiseSampler;
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WorldgenPreset {
     Flatish,
@@ -144,10 +143,6 @@ impl TerrainSampler {
             noise: NoiseSampler::new(cfg.seed),
             cfg,
         }
-    }
-
-    pub fn config(&self) -> &WorldGenConfig {
-        &self.cfg
     }
 
     pub fn height_at(&self, world_x: i32, world_z: i32, world_max_y: i32) -> i32 {

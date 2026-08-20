@@ -121,11 +121,6 @@ pub(crate) fn player_aabb_with_height(feet_pos: Vec3, height: f32) -> (Vec3, Vec
     )
 }
 
-#[allow(dead_code)]
-pub(crate) fn player_aabb(feet_pos: Vec3) -> (Vec3, Vec3) {
-    player_aabb_with_height(feet_pos, PLAYER_HEIGHT)
-}
-
 #[inline(always)]
 fn aabb_overlaps(min_a: Vec3, max_a: Vec3, min_b: Vec3, max_b: Vec3) -> bool {
     min_a.x < max_b.x
@@ -215,17 +210,6 @@ pub(crate) fn move_axis_with_collisions_for_height(
     pos
 }
 
-#[allow(dead_code)]
-pub(crate) fn move_axis_with_collisions(
-    world: &World,
-    pos: Vec3,
-    axis: usize,
-    delta_axis: f32,
-    hit_flag: &mut bool,
-) -> Vec3 {
-    move_axis_with_collisions_for_height(world, pos, axis, delta_axis, hit_flag, PLAYER_HEIGHT)
-}
-
 /// Shared Bewegung mit Axis-Separation:
 /// X -> Z -> Y, damit diagonales Sliding an Wänden robust bleibt.
 pub(crate) fn move_with_collisions_for_height(
@@ -278,8 +262,6 @@ pub(crate) fn move_with_collisions(
 pub(crate) struct CharacterMoveResult {
     pub(crate) feet_pos: Vec3,
     pub(crate) collision: CollisionFlags,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) stepped_up: bool,
 }
 
 pub(crate) fn horizontal_progress_squared(start: Vec3, end: Vec3) -> f32 {
@@ -299,7 +281,6 @@ pub(crate) fn move_horizontal_with_step_up_with_height(
     let base_result = CharacterMoveResult {
         feet_pos: flat_pos,
         collision: flat_flags,
-        stepped_up: false,
     };
 
     if delta_xz.x.abs() <= f32::EPSILON && delta_xz.z.abs() <= f32::EPSILON {
@@ -345,24 +326,7 @@ pub(crate) fn move_horizontal_with_step_up_with_height(
             hit_y_up: up_flags.hit_y_up,
             hit_y_down: down_flags.hit_y_down,
         },
-        stepped_up: true,
     }
-}
-
-#[allow(dead_code)]
-pub(crate) fn move_horizontal_with_step_up(
-    world: &World,
-    feet_pos: Vec3,
-    delta_xz: Vec3,
-    allow_step_up: bool,
-) -> CharacterMoveResult {
-    move_horizontal_with_step_up_with_height(
-        world,
-        feet_pos,
-        delta_xz,
-        allow_step_up,
-        PLAYER_HEIGHT,
-    )
 }
 
 #[cfg(test)]
@@ -388,22 +352,6 @@ pub(crate) fn move_character_with_step_up(
     result.collision.hit_y_up |= vertical_flags.hit_y_up;
     result.collision.hit_y_down |= vertical_flags.hit_y_down;
     result
-}
-
-#[allow(dead_code)]
-pub(crate) fn move_character_with_conditional_step_up(
-    world: &World,
-    feet_pos: Vec3,
-    delta: Vec3,
-    allow_step_up: bool,
-) -> CharacterMoveResult {
-    move_character_with_conditional_step_up_with_height(
-        world,
-        feet_pos,
-        delta,
-        allow_step_up,
-        PLAYER_HEIGHT,
-    )
 }
 
 pub(crate) fn move_character_with_conditional_step_up_with_height(
@@ -466,11 +414,6 @@ pub(crate) fn snap_to_ground_with_height(
     } else {
         (feet_pos, false)
     }
-}
-
-#[allow(dead_code)]
-pub(crate) fn snap_to_ground(world: &World, feet_pos: Vec3) -> (Vec3, bool) {
-    snap_to_ground_with_height(world, feet_pos, PLAYER_HEIGHT)
 }
 
 fn exp_approach(current: f32, target: f32, rate: f32, dt: f32) -> f32 {
@@ -843,8 +786,6 @@ pub(crate) fn update_flight_movement(
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct PlayerFluidState {
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) body_kind: Option<FluidKind>,
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) in_water_body: bool,
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) in_lava_body: bool,
@@ -853,19 +794,9 @@ pub(crate) struct PlayerFluidState {
     pub(crate) eyes_in_lava: bool,
     pub(crate) surface_contact_water: bool,
     pub(crate) surface_contact_lava: bool,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) water_surface_y: Option<f32>,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) lava_surface_y: Option<f32>,
     pub(crate) water_depth: f32,
     pub(crate) lava_depth: f32,
     pub(crate) depth_kind: Option<FluidKind>,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) surface_y: Option<f32>,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) submerged_depth: f32,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) at_surface: bool,
 }
 
 fn can_fit_player_height(world: &World, feet_pos: Vec3, height: f32) -> bool {
@@ -914,14 +845,6 @@ fn aabb_intersects_fluid_kind(
 }
 
 impl PlayerFluidState {
-    #[allow(dead_code)]
-    pub(crate) fn surface_for_kind(&self, kind: FluidKind) -> Option<f32> {
-        match kind {
-            FluidKind::Water => self.water_surface_y,
-            FluidKind::Lava => self.lava_surface_y,
-        }
-    }
-
     pub(crate) fn depth_for_kind(&self, kind: FluidKind) -> f32 {
         match kind {
             FluidKind::Water => self.water_depth,
@@ -976,13 +899,6 @@ impl PlayerFluidState {
             player_aabb_with_height(player.feet_position, player.collision_height());
         let in_water_body = aabb_intersects_fluid_kind(world, aabb_min, aabb_max, FluidKind::Water);
         let in_lava_body = aabb_intersects_fluid_kind(world, aabb_min, aabb_max, FluidKind::Lava);
-        let body_kind = if in_water_body {
-            Some(FluidKind::Water)
-        } else if in_lava_body {
-            Some(FluidKind::Lava)
-        } else {
-            None
-        };
         let surface_probe = player.feet_position + Vec3::new(0.0, 0.02, 0.0);
         let water_surface_y = liquid_height_at_point(world, FluidKind::Water, surface_probe)
             .or_else(|| liquid_height_at_point(world, FluidKind::Water, waist_point))
@@ -1003,16 +919,6 @@ impl PlayerFluidState {
         } else {
             (lava_depth > 0.0).then_some(FluidKind::Lava)
         };
-        let surface_y = depth_kind.and_then(|kind| match kind {
-            FluidKind::Water => water_surface_y,
-            FluidKind::Lava => lava_surface_y,
-        });
-        let submerged_depth = depth_kind
-            .map(|kind| match kind {
-                FluidKind::Water => water_depth,
-                FluidKind::Lava => lava_depth,
-            })
-            .unwrap_or(f32::NEG_INFINITY);
         let eyes_in_water = eye_kind == Some(FluidKind::Water);
         let eyes_in_lava = eye_kind == Some(FluidKind::Lava);
         let surface_contact_water = water_surface_y
@@ -1021,12 +927,8 @@ impl PlayerFluidState {
         let surface_contact_lava = lava_surface_y
             .map(|surface| (surface - eye_point.y).abs() <= FLUID_SURFACE_CONTACT_EPS)
             .unwrap_or(false);
-        let at_surface = surface_y
-            .map(|surface| (surface - eye_point.y).abs() <= FLUID_SURFACE_CONTACT_EPS)
-            .unwrap_or(false);
 
         Self {
-            body_kind,
             in_water_body,
             in_lava_body,
             underwater_kind: eye_kind,
@@ -1034,14 +936,9 @@ impl PlayerFluidState {
             eyes_in_lava,
             surface_contact_water,
             surface_contact_lava,
-            water_surface_y,
-            lava_surface_y,
             water_depth,
             lava_depth,
             depth_kind,
-            surface_y,
-            submerged_depth,
-            at_surface,
         }
     }
 }

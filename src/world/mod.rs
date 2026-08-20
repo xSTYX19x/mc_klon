@@ -1,7 +1,4 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
-use std::io;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,19 +28,10 @@ pub(crate) use chunk::{Chunk, ChunkBlocks, ChunkCoord, LightLevel, block_data_ar
 pub(crate) use config::WorldConfig;
 pub(crate) use environment::{PrecipitationKind, WorldEnvironment};
 pub(crate) use fluids::FluidKind;
-use fluids::fluid_kind;
 use manifest::{IdMapper, WorldManifest};
 
 pub(crate) const CHUNK_SIZE: i32 = 16;
-pub(crate) const WORLD_XZ: i32 = 256;
 pub(crate) const WORLD_MAX_Y: i32 = 255;
-pub(crate) const WORLD_CHUNKS_XZ: i32 = WORLD_XZ / CHUNK_SIZE;
-pub(crate) const WORLD_HEIGHT: i32 = WORLD_MAX_Y + 1;
-pub(crate) const SAVE_PATH: &str = "save/world.bin";
-const SAVE_MAGIC: [u8; 4] = *b"MCW0";
-const SAVE_VERSION: u16 = 15;
-const SAVE_VERSION_LEGACY_V14: u16 = 14;
-const SAVE_VERSION_LEGACY_V13: u16 = 13;
 
 type LocalCoord = IVec3;
 
@@ -690,7 +678,6 @@ pub(crate) struct SnapshotLightingChunk {
     // form than on flat arrays because the working set is ~10x smaller (see
     // `read_cost_report`).
     pub(crate) blocks: ChunkBlocks,
-    pub(crate) block_data: Arc<Vec<u8>>,
     pub(crate) light: Vec<u8>,
     // Per local (x,z) column: highest local y that blocks skylight, or -1 if none.
     pub(crate) sky_blocker_top: [i16; 256],
@@ -1402,10 +1389,6 @@ impl IncrementalLightingTask {
 
     pub(crate) fn region_chunk_count(&self) -> usize {
         self.region_coords.len()
-    }
-
-    pub(crate) fn total_stats(&self) -> IncrementalLightingStats {
-        self.total_stats
     }
 
     pub(crate) fn pending_queue_len(&self) -> usize {
@@ -2720,12 +2703,6 @@ impl World {
         (0..=WORLD_MAX_Y).contains(&world_pos.y)
     }
 
-    pub(crate) fn configure_generator(&mut self, seed: u64, preset: WorldgenPreset) {
-        self.cfg.seed = seed;
-        self.preset = preset;
-        self.generator = Box::new(TerrainGenerator::new(self.cfg, preset));
-    }
-
     pub(crate) fn configure_world_config(&mut self, cfg: WorldConfig, preset: WorldgenPreset) {
         self.cfg = cfg;
         self.preset = preset;
@@ -2799,10 +2776,6 @@ impl World {
         area
     }
 
-    pub(crate) fn ticking_area(&self, id: u32) -> Option<&TickingArea> {
-        self.ticking_areas.iter().find(|area| area.id == id)
-    }
-
     /// Applies an in-place edit (radius/flags) and returns the normalized result.
     pub(crate) fn update_ticking_area(
         &mut self,
@@ -2851,25 +2824,8 @@ impl World {
         self.id_mapper.missing_block_keys()
     }
 
-    pub(crate) fn encode_runtime_block_for_storage_u8(&self, block: BlockId) -> io::Result<u8> {
-        let manifest_id = self.id_mapper.encode_runtime_block(block);
-        u8::try_from(manifest_id).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "manifest id {} for runtime block {:?} exceeds u8 storage range",
-                    manifest_id, block
-                ),
-            )
-        })
-    }
-
     pub(crate) fn decode_manifest_block_id(&self, manifest_id: u32) -> BlockId {
         self.id_mapper.decode_manifest_id(manifest_id)
-    }
-
-    pub(crate) fn runtime_to_manifest_lut(&self) -> [u32; 256] {
-        self.id_mapper.runtime_to_manifest_lut()
     }
 
     pub(crate) fn min_chunk_y(&self) -> i32 {
@@ -2977,7 +2933,6 @@ impl World {
                 coord,
                 SnapshotLightingChunk {
                     blocks: chunk.blocks.clone(),
-                    block_data: Arc::clone(&chunk.block_data),
                     light: vec![0; chunk.light.len()],
                     sky_blocker_top,
                 },
@@ -3223,16 +3178,6 @@ impl World {
         affected
     }
 
-    pub(crate) fn lighting_on_block_changes(
-        &mut self,
-        changes: &[LightingBlockChange],
-    ) -> IncrementalLightingResult {
-        let mut engine = std::mem::take(&mut self.light_engine);
-        let affected = engine.on_block_changes(self, changes);
-        self.light_engine = engine;
-        affected
-    }
-
     pub(crate) fn rebuild_loaded_lighting(&mut self) {
         if self.chunks.is_empty() {
             return;
@@ -3248,14 +3193,6 @@ impl World {
                 chunk.revision = chunk.revision.wrapping_add(1);
             }
         }
-    }
-
-    pub(crate) fn is_solid_block_at(&self, wx: i32, wy: i32, wz: i32) -> bool {
-        let pos = IVec3::new(wx, wy, wz);
-        if !Self::in_bounds(pos) {
-            return true;
-        }
-        self.get_block(pos).is_solid()
     }
 
     #[cfg(test)]
@@ -3422,156 +3359,5 @@ impl World {
         self.generator
             .estimate_surface_height(world_x, world_z, max_y)
             .clamp(min_y, max_y)
-    }
-
-    pub(crate) fn save_to_file(&self, path: &str) -> io::Result<()> {
-        let save_path = Path::new(path);
-        if let Some(parent) = save_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let block_count = (WORLD_XZ * WORLD_XZ * WORLD_HEIGHT) as usize;
-        let mut bytes = Vec::with_capacity(4 + 2 + 4 + 4 + block_count + block_count);
-        bytes.extend_from_slice(&SAVE_MAGIC);
-        bytes.extend_from_slice(&SAVE_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&(WORLD_XZ as u32).to_le_bytes());
-        bytes.extend_from_slice(&(WORLD_MAX_Y as u32).to_le_bytes());
-
-        for y in 0..WORLD_HEIGHT {
-            for z in 0..WORLD_XZ {
-                for x in 0..WORLD_XZ {
-                    let id = self.get_block(IVec3::new(x, y, z));
-                    bytes.push(id.to_u8());
-                }
-            }
-        }
-        for y in 0..WORLD_HEIGHT {
-            for z in 0..WORLD_XZ {
-                for x in 0..WORLD_XZ {
-                    let pos = IVec3::new(x, y, z);
-                    let data = if fluid_kind(self.get_block(pos)).is_some() {
-                        self.get_block_data(pos)
-                    } else {
-                        0
-                    };
-                    bytes.push(data);
-                }
-            }
-        }
-
-        let tmp_path = save_path.with_extension("bin.tmp");
-        fs::write(&tmp_path, &bytes)?;
-        fs::rename(tmp_path, save_path)?;
-        Ok(())
-    }
-
-    pub(crate) fn load_from_file(path: &str) -> io::Result<Option<Self>> {
-        let save_path = Path::new(path);
-        if !save_path.exists() {
-            return Ok(None);
-        }
-
-        let bytes = fs::read(save_path)?;
-        let header_len = 4 + 2 + 4 + 4;
-        if bytes.len() < header_len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "save file too small",
-            ));
-        }
-
-        let file_magic = [bytes[0], bytes[1], bytes[2], bytes[3]];
-        if file_magic != SAVE_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "invalid save magic: expected {:?}, got {:?}",
-                    SAVE_MAGIC, file_magic
-                ),
-            ));
-        }
-
-        let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-        if version != SAVE_VERSION
-            && version != SAVE_VERSION_LEGACY_V14
-            && version != SAVE_VERSION_LEGACY_V13
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "unsupported save version: expected {}, {} or {}, got {}",
-                    SAVE_VERSION_LEGACY_V13, SAVE_VERSION_LEGACY_V14, SAVE_VERSION, version
-                ),
-            ));
-        }
-
-        let file_world_xz = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]) as i32;
-        let file_world_max_y =
-            u32::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]) as i32;
-        if file_world_xz != WORLD_XZ || file_world_max_y != WORLD_MAX_Y {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "save dimensions mismatch: expected WORLD_XZ={}, WORLD_MAX_Y={}, got WORLD_XZ={}, WORLD_MAX_Y={}",
-                    WORLD_XZ, WORLD_MAX_Y, file_world_xz, file_world_max_y
-                ),
-            ));
-        }
-
-        let expected_block_count = (WORLD_XZ * WORLD_XZ * WORLD_HEIGHT) as usize;
-        let expected_total_len_blocks_only = header_len + expected_block_count;
-        let expected_total_len_with_data = expected_total_len_blocks_only + expected_block_count;
-        let has_block_data = bytes.len() == expected_total_len_with_data;
-        if bytes.len() != expected_total_len_blocks_only && !has_block_data {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "save payload size mismatch: expected {} or {} bytes, got {} bytes",
-                    expected_total_len_blocks_only,
-                    expected_total_len_with_data,
-                    bytes.len()
-                ),
-            ));
-        }
-
-        let mut world = World::new();
-        let mut blocks_index = header_len;
-        let mut block_data_index = expected_total_len_blocks_only;
-        for y in 0..WORLD_HEIGHT {
-            for z in 0..WORLD_XZ {
-                for x in 0..WORLD_XZ {
-                    let raw = bytes[blocks_index];
-                    blocks_index += 1;
-                    let id = if version == SAVE_VERSION_LEGACY_V13 {
-                        BlockId::from_legacy_v13_u8(raw)
-                    } else {
-                        BlockId::from_u8(raw)
-                    }
-                    .map_err(|err| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("invalid block id in save: {} (version {})", err, version),
-                        )
-                    })?;
-                    let raw_data = if has_block_data {
-                        let value = bytes[block_data_index];
-                        block_data_index += 1;
-                        value
-                    } else {
-                        0
-                    };
-                    let data = if fluid_kind(id).is_some() {
-                        raw_data
-                    } else {
-                        0
-                    };
-                    if id != BlockId::Air {
-                        let _ = world.set_block_and_data(IVec3::new(x, y, z), id, data);
-                    }
-                }
-            }
-        }
-
-        Ok(Some(world))
     }
 }

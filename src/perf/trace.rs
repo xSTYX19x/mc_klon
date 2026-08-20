@@ -436,20 +436,6 @@ pub(crate) fn trace_file_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("logs/run_unknown.trace.json"))
 }
 
-pub(crate) fn stall_file_path() -> PathBuf {
-    TRACE_RUNTIME
-        .get()
-        .map(|rt| rt.stall_path.clone())
-        .unwrap_or_else(|| PathBuf::from("logs/run_unknown.stall.txt"))
-}
-
-pub(crate) fn gpu_csv_path() -> PathBuf {
-    TRACE_RUNTIME
-        .get()
-        .map(|rt| rt.gpu_csv_path.clone())
-        .unwrap_or_else(|| PathBuf::from("logs/run_unknown.gpu.csv"))
-}
-
 pub(crate) fn scope(tag: impl Into<String>) -> TraceScope {
     TraceScope {
         tag: tag.into(),
@@ -606,10 +592,6 @@ pub(crate) fn append_gpu_csv_line(header: &str, line: &str) -> io::Result<()> {
     }
     let file = slot.as_mut().expect("gpu csv writer just initialized");
     writeln!(file, "{line}")
-}
-
-pub(crate) fn note_gpu_wait(reason: &str) {
-    instant_event("gpu.wait", reason);
 }
 
 #[cfg(test)]

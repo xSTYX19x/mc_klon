@@ -350,16 +350,6 @@ impl FluidSystem {
         self.lava_dimension_mode = mode;
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn set_source_conversion_rules(
-        &mut self,
-        _water_enabled: bool,
-        _lava_enabled: bool,
-    ) {
-        // Source conversion rules are fixed to the vanilla-like default:
-        // water infinite sources enabled, lava source conversion disabled.
-    }
-
     fn params_for_kind(&self, kind: FluidKind) -> FluidParams {
         match kind {
             FluidKind::Water => FluidParams {

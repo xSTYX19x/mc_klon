@@ -83,8 +83,7 @@ use crate::storage::chunk_codec::{
     decode_chunk_from_section_blob, decode_column, validate_column_for_world,
 };
 use crate::storage::format::{
-    SAVE_ROOT_DIR, SECTION_BLOCK_COUNT, TICKING_AREAS_FILE_NAME, WORLD_MANIFEST_FILE_NAME,
-    WORLD_META_FILE_NAME,
+    SAVE_ROOT_DIR, TICKING_AREAS_FILE_NAME, WORLD_MANIFEST_FILE_NAME, WORLD_META_FILE_NAME,
 };
 use crate::storage::world_meta::{self, PlayerSpawn, WorldMeta};
 use crate::storage::{
@@ -1129,7 +1128,6 @@ const FIRST_PERSON_HELD_ITEM_GRIP_TO_CENTER_UP: f32 = 0.3;
 const FIRST_PERSON_HELD_ITEM_GRIP_TO_CENTER_FORWARD: f32 = 1.5;
 const FIRST_PERSON_HELD_ITEM_YAW_RAD: f32 = -35.0_f32.to_radians();
 const FIRST_PERSON_HELD_ITEM_PITCH_RAD: f32 = 0.0_f32.to_radians();
-const COORDS_TEXT_SCALE: f32 = 1.5;
 const DEBUG_OVERLAY_TEXT_SCALE: f32 = 2.5;
 const CHAT_OVERLAY_TEXT_SCALE: f32 = 2.35;
 const CHAT_OVERLAY_PAD_X: f32 = 8.0;
@@ -1247,7 +1245,6 @@ const STORAGE_SAVE_RESULTS_PER_FRAME: usize = 32;
 const LIGHTING_RESULTS_PER_FRAME: usize = 2;
 const LIGHTING_CHANGED_CHUNK_DIRTY_APPLY_PER_FRAME: usize = 64;
 const LIGHTING_CHANGED_CHUNK_DIRTY_APPLY_BUDGET_MS: f32 = 0.5;
-const LIGHTING_REBUILD_DEBOUNCE_MS: u64 = 75;
 // Job granularity. Bigger jobs amortize the per-job fixed cost (region
 // collection plus the finalize/dirty sweep in `commit_incremental_lighting_result`)
 // without making an individual step longer — steps stay bounded by
@@ -3054,89 +3051,6 @@ struct BitmapFont {
     texel_scale_y: u32,
     glyph_h: u8,
     glyph_widths: [u8; 256],
-}
-
-#[allow(dead_code)]
-fn build_face_highlight_mesh(
-    hit_block_pos: IVec3,
-    hit_normal: IVec3,
-    face_offset: f32,
-) -> (Vec<Vertex>, Vec<u32>) {
-    let base = Vec3::new(
-        hit_block_pos.x as f32,
-        hit_block_pos.y as f32,
-        hit_block_pos.z as f32,
-    );
-    let n = Vec3::new(
-        hit_normal.x as f32,
-        hit_normal.y as f32,
-        hit_normal.z as f32,
-    );
-
-    let (origin, u, v) = match (hit_normal.x, hit_normal.y, hit_normal.z) {
-        (1, 0, 0) => (
-            base + Vec3::new(1.0, 0.0, 0.0),
-            Vec3::new(0.0, 1.0, 0.0),
-            Vec3::new(0.0, 0.0, 1.0),
-        ),
-        (-1, 0, 0) => (base, Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 1.0, 0.0)),
-        (0, 1, 0) => (
-            base + Vec3::new(0.0, 1.0, 0.0),
-            Vec3::new(0.0, 0.0, 1.0),
-            Vec3::new(1.0, 0.0, 0.0),
-        ),
-        (0, -1, 0) => (base, Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0)),
-        (0, 0, 1) => (
-            base + Vec3::new(0.0, 0.0, 1.0),
-            Vec3::new(1.0, 0.0, 0.0),
-            Vec3::new(0.0, 1.0, 0.0),
-        ),
-        (0, 0, -1) => (base, Vec3::new(0.0, 1.0, 0.0), Vec3::new(1.0, 0.0, 0.0)),
-        _ => (base, Vec3::X, Vec3::Y),
-    };
-
-    let p0 = origin + n * face_offset;
-    let p1 = origin + u + n * face_offset;
-    let p2 = origin + u + v + n * face_offset;
-    let p3 = origin + v + n * face_offset;
-
-    let white = [1.0, 1.0, 1.0];
-    let vertices = vec![
-        Vertex {
-            position: p0.to_array(),
-            uv: [0.0, 0.0],
-            tex_layer: 0,
-            tint_kind: TINT_NONE,
-            light_packed: FULLBRIGHT_LIGHT_PACKED,
-            color: white,
-        },
-        Vertex {
-            position: p1.to_array(),
-            uv: [0.0, 0.0],
-            tex_layer: 0,
-            tint_kind: TINT_NONE,
-            light_packed: FULLBRIGHT_LIGHT_PACKED,
-            color: white,
-        },
-        Vertex {
-            position: p2.to_array(),
-            uv: [0.0, 0.0],
-            tex_layer: 0,
-            tint_kind: TINT_NONE,
-            light_packed: FULLBRIGHT_LIGHT_PACKED,
-            color: white,
-        },
-        Vertex {
-            position: p3.to_array(),
-            uv: [0.0, 0.0],
-            tex_layer: 0,
-            tint_kind: TINT_NONE,
-            light_packed: FULLBRIGHT_LIGHT_PACKED,
-            color: white,
-        },
-    ];
-    let indices = vec![0, 1, 2, 0, 2, 3];
-    (vertices, indices)
 }
 
 pub(crate) fn build_fullscreen_overlay_mesh(
@@ -5320,42 +5234,6 @@ fn build_menu_overlay_mesh(
     (vertices, indices)
 }
 
-fn build_coords_overlay_mesh(
-    view_width: u32,
-    view_height: u32,
-    font: &BitmapFont,
-    camera: &Camera,
-) -> (Vec<Vertex>, Vec<u32>) {
-    let mut vertices = Vec::with_capacity(512);
-    let mut indices = Vec::with_capacity(768);
-
-    let world_x = camera.position.x;
-    let world_y = camera.position.y;
-    let world_z = camera.position.z;
-    let chunk = World::world_to_chunk_coord(IVec3::new(
-        world_x.floor() as i32,
-        world_y.floor() as i32,
-        world_z.floor() as i32,
-    ));
-    let text = format!(
-        "XYZ {:.1} {:.1} {:.1}  C {} {} {}",
-        world_x, world_y, world_z, chunk.x, chunk.y, chunk.z
-    );
-    append_bitmap_text_with_shadow(
-        &mut vertices,
-        &mut indices,
-        view_width,
-        view_height,
-        font,
-        &text,
-        COORDS_PAD_X,
-        COORDS_PAD_Y,
-        COORDS_TEXT_SCALE,
-    );
-
-    (vertices, indices)
-}
-
 fn build_debug_overlay_mesh(
     view_width: u32,
     view_height: u32,
@@ -5584,7 +5462,6 @@ pub(crate) struct State {
     backface_culling_enabled: bool,
     debug_depth_test: bool,
     pub(crate) world: World,
-    zero_light_chunk_data: Arc<Vec<u8>>,
     chunk_meshes: HashMap<ChunkCoord, LayeredChunkMesh>,
     full_solid_mesh_skip_set: HashSet<ChunkCoord>,
     lod_meshes: HashMap<LodColumnCoord, ChunkMesh>,
@@ -6008,13 +5885,6 @@ impl State {
         }
     }
 
-    fn boundary_ocean_defaults_for_preset(preset: WorldgenPreset) -> (bool, i32) {
-        match preset {
-            WorldgenPreset::Rd161348Like => (true, 128),
-            _ => (false, 128),
-        }
-    }
-
     fn load_ticking_areas_into_world(save_root: &Path, world: &mut World) {
         let path = Self::ticking_areas_path_for(save_root);
         match ticking_areas::load(&path) {
@@ -6336,10 +6206,6 @@ impl State {
         self.restart_storage_services_for_current_save_root();
     }
 
-    pub(crate) fn world_session_state(&self) -> WorldSessionState {
-        self.world_session_state
-    }
-
     pub(crate) fn world_session_debug_line(&self) -> String {
         format!(
             "World session: id={} state={} runtime={} sim={} save_root={}",
@@ -6639,15 +6505,6 @@ impl State {
             save_root.display()
         );
         Ok(())
-    }
-
-    pub(crate) fn set_world_session_active(&mut self, reason: &str) {
-        if self.world_session_state == WorldSessionState::Unloaded {
-            self.next_world_session_id();
-        }
-        self.saved_loads_paused = false;
-        self.startup_saved_load_bypass_logged = false;
-        self.transition_world_session(WorldSessionState::Active, reason);
     }
 
     pub(crate) fn set_world_session_paused(&mut self, paused: bool, reason: &str) {
@@ -8779,10 +8636,6 @@ impl State {
         );
     }
 
-    pub(crate) fn far_lod_enabled(&self) -> bool {
-        self.far_lod_enabled
-    }
-
     pub(crate) fn should_report_stall(&self, frame_dt_ms: f32) -> bool {
         frame_dt_ms > STALL_REPORT_THRESHOLD_MS
     }
@@ -10520,7 +10373,6 @@ impl State {
         let simulation_distance_chunks = simulation_distance
             .distance_chunks()
             .min(view_distance_chunks);
-        let zero_light_chunk_data = Arc::new(vec![0u8; SECTION_BLOCK_COUNT]);
 
         crate::console_info!(
             "[perf][startup] State::new setup before first frame took: {:.2}ms",
@@ -10556,7 +10408,6 @@ impl State {
             backface_culling_enabled: true,
             debug_depth_test: true,
             world,
-            zero_light_chunk_data,
             chunk_meshes,
             full_solid_mesh_skip_set: HashSet::new(),
             lod_meshes,
@@ -11815,11 +11666,6 @@ impl State {
         }
     }
 
-    fn chunk_visibility_score(&self, camera: &Camera, chunk_coord: ChunkCoord) -> u32 {
-        let frustum = self.build_frustum_for_camera(camera);
-        Self::chunk_visibility_score_for_frustum(&frustum, chunk_coord)
-    }
-
     fn stream_priority_key_for_chunk(
         &mut self,
         coord: ChunkCoord,
@@ -11854,19 +11700,6 @@ impl State {
             y_band_rank,
             age,
         }
-    }
-
-    fn clear_chunkgen_pending_requests(&mut self) {
-        self.chunkgen_pending_set.clear();
-        self.chunkgen_pending_enqueued_frame.clear();
-        self.chunkgen_pending_priority.clear();
-        self.chunkgen_pending_round_robin.clear();
-        self.chunkgen_pending_heap.clear();
-        self.chunkgen_pending_scan_cursor = 0;
-        self.chunkgen_pending_refresh_cursor = 0;
-        self.chunkgen_heap_valid_for_center = None;
-        self.chunkgen_heap_valid_for_radius = -1;
-        self.chunkgen_priority_context_stamp = None;
     }
 
     fn startup_radius_chunks(&self) -> i32 {
@@ -13285,18 +13118,6 @@ impl State {
             for (pos, kind) in to_schedule {
                 let delay = fluids.tick_rate_for_kind(kind);
                 fluids.schedule_fluid_update(pos, kind, delay);
-            }
-        });
-    }
-
-    fn enqueue_generated_fluids_from_bootstrap_cells(
-        &mut self,
-        cells: &[GeneratedFluidBootstrapCell],
-    ) {
-        let _ = self.with_fluids_system(|fluids| {
-            for cell in cells {
-                let delay = fluids.tick_rate_for_kind(cell.kind);
-                fluids.schedule_fluid_update(cell.pos, cell.kind, delay);
             }
         });
     }
@@ -15077,18 +14898,6 @@ impl State {
         );
     }
 
-    pub(crate) fn begin_startup_loading(&mut self) {
-        if self.world_session_state != WorldSessionState::Unloaded {
-            self.shutdown_world_session("begin_startup_loading");
-        }
-        let (warmup_center_x, warmup_center_z) = self.startup_spawn_chunk_center();
-        self.begin_world_startup_task(
-            WorldGenerationKind::StartupLoad,
-            warmup_center_x,
-            warmup_center_z,
-        );
-    }
-
     pub(crate) fn begin_new_world(
         &mut self,
         seed: u64,
@@ -16342,26 +16151,6 @@ impl State {
         }
     }
 
-    fn apply_deferred_edits_to_loaded_world_chunk(&mut self, coord: ChunkCoord) -> ApplyEditsStats {
-        if !self.has_deferred_edits(coord) {
-            return ApplyEditsStats::default();
-        }
-        let Some(mut chunk) = self.world.chunks.remove(&coord) else {
-            return ApplyEditsStats::default();
-        };
-        let stats = self.apply_deferred_edits_to_chunk(coord, &mut chunk);
-        self.full_solid_mesh_skip_set.remove(&coord);
-        if chunk.is_empty() {
-            self.generated_empty_chunks.insert(coord);
-            self.chunk_origin.remove(&coord);
-        } else {
-            self.generated_empty_chunks.remove(&coord);
-            self.world.chunks.insert(coord, chunk);
-            self.mark_chunk_user_only_if_unknown(coord);
-        }
-        stats
-    }
-
     pub(crate) fn defer_block_edit(&mut self, edit: DeferredBlockEdit) {
         if !World::in_bounds(edit.world_pos) {
             return;
@@ -16555,21 +16344,6 @@ impl State {
         for coord in remove_entries {
             self.fluid_mesh_coalesce.remove(&coord);
         }
-    }
-
-    pub(crate) fn mark_dirty_after_block_change(
-        &mut self,
-        world_pos: IVec3,
-        old_block: BlockId,
-        new_block: BlockId,
-    ) -> usize {
-        let invalidations =
-            self.classify_block_edit_mesh_invalidation(world_pos, old_block, new_block);
-        for invalidation in invalidations.iter().copied() {
-            self.mark_chunk_dirty_with_scope(invalidation.coord, invalidation.dirty);
-            self.mark_column_dirty_for_chunk(invalidation.coord);
-        }
-        invalidations.len()
     }
 
     fn stage_block_edit_dirty_after_block_change(
@@ -17872,26 +17646,6 @@ impl State {
         );
     }
 
-    fn request_lighting_rebuild(&mut self) {
-        // Retained as a fallback for explicit bulk rebuilds; ordinary streaming
-        // now uses immediate incremental lighting hooks instead.
-        let was_pending = self.lighting_request_pending;
-        if self.lighting_job_inflight || !self.lighting_request_pending {
-            self.lighting_generation = self.lighting_generation.wrapping_add(1);
-        }
-        self.lighting_request_pending = true;
-        self.lighting_rebuild_not_before =
-            Some(Instant::now() + Duration::from_millis(LIGHTING_REBUILD_DEBOUNCE_MS));
-        if !was_pending {
-            crate::console_error!(
-                "[perf][lighting][async] requested gen={} debounce_ms={} inflight={}",
-                self.lighting_generation,
-                LIGHTING_REBUILD_DEBOUNCE_MS,
-                self.lighting_job_inflight
-            );
-        }
-    }
-
     fn queue_lighting_changed_chunk_dirty(&mut self, coord: ChunkCoord) {
         if self.pending_lighting_dirty_set.insert(coord) {
             self.pending_lighting_dirty_chunks.push_back(coord);
@@ -18157,36 +17911,6 @@ impl State {
         let _ = self.stage_block_edit_dirty_after_block_change(landing, replaced, BlockId::Sand);
         self.enqueue_block_edit_lighting_repairs(&[source_lighting, landing_lighting]);
         true
-    }
-
-    fn resolve_sand_gravity_after_direct_block_update(
-        &mut self,
-        world_pos: IVec3,
-    ) -> SandGravityResolveStats {
-        let mut stats = SandGravityResolveStats::default();
-        if !World::in_bounds(world_pos) {
-            return stats;
-        }
-
-        if self.world.get_block(world_pos) == BlockId::Sand {
-            stats.scanned += 1;
-            if self.try_drop_sand_block(world_pos) {
-                stats.dropped += 1;
-            }
-        }
-
-        let start_y = (world_pos.y + 1).clamp(0, WORLD_MAX_Y);
-        for y in start_y..=WORLD_MAX_Y {
-            let pos = IVec3::new(world_pos.x, y, world_pos.z);
-            if self.world.get_block(pos) != BlockId::Sand {
-                break;
-            }
-            stats.scanned += 1;
-            if self.try_drop_sand_block(pos) {
-                stats.dropped += 1;
-            }
-        }
-        stats
     }
 
     fn dispatch_dirty_chunk_meshes_pass(
@@ -21088,13 +20812,6 @@ impl State {
             self.last_visible_chunks,
             self.last_visible_lod_columns,
             self.last_render_ms,
-        )
-    }
-
-    pub(crate) fn frustum_culling_stats(&self) -> (u64, u64) {
-        (
-            self.frustum_culled_chunks_total,
-            self.meshes_skipped_due_to_frustum,
         )
     }
 

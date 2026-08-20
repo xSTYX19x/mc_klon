@@ -22,8 +22,6 @@ pub struct TextureArray {
     pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,
     pub sampler: wgpu::Sampler,
-    pub format: wgpu::TextureFormat,
-    pub layer_count: u32,
 }
 
 impl TextureArray {
@@ -191,8 +189,6 @@ impl TextureArray {
             texture,
             view,
             sampler,
-            format,
-            layer_count,
         })
     }
 }

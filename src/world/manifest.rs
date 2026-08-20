@@ -126,7 +126,6 @@ impl WorldManifest {
 #[derive(Clone, Debug)]
 pub(crate) struct IdMapper {
     pub(crate) from_manifest: Vec<BlockId>,
-    pub(crate) to_manifest: HashMap<NamespacedKey, u32>,
     runtime_to_manifest_lut: [u32; 256],
     missing_manifest_keys: Vec<String>,
     missing_manifest_id: u32,
@@ -222,7 +221,6 @@ impl IdMapper {
 
         IdMapper {
             from_manifest,
-            to_manifest,
             runtime_to_manifest_lut,
             missing_manifest_keys,
             missing_manifest_id: fallback_manifest_id,
@@ -251,10 +249,6 @@ impl IdMapper {
 
     pub(crate) fn missing_block_keys(&self) -> &[String] {
         &self.missing_manifest_keys
-    }
-
-    pub(crate) fn runtime_to_manifest_lut(&self) -> [u32; 256] {
-        self.runtime_to_manifest_lut
     }
 }
 

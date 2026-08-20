@@ -99,34 +99,8 @@ impl LiquidMeshingPool {
 
     /// Get allocation statistics for performance tracking
     pub(crate) fn allocation_stats(&self) -> LiquidPoolStats {
-        // Count entries with each type of valid data
-        let mut water_surface_used = 0;
-        let mut lava_surface_used = 0;
-        let mut water_wall_used = 0;
-        let mut lava_wall_used = 0;
-
-        for entry in self.corner_cache.values() {
-            if entry.is_water_surface_valid() {
-                water_surface_used += 1;
-            }
-            if entry.is_lava_surface_valid() {
-                lava_surface_used += 1;
-            }
-            if entry.is_water_wall_valid() {
-                water_wall_used += 1;
-            }
-            if entry.is_lava_wall_valid() {
-                lava_wall_used += 1;
-            }
-        }
-
         LiquidPoolStats {
             total_capacity: self.corner_cache.capacity(),
-            total_entries: self.corner_cache.len(),
-            water_surface_used,
-            lava_surface_used,
-            water_wall_used,
-            lava_wall_used,
         }
     }
 }
@@ -135,23 +109,11 @@ impl LiquidMeshingPool {
 #[derive(Debug, Clone)]
 pub(crate) struct LiquidPoolStats {
     pub(crate) total_capacity: usize,
-    pub(crate) total_entries: usize,
-    pub(crate) water_surface_used: usize,
-    pub(crate) lava_surface_used: usize,
-    pub(crate) water_wall_used: usize,
-    pub(crate) lava_wall_used: usize,
 }
 
 impl LiquidPoolStats {
     pub(crate) fn total_capacity(&self) -> usize {
         self.total_capacity
-    }
-
-    pub(crate) fn total_used(&self) -> usize {
-        self.water_surface_used
-            + self.lava_surface_used
-            + self.water_wall_used
-            + self.lava_wall_used
     }
 }
 
@@ -166,15 +128,6 @@ pub(crate) const LIQUID_EPS: f32 = 0.001;
 fn height_from_level(level: u8) -> f32 {
     const MIN_HEIGHT: f32 = 1.0 / 8.0;
     ((8.0 - level as f32) / 8.0).clamp(MIN_HEIGHT, LIQUID_SOURCE_HEIGHT)
-}
-
-#[cfg(test)]
-pub(crate) fn fluid_surface_height(kind: FluidKind, level: u8, is_falling: bool) -> f32 {
-    if is_falling {
-        return LIQUID_SOURCE_HEIGHT;
-    }
-    let _ = kind;
-    height_from_level(level)
 }
 
 fn is_same_fluid<A: BlockAccess + ?Sized>(world: &A, pos: IVec3, kind: FluidKind) -> bool {
@@ -213,15 +166,6 @@ pub(crate) fn wall_height<A: BlockAccess + ?Sized>(world: &A, pos: IVec3, kind: 
         return 1.0;
     }
     surface_height(world, pos, kind)
-}
-
-#[cfg(test)]
-pub(crate) fn effective_cell_height<A: BlockAccess + ?Sized>(
-    world: &A,
-    pos: IVec3,
-    kind: FluidKind,
-) -> f32 {
-    wall_height(world, pos, kind)
 }
 
 pub(super) fn fluid_surface_height_at<A: BlockAccess + ?Sized>(

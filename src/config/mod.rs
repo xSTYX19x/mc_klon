@@ -61,52 +61,10 @@ pub(crate) mod player {
     pub(crate) const SWIM_POSE_EYE_HEIGHT: f32 = 0.4;
     pub(crate) const COLLISION_EPS: f32 = 1e-4;
     pub(crate) const COLLISION_SUBSTEP: f32 = 0.1;
-    #[allow(dead_code)]
-    pub(crate) const GRAVITY: f32 = PLAYER_TUNING_MINECRAFT.gravity_per_tick
-        * PLAYER_TUNING_MINECRAFT.mc_ticks_per_second
-        * PLAYER_TUNING_MINECRAFT.mc_ticks_per_second;
     pub(crate) const WADING_SPEED_MULT: f32 = 0.7;
     pub(crate) const WADING_ACCEL_MULT: f32 = 0.8;
     pub(crate) const WADING_EXTRA_DRAG: f32 = 2.0;
     pub(crate) const SWIM_ENTER_DEPTH: f32 = 0.9;
-    #[allow(dead_code)]
-    pub(crate) const SWIM_EXIT_DEPTH: f32 = 0.6;
-    #[allow(dead_code)]
-    pub(crate) const SWIM_BOB_SURFACE_BAND_EYE: f32 = 0.4;
-    #[allow(dead_code)]
-    pub(crate) const SWIM_BOBBING_AMP: f32 = 0.5;
-    #[allow(dead_code)]
-    pub(crate) const SWIM_BOB_K: f32 = 18.0;
-    #[allow(dead_code)]
-    pub(crate) const SWIM_BOB_D: f32 = 8.0;
-    #[allow(dead_code)]
-    pub(crate) const SWIM_WATER_SINK_RATE: f32 = 0.10;
-    #[allow(dead_code)]
-    pub(crate) const SWIM_LAVA_SINK_RATE: f32 = 0.05;
-    #[allow(dead_code)]
-    pub(crate) const SWIM_LIQUID_GRAVITY_MULT: f32 = 0.35;
-    #[allow(dead_code)]
-    pub(crate) const SWIM_BUOYANCY_MULT: f32 = 0.6;
-    #[allow(dead_code)]
-    pub(crate) const SWIM_WATER_MAX_SPEED: f32 = 4.5;
-    #[allow(dead_code)]
-    pub(crate) const SWIM_WATER_ACCEL: f32 = 18.0;
-    #[allow(dead_code)]
-    pub(crate) const SWIM_WATER_DRAG_XZ: f32 = 6.0;
-    #[allow(dead_code)]
-    pub(crate) const SWIM_WATER_DRAG_Y: f32 = 4.0;
-    #[allow(dead_code)]
-    pub(crate) const SWIM_WATER_BOB_FREQ: f32 = 1.2;
-    #[allow(dead_code)]
-    pub(crate) const SWIM_LAVA_MAX_SPEED: f32 = SWIM_WATER_MAX_SPEED * 0.5;
-    #[allow(dead_code)]
-    pub(crate) const SWIM_LAVA_ACCEL: f32 = SWIM_WATER_ACCEL * 0.6;
-    #[allow(dead_code)]
-    pub(crate) const SWIM_LAVA_DRAG_XZ: f32 = 10.0;
-    #[allow(dead_code)]
-    pub(crate) const SWIM_LAVA_DRAG_Y: f32 = 8.0;
-    #[allow(dead_code)]
-    pub(crate) const SWIM_LAVA_BOB_FREQ: f32 = 0.8;
     pub(crate) const FLUID_SURFACE_CONTACT_EPS: f32 = 0.08;
     pub(crate) const FLUID_INPUT_ACCEL_PER_TICK: f32 = 0.02;
     pub(crate) const FLUID_GRAVITY_PER_TICK: f32 = 0.02;
@@ -238,17 +196,6 @@ pub(crate) mod render {
             Self::Insane,
         ];
 
-        pub(crate) fn next(self) -> Self {
-            match self {
-                Self::Short => Self::Normal,
-                Self::Normal => Self::Far,
-                Self::Far => Self::Extreme,
-                Self::Extreme => Self::Ultra,
-                Self::Ultra => Self::Insane,
-                Self::Insane => Self::Short,
-            }
-        }
-
         pub(crate) fn label(self) -> &'static str {
             match self {
                 Self::Short => "Short",
@@ -348,7 +295,6 @@ pub(crate) mod render {
     pub(crate) const STREAM_BURST_MISSING_MESHES_THRESHOLD: usize = 24;
     pub(crate) const STREAM_BURST_NEAR_RADIUS_CHUNKS: i32 = 4;
     pub(crate) const NEAR_MESH_RADIUS_CHUNKS: i32 = 8;
-    pub(crate) const HIGHLIGHT_FACE_OFFSET: f32 = 0.0015;
     pub(crate) const HIGHLIGHT_BLINK_MS: u128 = 250;
     pub(crate) const CROSSHAIR_THICKNESS_PX: f32 = 4.0;
     pub(crate) const CROSSHAIR_HALF_LEN_PX: f32 = 14.0;

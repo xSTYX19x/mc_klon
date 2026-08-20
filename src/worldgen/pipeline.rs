@@ -103,7 +103,7 @@ impl WorldgenPipeline {
             || matches!((&**a, &**b), (DensityFn::Y, DensityFn::Constant(v)) if *v == -1.0)
     }
 
-    pub fn generate_chunk(&self, seed: u64, coord: ChunkCoord, out: &mut Chunk) {
+    pub fn generate_chunk(&self, coord: ChunkCoord, out: &mut Chunk) {
         out.blocks.make_flat_mut().fill(BlockId::Air);
         Arc::make_mut(&mut out.block_data).fill(0);
 
@@ -122,8 +122,8 @@ impl WorldgenPipeline {
                 smooth,
             }) => DensityChunkCache::build_heightmap_minus_y(coord, sampler, *max_y, *smooth),
             None => {
-                let mut ctx = EvalContext::new(seed);
-                ctx.init_for_chunk(coord.x, coord.y, coord.z);
+                let mut ctx = EvalContext::new();
+                ctx.init_for_chunk(coord.x, coord.z);
                 let cache = DensityChunkCache::build(&self.density_root, &mut ctx, coord);
                 fallback_ctx = Some(ctx);
                 cache
@@ -295,7 +295,6 @@ mod tests {
             dirt_depth: 3,
             shore_band: 1,
         };
-        let seed = world_cfg.seed;
         let fast_pipeline = WorldgenPipeline::new(
             build_fast_density_root(Arc::clone(&sampler), world_cfg.max_y),
             surface_rules,
@@ -319,10 +318,10 @@ mod tests {
         ];
         for coord in coords {
             let mut fast_chunk = Chunk::new_empty();
-            fast_pipeline.generate_chunk(seed, coord, &mut fast_chunk);
+            fast_pipeline.generate_chunk(coord, &mut fast_chunk);
 
             let mut fallback_chunk = Chunk::new_empty();
-            fallback_pipeline.generate_chunk(seed, coord, &mut fallback_chunk);
+            fallback_pipeline.generate_chunk(coord, &mut fallback_chunk);
 
             assert_eq!(
                 fast_chunk.blocks.to_vec(),

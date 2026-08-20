@@ -20,7 +20,7 @@ use crate::world::fluids::{
 use crate::world::{CHUNK_SIZE, Chunk, ChunkBlocks, ChunkCoord, WORLD_MAX_Y, block_data_arc};
 use crate::worldgen::{
     ChunkGenerator, ColumnBuffer, GenContext, TerrainGenerator, TerrainSampler, WorldGenConfig,
-    WorldGenerator, WorldgenPreset, carvers::Carvers, ores::apply_ores_to_column,
+    WorldgenPreset, carvers::Carvers, ores::apply_ores_to_column,
 };
 
 const WATER_FEATURE_CHANCE_PER_CHUNK_256: u32 = 24;
@@ -1849,12 +1849,6 @@ impl StreamingWorldColumnGenerator {
             stage_timings.winter_surface = stage_started.elapsed();
         }
         (shoreline_sand_by_chunk, stage_timings, winter_stats)
-    }
-}
-
-impl WorldGenerator for StreamingWorldColumnGenerator {
-    fn generate_column(&self, cx: i32, cz: i32, out: &mut ColumnBuffer, ctx: &mut GenContext) {
-        let _ = self.generate_column_with_debug_stats(cx, cz, out, ctx);
     }
 }
 

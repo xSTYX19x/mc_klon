@@ -306,7 +306,6 @@ struct OptionsMenuState {
 const WORLD_ACTION_ROW_LOAD: usize = 0;
 const WORLD_ACTION_ROW_RENAME: usize = 1;
 const WORLD_ACTION_ROW_DELETE: usize = 2;
-const WORLD_ACTION_ROW_BACK: usize = 3;
 const WORLD_ACTION_ROW_COUNT: usize = 4;
 
 /// Per-world management screen reached from the load-level list.

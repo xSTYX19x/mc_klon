@@ -136,18 +136,6 @@ pub(crate) enum BlockId {
     Snow = 50,
 }
 
-pub(crate) const HOTBAR: [BlockId; 9] = [
-    BlockId::Stone,
-    BlockId::Dirt,
-    BlockId::Grass,
-    BlockId::OakPlanks,
-    BlockId::WaterStill,
-    BlockId::Sapling,
-    BlockId::WaterFlowing,
-    BlockId::LavaStill,
-    BlockId::LavaFlowing,
-];
-
 pub(crate) const CLASSIC_PALETTE_ORDER: [BlockId; 43] = [
     // Row 1
     BlockId::Stone,
@@ -2119,16 +2107,8 @@ impl BlockRegistry {
         self.def(block).breakable
     }
 
-    pub(crate) fn block_entity_key_for(&self, block: BlockId) -> Option<&'static str> {
-        block_spec_for(block).block_entity
-    }
-
     pub(crate) fn random_tick_for(&self, block: BlockId) -> Option<RandomTickFn> {
         block_spec_for(block).random_tick
-    }
-
-    pub(crate) fn has_random_tick(&self, block: BlockId) -> bool {
-        self.random_tick_for(block).is_some()
     }
 
     pub(crate) fn registered_block_keys(&self) -> Vec<NamespacedKey> {
@@ -2154,11 +2134,6 @@ impl BlockRegistry {
 
     pub(crate) fn name_of(&self, block: BlockId) -> &'static str {
         block_key_str_for_block(block)
-    }
-
-    pub(crate) fn resolve(&self, name: &str) -> Option<BlockId> {
-        let key = NamespacedKey::parse(name)?;
-        self.block_for_key(&key)
     }
 
     pub(crate) fn resolve_fast(&self, name: &str) -> Option<BlockId> {
@@ -2418,18 +2393,6 @@ impl BlockId {
         block_spec_from_u8(value)
             .map(|spec| spec.variant)
             .ok_or(InvalidBlockId { raw: value })
-    }
-
-    pub(crate) fn from_legacy_v13_u8(value: u8) -> Result<Self, InvalidBlockId> {
-        match value {
-            0 => Ok(BlockId::Air),
-            1 => Ok(BlockId::Grass),
-            2 => Ok(BlockId::Stone),
-            3 => Ok(BlockId::Sapling),
-            4 => Ok(BlockId::Dirt),
-            5 => Ok(BlockId::OakPlanks),
-            _ => Err(InvalidBlockId { raw: value }),
-        }
     }
 
     pub(crate) fn display_name(self) -> &'static str {

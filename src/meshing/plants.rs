@@ -4,15 +4,6 @@ use crate::world::chunk::Chunk;
 
 use super::{WorldCpuMeshData, WorldVertex, FULLBRIGHT_LIGHT_PACKED, pack_uv};
 
-pub(super) fn append_cross_plants_in_chunk(
-    chunk: &Chunk,
-    chunk_offset: [f32; 3],
-    texture_lookup: &BlockTextureLookup,
-    cutout_mesh: &mut WorldCpuMeshData,
-) {
-    append_cross_plants_in_chunk_pooled(chunk, chunk_offset, texture_lookup, cutout_mesh, None)
-}
-
 pub(super) fn append_cross_plants_in_chunk_pooled(
     chunk: &Chunk,
     chunk_offset: [f32; 3],

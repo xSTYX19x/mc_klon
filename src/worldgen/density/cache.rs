@@ -16,9 +16,6 @@ thread_local! {
 
 #[derive(Clone)]
 pub struct DensityChunkCache {
-    chunk_world_x0: i32,
-    chunk_world_y0: i32,
-    chunk_world_z0: i32,
     grid: [f32; GRID_LEN],
 }
 
@@ -41,12 +38,7 @@ impl DensityChunkCache {
             }
         }
 
-        Self {
-            chunk_world_x0,
-            chunk_world_y0,
-            chunk_world_z0,
-            grid,
-        }
+        Self { grid }
     }
 
     pub fn build_heightmap_minus_y(
@@ -82,12 +74,7 @@ impl DensityChunkCache {
             }
         });
 
-        Self {
-            chunk_world_x0,
-            chunk_world_y0,
-            chunk_world_z0,
-            grid,
-        }
+        Self { grid }
     }
 
     pub fn sample(&self, lx: i32, ly: i32, lz: i32) -> f32 {
@@ -122,20 +109,6 @@ impl DensityChunkCache {
         let y0 = Self::lerp(x00, x10, ty);
         let y1 = Self::lerp(x01, x11, ty);
         Self::lerp(y0, y1, tz)
-    }
-
-    pub fn contains_world_pos(&self, world_x: i32, world_y: i32, world_z: i32) -> bool {
-        (self.chunk_world_x0..self.chunk_world_x0 + CHUNK_SIZE).contains(&world_x)
-            && (self.chunk_world_y0..self.chunk_world_y0 + CHUNK_SIZE).contains(&world_y)
-            && (self.chunk_world_z0..self.chunk_world_z0 + CHUNK_SIZE).contains(&world_z)
-    }
-
-    pub fn sample_world_pos(&self, world_x: i32, world_y: i32, world_z: i32) -> f32 {
-        self.sample(
-            world_x - self.chunk_world_x0,
-            world_y - self.chunk_world_y0,
-            world_z - self.chunk_world_z0,
-        )
     }
 
     #[inline]

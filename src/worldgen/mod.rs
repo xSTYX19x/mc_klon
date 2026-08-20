@@ -24,33 +24,9 @@ pub(crate) struct GenerationProgress {
     pub total: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct FeatureRng {
-    state: u64,
-}
-
-impl FeatureRng {
-    pub const fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-
-    pub fn reseed(&mut self, seed: u64) {
-        self.state = seed;
-    }
-
-    pub fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-}
-
 pub(crate) struct GenContext {
     pub seed: u64,
     pub world_cfg: WorldConfig,
-    pub feature_rng: FeatureRng,
     pub progress_hook: Option<Box<dyn FnMut(GenerationProgress) + Send>>,
 }
 
@@ -59,7 +35,6 @@ impl GenContext {
         Self {
             seed,
             world_cfg,
-            feature_rng: FeatureRng::new(seed),
             progress_hook: None,
         }
     }
@@ -71,10 +46,6 @@ impl GenContext {
     }
 }
 
-pub(crate) trait WorldGenerator: Send + Sync {
-    fn generate_column(&self, cx: i32, cz: i32, out: &mut ColumnBuffer, ctx: &mut GenContext);
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ClassicLevelSize {
     Small,
@@ -83,8 +54,6 @@ pub(crate) enum ClassicLevelSize {
 }
 
 impl ClassicLevelSize {
-    pub(crate) const ALL: [Self; 3] = [Self::Small, Self::Normal, Self::Huge];
-
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Small => "Small",
@@ -115,9 +84,6 @@ impl ClassicLevelSize {
     }
 }
 
-pub use density::{DensityFn, EvalContext};
-pub use pipeline::WorldgenPipeline;
-pub use surface_rules::{SurfaceContext, SurfaceRules};
 pub use terrain::{DEFAULT_WORLDGEN_PRESET, TerrainSampler, WorldGenConfig, WorldgenPreset};
 pub use terrain_generator::TerrainGenerator;
 

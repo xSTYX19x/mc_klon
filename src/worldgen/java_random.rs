@@ -30,11 +30,6 @@ impl JavaRandom {
         (self.seed >> shift) as i32
     }
 
-    /// Java `Random.nextInt()`
-    pub(crate) fn next_int(&mut self) -> i32 {
-        self.next(32)
-    }
-
     /// Java `Random.nextInt(bound)`
     pub(crate) fn next_int_bound(&mut self, bound: i32) -> i32 {
         assert!(bound > 0, "bound must be positive");

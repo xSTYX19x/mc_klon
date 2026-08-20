@@ -83,9 +83,6 @@ impl MeshingPool {
         MeshingPoolStats {
             vertices_capacity: self.vertices.capacity(),
             indices_capacity: self.indices.capacity(),
-            mask_capacity: self.greedy_mask.capacity(),
-            liquid_stats: self.liquid_pool.allocation_stats(),
-            temp_capacity: self.temp_positions.capacity() + self.temp_uvs.capacity(),
         }
     }
 
@@ -197,22 +194,9 @@ fn update_hint(current: &mut usize, capacity: usize) -> u32 {
 pub(crate) struct MeshingPoolStats {
     pub(crate) vertices_capacity: usize,
     pub(crate) indices_capacity: usize,
-    pub(crate) mask_capacity: usize,
-    pub(crate) liquid_stats: super::liquids::LiquidPoolStats,
-    pub(crate) temp_capacity: usize,
 }
 
-impl MeshingPoolStats {
-    pub(crate) fn total_capacity(&self) -> usize {
-        self.vertices_capacity
-            + self.indices_capacity
-            + self.mask_capacity
-            + self.liquid_stats.total_capacity()
-            + self.temp_capacity
-    }
-}
-
-/// Thread-local storage for mesh pools to avoid contention between workers
+// Thread-local storage for mesh pools to avoid contention between workers
 thread_local! {
     static MESHING_POOL: std::cell::RefCell<MeshingPool> = std::cell::RefCell::new(MeshingPool::new());
 }

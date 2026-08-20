@@ -1780,12 +1780,6 @@ mod tests {
             let span = (hi - lo + 1) as u64;
             lo + (self.next_u64() % span) as i32
         }
-
-        fn range_usize(&mut self, lo: usize, hi: usize) -> usize {
-            debug_assert!(lo <= hi);
-            let span = (hi - lo + 1) as u64;
-            lo + (self.next_u64() % span) as usize
-        }
     }
 }
 

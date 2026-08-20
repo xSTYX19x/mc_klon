@@ -268,23 +268,6 @@ impl RegionFile {
         Ok(())
     }
 
-    pub(crate) fn clear_column(&mut self, cx: i32, cz: i32) -> io::Result<()> {
-        let index = self.index_for_chunk(cx, cz)?;
-        let old_entry = self.locations[index];
-        if old_entry == 0 {
-            return Ok(());
-        }
-
-        self.locations[index] = 0;
-        self.timestamps[index] = unix_epoch_secs_u32();
-        self.write_header()?;
-        self.file.sync_data()?;
-
-        let (offset, count) = unpack_location(old_entry);
-        self.mark_sector_range(offset, count, true)?;
-        Ok(())
-    }
-
     pub(crate) fn flush(&mut self) -> io::Result<()> {
         self.file.sync_all()
     }
