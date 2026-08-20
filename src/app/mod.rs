@@ -29,6 +29,7 @@ use crate::render::state::{
     pause_menu_item_at_pos_px,
 };
 use crate::settings::{AppSettings, InputAction, SettingsScope, keycode_label};
+use crate::world::ticking_areas::{TICKING_AREA_MAX_RADIUS_CHUNKS, TickingArea, TickingFlags};
 use crate::world::{FluidKind, World, WorldEnvironment};
 use crate::worldgen::ClassicLevelSize;
 
@@ -59,6 +60,17 @@ const PAUSE_MENU_ITEMS: [&str; 6] = [
     "Exit to main menu",
 ];
 const OPTIONS_ROOT_ITEMS: [&str; 3] = ["General / Gameplay", "Video / Graphics", "Controls"];
+const TICKING_EDIT_FLAG_ROWS: [(u32, &str); 4] = [
+    (TickingFlags::KEEP_LOADED, "Keep loaded"),
+    (TickingFlags::TICK_FLUIDS, "Tick fluids"),
+    (TickingFlags::TICK_LIGHTING, "Tick lighting"),
+    (TickingFlags::TICK_ENTITIES, "Tick entities"),
+];
+const TICKING_EDIT_ROW_RADIUS: usize = 0;
+const TICKING_EDIT_ROW_FLAGS_START: usize = 1;
+const TICKING_EDIT_ROW_DELETE: usize = TICKING_EDIT_ROW_FLAGS_START + TICKING_EDIT_FLAG_ROWS.len();
+const TICKING_EDIT_ROW_BACK: usize = TICKING_EDIT_ROW_DELETE + 1;
+const TICKING_EDIT_ROW_COUNT: usize = TICKING_EDIT_ROW_BACK + 1;
 
 struct ChatLine {
     text: String,
@@ -120,6 +132,7 @@ enum GameState {
         selected: usize,
     },
     Options(OptionsMenuState),
+    TickingAreas(TickingAreaMenuState),
     Inventory {
         selected_palette: usize,
         selected_hotbar_slot: usize,
@@ -181,6 +194,55 @@ struct OptionsMenuState {
     status_line: Option<String>,
     /// Armed by the first activation of a reset row; the second activation performs it.
     pending_reset: Option<SettingsScope>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TickingAreaScreen {
+    List,
+    Edit { id: u32 },
+}
+
+/// In-game editor for ticking areas. `areas` is a snapshot of the world's list,
+/// re-read after every mutation so the rows always match what was persisted.
+struct TickingAreaMenuState {
+    screen: TickingAreaScreen,
+    selected: usize,
+    areas: Vec<TickingArea>,
+    status_line: Option<String>,
+    /// Armed by the first activation of the delete row; the second one performs it.
+    pending_delete: Option<u32>,
+}
+
+impl TickingAreaMenuState {
+    fn area(&self, id: u32) -> Option<&TickingArea> {
+        self.areas.iter().find(|area| area.id == id)
+    }
+
+    fn item_count(&self) -> usize {
+        match self.screen {
+            // one row per area, plus "add" and "back"
+            TickingAreaScreen::List => self.areas.len() + 2,
+            TickingAreaScreen::Edit { .. } => TICKING_EDIT_ROW_COUNT,
+        }
+    }
+
+    fn add_row(&self) -> usize {
+        self.areas.len()
+    }
+}
+
+fn ticking_flag_summary(flags: TickingFlags) -> String {
+    let mut parts = Vec::with_capacity(TICKING_EDIT_FLAG_ROWS.len());
+    for (bit, label) in TICKING_EDIT_FLAG_ROWS {
+        if flags.bits() & bit != 0 {
+            parts.push(label);
+        }
+    }
+    if parts.is_empty() {
+        "no flags".to_string()
+    } else {
+        parts.join(", ")
+    }
 }
 
 pub(crate) struct App {
@@ -369,8 +431,15 @@ impl App {
         matches!(self.game_state, GameState::Options(_))
     }
 
+    fn is_ticking_areas_open(&self) -> bool {
+        matches!(self.game_state, GameState::TickingAreas(_))
+    }
+
     fn is_menu_open(&self) -> bool {
-        self.is_main_menu() || self.is_paused() || self.is_options_open()
+        self.is_main_menu()
+            || self.is_paused()
+            || self.is_options_open()
+            || self.is_ticking_areas_open()
     }
 
     fn is_in_game(&self) -> bool {
@@ -885,6 +954,7 @@ impl App {
             GameState::Paused { .. } => PAUSE_MENU_ITEMS.len(),
             GameState::LoadLevelMenu { worlds, .. } => worlds.len().max(1) + 1,
             GameState::Options(options) => options.screen.item_count(),
+            GameState::TickingAreas(menu) => menu.item_count(),
             _ => 0,
         }
     }
@@ -895,6 +965,7 @@ impl App {
             GameState::Paused { selected } => Some(*selected),
             GameState::LoadLevelMenu { selected, .. } => Some(*selected),
             GameState::Options(options) => Some(options.selected),
+            GameState::TickingAreas(menu) => Some(menu.selected),
             _ => None,
         }
     }
@@ -912,13 +983,21 @@ impl App {
                 }
                 options.selected = selected;
             }
+            GameState::TickingAreas(menu) => {
+                if menu.selected != selected {
+                    menu.pending_delete = None;
+                }
+                menu.selected = selected;
+            }
             _ => {}
         }
     }
 
     fn clear_pending_reset(&mut self) {
-        if let GameState::Options(options) = &mut self.game_state {
-            options.pending_reset = None;
+        match &mut self.game_state {
+            GameState::Options(options) => options.pending_reset = None,
+            GameState::TickingAreas(menu) => menu.pending_delete = None,
+            _ => {}
         }
     }
 
@@ -1242,6 +1321,255 @@ impl App {
         self.set_options_status(None, status);
     }
 
+    fn apply_selected_menu_step(&mut self, delta: i32) -> bool {
+        match self.game_state {
+            GameState::Options(_) => self.apply_selected_option_step(delta),
+            GameState::TickingAreas(_) => self.apply_ticking_area_step(delta),
+            _ => false,
+        }
+    }
+
+    fn player_chunk_xz(&self) -> (i32, i32) {
+        let chunk = World::world_to_chunk_coord(IVec3::new(
+            self.camera.position.x.floor() as i32,
+            self.camera.position.y.floor() as i32,
+            self.camera.position.z.floor() as i32,
+        ));
+        (chunk.x, chunk.z)
+    }
+
+    fn open_ticking_area_menu(&mut self) {
+        self.reset_chat_state();
+        self.clear_menu_press();
+        let areas = self
+            .state
+            .as_ref()
+            .map(|state| state.ticking_areas_snapshot())
+            .unwrap_or_default();
+        self.game_state = GameState::TickingAreas(TickingAreaMenuState {
+            screen: TickingAreaScreen::List,
+            selected: 0,
+            areas,
+            status_line: None,
+            pending_delete: None,
+        });
+        self.clear_action_state();
+        if let Some(window) = self.window.as_ref() {
+            self.controller.set_mouse_capture(window, false);
+        }
+    }
+
+    fn leave_ticking_area_menu(&mut self) {
+        self.clear_menu_press();
+        self.game_state = GameState::InGame;
+        self.clear_action_state();
+        if let Some(window) = self.window.as_ref() {
+            self.controller.set_mouse_capture(window, true);
+        }
+    }
+
+    /// Re-reads the persisted list and re-applies the simulation activation so
+    /// edits take effect without leaving the editor.
+    fn refresh_ticking_areas(&mut self, status: Option<String>) {
+        let areas = if let Some(state) = self.state.as_mut() {
+            state.update_simulation_activation(&self.camera);
+            state.ticking_areas_snapshot()
+        } else {
+            Vec::new()
+        };
+        if let GameState::TickingAreas(menu) = &mut self.game_state {
+            menu.areas = areas;
+            menu.pending_delete = None;
+            if let Some(status) = status {
+                menu.status_line = Some(status);
+            }
+            // An edited area can disappear (deleted elsewhere); fall back to the list.
+            if let TickingAreaScreen::Edit { id } = menu.screen
+                && menu.area(id).is_none()
+            {
+                menu.screen = TickingAreaScreen::List;
+                menu.selected = 0;
+            }
+            let max_index = menu.item_count().saturating_sub(1);
+            menu.selected = menu.selected.min(max_index);
+        }
+    }
+
+    /// The area currently being edited, taken from the menu's own snapshot
+    /// (kept in sync by `refresh_ticking_areas`), plus the selected row.
+    fn selected_ticking_area_edit(&self) -> Option<(TickingArea, usize)> {
+        let GameState::TickingAreas(menu) = &self.game_state else {
+            return None;
+        };
+        let TickingAreaScreen::Edit { id } = menu.screen else {
+            return None;
+        };
+        menu.area(id).map(|area| (*area, menu.selected))
+    }
+
+    /// Left/right on the edit screen: radius steps by `delta`, flag rows toggle.
+    fn apply_ticking_area_step(&mut self, delta: i32) -> bool {
+        let Some((area, row)) = self.selected_ticking_area_edit() else {
+            return false;
+        };
+        let id = area.id;
+
+        let (radius, flags, status) = if row == TICKING_EDIT_ROW_RADIUS {
+            let radius = (area.radius_chunks + delta).clamp(0, TICKING_AREA_MAX_RADIUS_CHUNKS);
+            if radius == area.radius_chunks {
+                return false;
+            }
+            (
+                radius,
+                area.flags,
+                format!("Area #{id} radius: {radius} chunk(s)"),
+            )
+        } else if (TICKING_EDIT_ROW_FLAGS_START..TICKING_EDIT_ROW_DELETE).contains(&row) {
+            let (bit, label) = TICKING_EDIT_FLAG_ROWS[row - TICKING_EDIT_ROW_FLAGS_START];
+            let flags = TickingFlags::from_bits(area.flags.bits() ^ bit);
+            let enabled = flags.bits() & bit != 0;
+            (
+                area.radius_chunks,
+                flags,
+                format!(
+                    "Area #{id} {}: {}",
+                    label.to_lowercase(),
+                    if enabled { "on" } else { "off" }
+                ),
+            )
+        } else {
+            return false;
+        };
+
+        let applied = self
+            .state
+            .as_mut()
+            .and_then(|state| state.update_ticking_area(id, radius, flags))
+            .is_some();
+        if !applied {
+            self.refresh_ticking_areas(Some(format!("Area #{id} no longer exists.")));
+            return false;
+        }
+        self.refresh_ticking_areas(Some(status));
+        true
+    }
+
+    fn activate_ticking_area_selected(&mut self) {
+        let Some((screen, selected, add_row, area_count)) = (match &self.game_state {
+            GameState::TickingAreas(menu) => {
+                Some((menu.screen, menu.selected, menu.add_row(), menu.areas.len()))
+            }
+            _ => None,
+        }) else {
+            return;
+        };
+
+        match screen {
+            TickingAreaScreen::List => {
+                if selected < area_count {
+                    let id = match &self.game_state {
+                        GameState::TickingAreas(menu) => menu.areas[selected].id,
+                        _ => return,
+                    };
+                    if let GameState::TickingAreas(menu) = &mut self.game_state {
+                        menu.screen = TickingAreaScreen::Edit { id };
+                        menu.selected = TICKING_EDIT_ROW_RADIUS;
+                        menu.pending_delete = None;
+                        menu.status_line = None;
+                    }
+                } else if selected == add_row {
+                    let (cx, cz) = self.player_chunk_xz();
+                    let created = self
+                        .state
+                        .as_mut()
+                        .map(|state| state.create_ticking_area(cx, cz, 4, TickingFlags::default()));
+                    match created {
+                        Some(area) => self.refresh_ticking_areas(Some(format!(
+                            "Created area #{} at chunk ({cx}, {cz}), radius {}.",
+                            area.id, area.radius_chunks
+                        ))),
+                        None => self.refresh_ticking_areas(Some("No world loaded.".to_string())),
+                    }
+                } else {
+                    self.leave_ticking_area_menu();
+                }
+            }
+            TickingAreaScreen::Edit { id } => match selected {
+                TICKING_EDIT_ROW_DELETE => self.activate_ticking_area_delete(id),
+                TICKING_EDIT_ROW_BACK => {
+                    if let GameState::TickingAreas(menu) = &mut self.game_state {
+                        menu.screen = TickingAreaScreen::List;
+                        menu.selected = 0;
+                        menu.pending_delete = None;
+                        menu.status_line = None;
+                    }
+                }
+                _ => {
+                    self.apply_ticking_area_step(1);
+                }
+            },
+        }
+    }
+
+    /// Two-step delete, mirroring the options reset confirmation.
+    fn activate_ticking_area_delete(&mut self, id: u32) {
+        let armed = matches!(
+            &self.game_state,
+            GameState::TickingAreas(menu) if menu.pending_delete == Some(id)
+        );
+        if !armed {
+            if let GameState::TickingAreas(menu) = &mut self.game_state {
+                menu.pending_delete = Some(id);
+                menu.status_line = Some(format!("Delete area #{id}? Activate again to confirm."));
+            }
+            return;
+        }
+
+        let deleted = self
+            .state
+            .as_mut()
+            .is_some_and(|state| state.delete_ticking_area(id));
+        let status = if deleted {
+            format!("Area #{id} deleted.")
+        } else {
+            format!("Area #{id} no longer exists.")
+        };
+        if let GameState::TickingAreas(menu) = &mut self.game_state {
+            menu.screen = TickingAreaScreen::List;
+            menu.selected = 0;
+        }
+        self.refresh_ticking_areas(Some(status));
+    }
+
+    fn handle_ticking_areas_back(&mut self) -> bool {
+        let Some((screen, pending_delete)) = (match &self.game_state {
+            GameState::TickingAreas(menu) => Some((menu.screen, menu.pending_delete)),
+            _ => None,
+        }) else {
+            return false;
+        };
+
+        if pending_delete.is_some() {
+            if let GameState::TickingAreas(menu) = &mut self.game_state {
+                menu.pending_delete = None;
+                menu.status_line = Some("Delete cancelled.".to_string());
+            }
+            return true;
+        }
+
+        match screen {
+            TickingAreaScreen::List => self.leave_ticking_area_menu(),
+            TickingAreaScreen::Edit { .. } => {
+                if let GameState::TickingAreas(menu) = &mut self.game_state {
+                    menu.screen = TickingAreaScreen::List;
+                    menu.selected = 0;
+                    menu.status_line = None;
+                }
+            }
+        }
+        true
+    }
+
     fn set_options_status(&mut self, pending_reset: Option<SettingsScope>, status: String) {
         if let GameState::Options(options) = &mut self.game_state {
             options.pending_reset = pending_reset;
@@ -1548,7 +1876,94 @@ impl App {
                     show_panorama: matches!(options.origin, MenuOrigin::MainMenu),
                 })
             }
+            GameState::TickingAreas(menu) => Some(self.ticking_area_menu_content(menu)),
             _ => None,
+        }
+    }
+
+    fn ticking_area_menu_content(&self, menu: &TickingAreaMenuState) -> MenuScreenContent {
+        let (cx, cz) = self.player_chunk_xz();
+        match menu.screen {
+            TickingAreaScreen::List => {
+                let mut items: Vec<String> = menu
+                    .areas
+                    .iter()
+                    .map(|area| {
+                        format!(
+                            "#{} at ({}, {})  r={}  [{}]",
+                            area.id,
+                            area.center.x,
+                            area.center.y,
+                            area.radius_chunks,
+                            ticking_flag_summary(area.flags)
+                        )
+                    })
+                    .collect();
+                items.push(format!("Add area at current chunk ({cx}, {cz})"));
+                items.push("Back to game".to_string());
+                let footer = menu.status_line.clone().or_else(|| {
+                    Some(if menu.areas.is_empty() {
+                        "No ticking areas yet. Areas keep chunks loaded and ticking.".to_string()
+                    } else {
+                        format!("{} area(s). Enter edits, Escape leaves.", menu.areas.len())
+                    })
+                });
+                MenuScreenContent {
+                    title: "Ticking areas".to_string(),
+                    enabled: vec![true; items.len()],
+                    items,
+                    footer,
+                    selected: menu.selected,
+                    show_panorama: false,
+                }
+            }
+            TickingAreaScreen::Edit { id } => {
+                let Some(area) = menu.area(id) else {
+                    return MenuScreenContent {
+                        title: "Ticking area".to_string(),
+                        items: vec!["Back".to_string()],
+                        footer: Some(format!("Area #{id} no longer exists.")),
+                        selected: 0,
+                        enabled: vec![true],
+                        show_panorama: false,
+                    };
+                };
+                let mut items = Vec::with_capacity(TICKING_EDIT_ROW_COUNT);
+                items.push(format!(
+                    "Radius: {} chunk(s)  (max {})",
+                    area.radius_chunks, TICKING_AREA_MAX_RADIUS_CHUNKS
+                ));
+                for (bit, label) in TICKING_EDIT_FLAG_ROWS {
+                    items.push(format!(
+                        "{label}: {}",
+                        if area.flags.bits() & bit != 0 {
+                            "On"
+                        } else {
+                            "Off"
+                        }
+                    ));
+                }
+                items.push(if menu.pending_delete == Some(id) {
+                    "Delete area - confirm?".to_string()
+                } else {
+                    "Delete area".to_string()
+                });
+                items.push("Back".to_string());
+                let footer = menu.status_line.clone().or_else(|| {
+                    Some(format!(
+                        "Area #{id} at chunk ({}, {}). Left/right adjusts, Enter toggles.",
+                        area.center.x, area.center.y
+                    ))
+                });
+                MenuScreenContent {
+                    title: format!("Ticking area #{id}"),
+                    enabled: vec![true; items.len()],
+                    items,
+                    footer,
+                    selected: menu.selected,
+                    show_panorama: false,
+                }
+            }
         }
     }
 
@@ -1558,6 +1973,7 @@ impl App {
             GameState::Paused { .. } => self.activate_pause_menu_selected(event_loop),
             GameState::LoadLevelMenu { .. } => self.activate_load_level_menu_selected(),
             GameState::Options(_) => self.activate_options_selected(),
+            GameState::TickingAreas(_) => self.activate_ticking_area_selected(),
             _ => {}
         }
     }
@@ -1995,10 +2411,15 @@ impl ApplicationHandler for App {
                 let paused = self.is_paused();
                 let inventory_open = self.is_inventory_open();
                 let options_open = self.is_options_open();
+                let ticking_areas_open = self.is_ticking_areas_open();
                 let menu_open = self.is_menu_open();
                 let pause_key = self.settings.controls.key_for(InputAction::PauseMenu);
                 let inventory_key = self.settings.controls.key_for(InputAction::OpenInventory);
                 let chat_key = self.settings.controls.key_for(InputAction::OpenChat);
+                let ticking_areas_key = self
+                    .settings
+                    .controls
+                    .key_for(InputAction::OpenTickingAreas);
                 let jump_key = self.settings.controls.key_for(InputAction::Jump);
                 let forward_key = self.settings.controls.key_for(InputAction::MoveForward);
                 let backward_key = self.settings.controls.key_for(InputAction::MoveBackward);
@@ -2036,6 +2457,8 @@ impl ApplicationHandler for App {
                             }
                         } else if options_open {
                             self.handle_options_back();
+                        } else if ticking_areas_open {
+                            self.handle_ticking_areas_back();
                         } else if paused {
                             self.leave_pause();
                         } else if self.is_in_game() {
@@ -2055,6 +2478,21 @@ impl ApplicationHandler for App {
                         }
                         return;
                     }
+
+                    if code == ticking_areas_key && !event.repeat {
+                        if generating || paused || options_open || self.is_main_menu() {
+                            return;
+                        }
+                        if ticking_areas_open {
+                            self.leave_ticking_area_menu();
+                        } else if inventory_open {
+                            self.leave_inventory();
+                            self.open_ticking_area_menu();
+                        } else if self.is_in_game() {
+                            self.open_ticking_area_menu();
+                        }
+                        return;
+                    }
                 }
 
                 if menu_open {
@@ -2071,10 +2509,10 @@ impl ApplicationHandler for App {
                                 KeyCode::ArrowUp | KeyCode::KeyW => self.move_menu_selection(-1),
                                 KeyCode::ArrowDown | KeyCode::KeyS => self.move_menu_selection(1),
                                 KeyCode::ArrowLeft | KeyCode::KeyA => {
-                                    self.apply_selected_option_step(-1);
+                                    self.apply_selected_menu_step(-1);
                                 }
                                 KeyCode::ArrowRight | KeyCode::KeyD => {
-                                    self.apply_selected_option_step(1);
+                                    self.apply_selected_menu_step(1);
                                 }
                                 KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space => {
                                     self.activate_current_menu_selected(event_loop);
@@ -2874,6 +3312,7 @@ impl ApplicationHandler for App {
                         | GameState::LoadLevelMenu { .. }
                         | GameState::Paused { .. }
                         | GameState::Options(_)
+                        | GameState::TickingAreas(_)
                         | GameState::Inventory { .. } => None,
                     };
                     let generation_overlay =

@@ -13588,26 +13588,61 @@ impl State {
     }
 
     pub(crate) fn create_ticking_area_radius(&mut self, cx: i32, cz: i32, radius: i32) -> u32 {
-        let area = self.world.create_ticking_area(
-            glam::IVec2::new(cx, cz),
-            radius,
-            TickingFlags::default(),
-        );
-        if let Err(err) = self.save_ticking_areas() {
-            crate::console_error!("[ticking_areas] failed to persist after create: {err}");
+        self.create_ticking_area(cx, cz, radius, TickingFlags::default())
+            .id
+    }
+
+    /// Snapshot for UI code that needs to outlive the `&World` borrow.
+    pub(crate) fn ticking_areas_snapshot(&self) -> Vec<TickingArea> {
+        self.world.ticking_areas().to_vec()
+    }
+
+    pub(crate) fn create_ticking_area(
+        &mut self,
+        cx: i32,
+        cz: i32,
+        radius: i32,
+        flags: TickingFlags,
+    ) -> TickingArea {
+        let area = self
+            .world
+            .create_ticking_area(glam::IVec2::new(cx, cz), radius, flags);
+        self.after_ticking_area_change("create");
+        area
+    }
+
+    pub(crate) fn update_ticking_area(
+        &mut self,
+        id: u32,
+        radius: i32,
+        flags: TickingFlags,
+    ) -> Option<TickingArea> {
+        let area = self.world.update_ticking_area(id, radius, flags)?;
+        self.after_ticking_area_change("update");
+        Some(area)
+    }
+
+    pub(crate) fn delete_ticking_area(&mut self, id: u32) -> bool {
+        if !self.world.remove_ticking_area(id) {
+            return false;
         }
+        self.after_ticking_area_change("delete");
+        true
+    }
+
+    fn after_ticking_area_change(&mut self, what: &str) {
+        if let Err(err) = self.save_ticking_areas() {
+            crate::console_error!("[ticking_areas] failed to persist after {what}: {err}");
+        }
+        // Force the next activation pass to recompute the simulated column set.
         self.last_sim_center = None;
-        area.id
     }
 
     pub(crate) fn delete_nearest_ticking_area(&mut self, cx: i32, cz: i32) -> Option<u32> {
         let removed = self
             .world
             .remove_nearest_ticking_area(glam::IVec2::new(cx, cz))?;
-        if let Err(err) = self.save_ticking_areas() {
-            crate::console_error!("[ticking_areas] failed to persist after delete: {err}");
-        }
-        self.last_sim_center = None;
+        self.after_ticking_area_change("delete");
         Some(removed.id)
     }
 

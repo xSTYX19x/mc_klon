@@ -58,11 +58,12 @@ pub(crate) enum InputAction {
     Sprint,
     OpenInventory,
     OpenChat,
+    OpenTickingAreas,
     PauseMenu,
 }
 
 impl InputAction {
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 11] = [
         Self::MoveForward,
         Self::MoveBackward,
         Self::MoveLeft,
@@ -72,6 +73,7 @@ impl InputAction {
         Self::Sprint,
         Self::OpenInventory,
         Self::OpenChat,
+        Self::OpenTickingAreas,
         Self::PauseMenu,
     ];
 
@@ -86,7 +88,8 @@ impl InputAction {
             Self::Sprint => 6,
             Self::OpenInventory => 7,
             Self::OpenChat => 8,
-            Self::PauseMenu => 9,
+            Self::OpenTickingAreas => 9,
+            Self::PauseMenu => 10,
         }
     }
 
@@ -101,6 +104,7 @@ impl InputAction {
             Self::Sprint => "Sprint",
             Self::OpenInventory => "Inventory",
             Self::OpenChat => "Chat",
+            Self::OpenTickingAreas => "Ticking areas",
             Self::PauseMenu => "Pause menu",
         }
     }
@@ -116,6 +120,7 @@ impl InputAction {
             Self::Sprint => KeyCode::ControlLeft,
             Self::OpenInventory => KeyCode::KeyB,
             Self::OpenChat => KeyCode::KeyT,
+            Self::OpenTickingAreas => KeyCode::KeyK,
             Self::PauseMenu => KeyCode::Escape,
         }
     }
@@ -194,6 +199,7 @@ struct SavedInputBindings {
     sprint: String,
     open_inventory: String,
     open_chat: String,
+    open_ticking_areas: String,
     pause_menu: String,
 }
 
@@ -215,6 +221,9 @@ impl SavedInputBindings {
             sprint: keycode_config_name(bindings.key_for(InputAction::Sprint)),
             open_inventory: keycode_config_name(bindings.key_for(InputAction::OpenInventory)),
             open_chat: keycode_config_name(bindings.key_for(InputAction::OpenChat)),
+            open_ticking_areas: keycode_config_name(
+                bindings.key_for(InputAction::OpenTickingAreas),
+            ),
             pause_menu: keycode_config_name(bindings.key_for(InputAction::PauseMenu)),
         }
     }
@@ -232,6 +241,7 @@ impl SavedInputBindings {
             (InputAction::Sprint, self.sprint),
             (InputAction::OpenInventory, self.open_inventory),
             (InputAction::OpenChat, self.open_chat),
+            (InputAction::OpenTickingAreas, self.open_ticking_areas),
             (InputAction::PauseMenu, self.pause_menu),
         ];
         for (action, raw) in entries {

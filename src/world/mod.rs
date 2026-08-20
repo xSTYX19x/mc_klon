@@ -2554,6 +2554,24 @@ impl World {
         area
     }
 
+    pub(crate) fn ticking_area(&self, id: u32) -> Option<&TickingArea> {
+        self.ticking_areas.iter().find(|area| area.id == id)
+    }
+
+    /// Applies an in-place edit (radius/flags) and returns the normalized result.
+    pub(crate) fn update_ticking_area(
+        &mut self,
+        id: u32,
+        radius_chunks: i32,
+        flags: TickingFlags,
+    ) -> Option<TickingArea> {
+        let area = self.ticking_areas.iter_mut().find(|area| area.id == id)?;
+        area.radius_chunks = radius_chunks;
+        area.flags = flags;
+        *area = area.normalized();
+        Some(*area)
+    }
+
     pub(crate) fn remove_ticking_area(&mut self, id: u32) -> bool {
         let before = self.ticking_areas.len();
         self.ticking_areas.retain(|area| area.id != id);
