@@ -358,6 +358,128 @@ mod tests {
     }
 
     #[test]
+    fn resumable_chunk_remove_task_matches_one_shot_removal() {
+        // The stepped path replaced the one-shot `lighting_on_chunks_removed` in
+        // the frame pump; it has to relight the same region to the same values.
+        fn build() -> (World, ChunkCoord, ChunkCoord) {
+            let mut world = World::new();
+            let left = ChunkCoord { x: 0, y: 0, z: 0 };
+            let right = ChunkCoord { x: 1, y: 0, z: 0 };
+            let mut left_chunk = Chunk::new_empty();
+            left_chunk.set(CHUNK_SIZE - 1, 8, 8, BlockId::LavaStill);
+            world.chunks.insert(left, left_chunk);
+            world.chunks.insert(right, Chunk::new_empty());
+            let _ = world.lighting_on_chunks_added(&[left, right]);
+            world.chunks.remove(&left);
+            (world, left, right)
+        }
+
+        let (mut one_shot, left, right) = build();
+        let one_shot_result = one_shot.lighting_on_chunks_removed(&[left]);
+
+        let (mut stepped, _, _) = build();
+        let mut task = stepped
+            .begin_incremental_chunk_removed_lighting_task(&[left])
+            .expect("expected a chunk-remove lighting task for a loaded neighbor");
+        let mut step_count = 0usize;
+        while !task.is_complete() {
+            stepped.step_incremental_lighting_task(
+                &mut task,
+                IncrementalLightingStepLimits {
+                    max_voxels_visited: 512,
+                    max_wall_clock: Duration::from_millis(1),
+                },
+            );
+            step_count += 1;
+            assert!(step_count < 10_000, "stepped removal never completed");
+        }
+        let stepped_result = task.into_result();
+
+        assert!(
+            step_count > 1,
+            "a tight per-step limit must actually split the removal across steps"
+        );
+        assert_eq!(
+            stepped_result.affected_chunks.len(),
+            one_shot_result.affected_chunks.len()
+        );
+        assert_eq!(
+            stepped
+                .get_chunk(right)
+                .expect("right chunk missing after stepped removal")
+                .light
+                .as_slice(),
+            one_shot
+                .get_chunk(right)
+                .expect("right chunk missing after one-shot removal")
+                .light
+                .as_slice()
+        );
+    }
+
+    #[test]
+    fn chunk_remove_task_is_none_when_nothing_loaded_borders_the_removal() {
+        let mut world = World::new();
+        let lone = ChunkCoord { x: 0, y: 0, z: 0 };
+        world.chunks.insert(lone, Chunk::new_empty());
+        let _ = world.lighting_on_chunks_added(&[lone]);
+        world.chunks.remove(&lone);
+
+        assert!(
+            world
+                .begin_incremental_chunk_removed_lighting_task(&[lone])
+                .is_none(),
+            "no loaded neighbor means there is nothing to relight"
+        );
+    }
+
+    #[test]
+    fn every_step_of_a_chunk_remove_task_respects_its_wall_clock_limit() {
+        // The point of the change: no single step may run to completion past the
+        // limit the caller set, which is what the one-shot call did.
+        let mut world = World::new();
+        let mut coords = Vec::new();
+        for x in 0..3 {
+            for z in 0..3 {
+                let coord = ChunkCoord { x, y: 0, z };
+                let mut chunk = Chunk::new_empty();
+                chunk.set(4, 4, 4, BlockId::LavaStill);
+                world.chunks.insert(coord, chunk);
+                coords.push(coord);
+            }
+        }
+        let _ = world.lighting_on_chunks_added(&coords);
+        let removed = ChunkCoord { x: 1, y: 0, z: 1 };
+        world.chunks.remove(&removed);
+
+        let mut task = world
+            .begin_incremental_chunk_removed_lighting_task(&[removed])
+            .expect("expected a chunk-remove lighting task");
+        let limits = IncrementalLightingStepLimits {
+            max_voxels_visited: 256,
+            max_wall_clock: Duration::from_millis(2),
+        };
+        let mut steps = 0usize;
+        while !task.is_complete() {
+            let started = Instant::now();
+            let result = world.step_incremental_lighting_task(&mut task, limits);
+            let step = started.elapsed();
+            steps += 1;
+            assert!(
+                result.stats.voxels_visited <= 256 + CHUNK_SIZE as u64 * CHUNK_SIZE as u64,
+                "step visited {} voxels over a 256 budget",
+                result.stats.voxels_visited
+            );
+            assert!(
+                step < Duration::from_millis(200),
+                "step {steps} took {step:?}, far past its 2ms budget"
+            );
+            assert!(steps < 100_000, "stepped removal never completed");
+        }
+        assert!(steps > 1);
+    }
+
+    #[test]
     fn resumable_chunk_add_task_matches_full_rebuild() {
         let mut incremental = World::new();
         let mut baseline = World::new();
@@ -1879,44 +2001,10 @@ impl LightEngine {
         removed_coords: &[ChunkCoord],
     ) -> IncrementalLightingResult {
         self.region_scratch.clear();
-        for &removed_coord in removed_coords {
-            for neighbor in [
-                ChunkCoord {
-                    x: removed_coord.x + 1,
-                    y: removed_coord.y,
-                    z: removed_coord.z,
-                },
-                ChunkCoord {
-                    x: removed_coord.x - 1,
-                    y: removed_coord.y,
-                    z: removed_coord.z,
-                },
-                ChunkCoord {
-                    x: removed_coord.x,
-                    y: removed_coord.y + 1,
-                    z: removed_coord.z,
-                },
-                ChunkCoord {
-                    x: removed_coord.x,
-                    y: removed_coord.y - 1,
-                    z: removed_coord.z,
-                },
-                ChunkCoord {
-                    x: removed_coord.x,
-                    y: removed_coord.y,
-                    z: removed_coord.z + 1,
-                },
-                ChunkCoord {
-                    x: removed_coord.x,
-                    y: removed_coord.y,
-                    z: removed_coord.z - 1,
-                },
-            ] {
-                if world.chunks.contains_key(&neighbor) {
-                    self.region_scratch.insert(neighbor);
-                }
-            }
-        }
+        // Shared with the stepped variant so both relight exactly the same region.
+        World::for_each_chunk_removed_lighting_region_coord(world, removed_coords, |neighbor| {
+            self.region_scratch.insert(neighbor);
+        });
         self.recompute_region_and_propagate(world)
     }
 
@@ -2952,6 +3040,69 @@ impl World {
                 }
             }
         }
+        self.begin_incremental_region_lighting_task(region.into_iter().collect())
+    }
+
+    /// Every still-loaded chunk that borders one of `removed_coords`. A removed
+    /// chunk itself is gone, so only its neighbors can hold stale light.
+    fn for_each_chunk_removed_lighting_region_coord(
+        world: &World,
+        removed_coords: &[ChunkCoord],
+        mut visit: impl FnMut(ChunkCoord),
+    ) {
+        for &removed_coord in removed_coords {
+            for neighbor in [
+                ChunkCoord {
+                    x: removed_coord.x + 1,
+                    y: removed_coord.y,
+                    z: removed_coord.z,
+                },
+                ChunkCoord {
+                    x: removed_coord.x - 1,
+                    y: removed_coord.y,
+                    z: removed_coord.z,
+                },
+                ChunkCoord {
+                    x: removed_coord.x,
+                    y: removed_coord.y + 1,
+                    z: removed_coord.z,
+                },
+                ChunkCoord {
+                    x: removed_coord.x,
+                    y: removed_coord.y - 1,
+                    z: removed_coord.z,
+                },
+                ChunkCoord {
+                    x: removed_coord.x,
+                    y: removed_coord.y,
+                    z: removed_coord.z + 1,
+                },
+                ChunkCoord {
+                    x: removed_coord.x,
+                    y: removed_coord.y,
+                    z: removed_coord.z - 1,
+                },
+            ] {
+                if world.chunks.contains_key(&neighbor) {
+                    visit(neighbor);
+                }
+            }
+        }
+    }
+
+    /// Stepped counterpart of `lighting_on_chunks_removed`.
+    ///
+    /// The one-shot call relights the whole neighbor region before it returns,
+    /// which cost 8-19 ms per removed chunk and blew the frame budget of the
+    /// stage draining it. Same region, same result, but resumable.
+    pub(crate) fn begin_incremental_chunk_removed_lighting_task(
+        &self,
+        removed_coords: &[ChunkCoord],
+    ) -> Option<IncrementalLightingTask> {
+        let mut region = HashSet::new();
+        Self::for_each_chunk_removed_lighting_region_coord(self, removed_coords, |neighbor| {
+            region.insert(neighbor);
+        });
         self.begin_incremental_region_lighting_task(region.into_iter().collect())
     }
 

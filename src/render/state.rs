@@ -68,6 +68,7 @@ use crate::meshing::{
     CpuMeshData, FULLBRIGHT_LIGHT_PACKED, MeshLayerMask, Vertex, WorldVertex,
     face_corner_ao_shades, face_from_normal, face_shade,
 };
+use crate::perf::stage_budget::StageBudgetWatchdog;
 use crate::perf::trace as perf_trace;
 use crate::player::PlayerMode;
 use crate::render::pause_backdrop::PauseBackdrop;
@@ -373,6 +374,22 @@ struct RemovedLightingBatch {
     coords: Vec<ChunkCoord>,
     reason: &'static str,
     enqueued_at: Instant,
+}
+
+/// A removal batch that has been turned into a resumable lighting task.
+///
+/// Removal lighting used to run to completion inside one `pop_front`, so a
+/// single batch could spend 8-19 ms per chunk no matter what budget the pump
+/// had left. Only one is active at a time: the rest stay in
+/// `pending_removed_lighting_batches`, where they can still be dropped on
+/// teardown.
+#[derive(Debug)]
+struct RemovedLightingJob {
+    coords: Vec<ChunkCoord>,
+    reason: &'static str,
+    task: IncrementalLightingTask,
+    enqueued_at: Instant,
+    cpu_ms_accum: f32,
 }
 
 #[derive(Debug)]
@@ -1247,6 +1264,8 @@ const STREAM_CHUNK_LIGHTING_FRAME_BUDGET_MS: f32 = 6.0;
 /// regardless, which only worked because chunk eviction repaired its own lighting
 /// synchronously. It no longer does.
 const STREAM_CHUNK_LIGHTING_REMOVED_FRAME_BUDGET_MS: f32 = 3.0;
+/// Console rate limit for stage-budget overruns. The trace event is unthrottled.
+const STAGE_BUDGET_OVERRUN_LOG_INTERVAL: Duration = Duration::from_secs(5);
 /// Must stay above `FRAME_BUDGET_MS / STEP_BUDGET_MS`, otherwise the step count
 /// becomes the binding limit instead of the time budget.
 const STREAM_CHUNK_LIGHTING_MAX_STEPS_PER_FRAME: usize = 8;
@@ -5751,6 +5770,11 @@ pub(crate) struct State {
     lighting_rebuild_not_before: Option<Instant>,
     pending_chunkgen_apply_followups: VecDeque<ChunkGenApplyFollowUpTask>,
     pending_removed_lighting_batches: VecDeque<RemovedLightingBatch>,
+    active_removed_lighting_job: Option<RemovedLightingJob>,
+    /// Items that alone cost a stage its whole frame budget. Filled during the
+    /// frame, reported and cleared at the start of the next one.
+    stage_budget_watchdog: StageBudgetWatchdog,
+    stage_budget_watchdog_last_log: Option<Instant>,
     pending_chunk_added_lighting_jobs: VecDeque<ChunkAddedLightingJob>,
     pending_chunk_added_lighting_coords: HashSet<ChunkCoord>,
     startup_deferred_chunk_added_lighting_coords: HashSet<ChunkCoord>,
@@ -6098,7 +6122,7 @@ impl State {
             self.lighting_results.len()
                 + usize::from(self.lighting_job_inflight)
                 + usize::from(self.lighting_request_pending)
-                + self.pending_removed_lighting_batches.len()
+                + self.removed_lighting_backlog_len()
                 + self.pending_chunk_added_lighting_jobs.len()
                 + self.pending_block_edit_lighting_batches.len()
                 + usize::from(self.active_block_edit_lighting_job.is_some()),
@@ -6195,6 +6219,7 @@ impl State {
         self.lighting_rebuild_not_before = None;
         self.pending_chunkgen_apply_followups.clear();
         self.pending_removed_lighting_batches.clear();
+        self.active_removed_lighting_job = None;
         self.pending_chunk_added_lighting_jobs.clear();
         self.pending_chunk_added_lighting_coords.clear();
         self.startup_deferred_chunk_added_lighting_coords.clear();
@@ -7638,7 +7663,7 @@ impl State {
                         batch.len(),
                         task.removed_lighting_cursor,
                         end,
-                        self.pending_removed_lighting_batches.len(),
+                        self.removed_lighting_backlog_len(),
                         SAVED_LOAD_APPLY_PHASE_BUDGET_MS
                     ),
                 );
@@ -8049,7 +8074,7 @@ impl State {
                     apply_queue_before,
                     apply_queue_after_drain,
                     apply_queue_after,
-                    self.pending_removed_lighting_batches.len(),
+                    self.removed_lighting_backlog_len(),
                     self.pending_chunk_added_lighting_jobs.len(),
                     self.frame_perf.saved_load_sections_prepared,
                     self.frame_perf.saved_load_sections_finalized,
@@ -8623,7 +8648,29 @@ impl State {
         );
     }
 
+    /// Reports the previous frame's stage-budget overruns and starts a new frame.
+    ///
+    /// The trace event is free enough to emit every time; the console line is
+    /// rate-limited because `console_error!` is an unbuffered `eprintln!` and a
+    /// streaming session can overrun on many consecutive frames.
+    fn flush_stage_budget_watchdog(&mut self) {
+        let Some(summary) = self.stage_budget_watchdog.summary() else {
+            return;
+        };
+        perf_trace::instant_event("stage.budget_overrun", &summary);
+        let now = Instant::now();
+        let due = self
+            .stage_budget_watchdog_last_log
+            .is_none_or(|last| now.duration_since(last) >= STAGE_BUDGET_OVERRUN_LOG_INTERVAL);
+        if due {
+            self.stage_budget_watchdog_last_log = Some(now);
+            crate::console_error!("[perf][stage-budget] single item over stage budget: {summary}");
+        }
+        self.stage_budget_watchdog.clear();
+    }
+
     pub(crate) fn begin_frame_profiling(&mut self, frame_dt_ms: f32) {
+        self.flush_stage_budget_watchdog();
         self.frame_perf.begin_frame(frame_dt_ms);
         self.warmup_tracking_refreshed_this_frame = false;
         self.dirty_queue_reprioritized_this_frame = false;
@@ -8781,8 +8828,16 @@ impl State {
             .collect::<Vec<_>>()
             .join(",");
 
+        // Appended rather than folded into `tops`: an overrun names the single
+        // item that blew a stage, which the subsystem totals cannot show.
+        let stage_overruns = self
+            .stage_budget_watchdog
+            .summary()
+            .map(|summary| format!(" stage_budget_overruns[{summary}]"))
+            .unwrap_or_default();
+
         format!(
-            "[perf][stall] frame={:.1}ms tops=[{}] process_dirty_chunk_meshes(ms={:.1},tops=[{}]) chunkgen(ms={:.1},drain={},q={}=>{},applied={},pure_ms={:.1},sidefx_ms={:.1},sidefx_q={}=>{},queued={},done={},light[a={},r={}],fluid_cells={},fluid_scans={},overshoot={},sched[pend={},heap={},reprio={},rebuild={}@{:.1}ms,fcache={}/{}@{:.1}ms,hcache={}/{}@{:.1}ms],lod_results={},lod_req={},lod_up={},lod_up_q={},lod_gpu_ms={:.1}) mesh(ms={:.1},drain={},q={}=>{},up_q={}=>{},uploads={},gpu_up_ms={:.1},wait_avg/max_ms={:.2}/{:.2},near_first={}@{:.2}/{:.2}ms,near_final={}@{:.2}/{:.2}ms,final_upgrades={},budget_boost_ms={:.2},dirty[g={},l={},b={}],coalesced={},avoided={},dispatch[b={},l={}]) storage(ms={:.1},drain={},q={}=>{},ok={},fail={},autosave_q={}) lighting(ms={:.1},drain={},q={}=>{},changed={},inc_jobs={},steps={},primary={},region={},inc_chunks={},voxels={},boundary={},split_jobs={},step_max_ms={:.2},backlog={},edit[batches={},merged={},enqueue_ms={:.2},proc_ms={:.2},steps={},voxels={},changed={},chunks={},budget_ms={:.2}]) stream(ms={:.1},far_lod={},lod_center={:?},lod_center_changes={},lod_cpu_skip={},lod_backlog_skip={}) coverage(near={},lod={},lod_dc={},near_mem_mb={:.2},lod_mem_mb={:.2}) saved_load(ms={:.1},attempts={},hits={},misses={},drain={},applied={},discarded={},failed={},rx_q={}=>{},apply_q={}=>{},work[sec={}=>{},edits={},chunks={},boundary={},steps={},done={},yield={},resume={},cps={:.1}],phase_ms=[{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}],step_max=[{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}],worst_ms={:.1}) deferred(pending={},applied={},chunks_touched={},dropped_caps={}) salvage(chunks={},edits={},skipped_dense={}) view={} inflight(mesh={},chunkgen={},lod={}) backlogs(mesh_rx={},chunkgen_rx={},light_rx={},save_rx={},save_ack_rx={},mesh_up_q={},lod_up_q={})",
+            "[perf][stall] frame={:.1}ms tops=[{}] process_dirty_chunk_meshes(ms={:.1},tops=[{}]) chunkgen(ms={:.1},drain={},q={}=>{},applied={},pure_ms={:.1},sidefx_ms={:.1},sidefx_q={}=>{},queued={},done={},light[a={},r={}],fluid_cells={},fluid_scans={},overshoot={},sched[pend={},heap={},reprio={},rebuild={}@{:.1}ms,fcache={}/{}@{:.1}ms,hcache={}/{}@{:.1}ms],lod_results={},lod_req={},lod_up={},lod_up_q={},lod_gpu_ms={:.1}) mesh(ms={:.1},drain={},q={}=>{},up_q={}=>{},uploads={},gpu_up_ms={:.1},wait_avg/max_ms={:.2}/{:.2},near_first={}@{:.2}/{:.2}ms,near_final={}@{:.2}/{:.2}ms,final_upgrades={},budget_boost_ms={:.2},dirty[g={},l={},b={}],coalesced={},avoided={},dispatch[b={},l={}]) storage(ms={:.1},drain={},q={}=>{},ok={},fail={},autosave_q={}) lighting(ms={:.1},drain={},q={}=>{},changed={},inc_jobs={},steps={},primary={},region={},inc_chunks={},voxels={},boundary={},split_jobs={},step_max_ms={:.2},backlog={},edit[batches={},merged={},enqueue_ms={:.2},proc_ms={:.2},steps={},voxels={},changed={},chunks={},budget_ms={:.2}]) stream(ms={:.1},far_lod={},lod_center={:?},lod_center_changes={},lod_cpu_skip={},lod_backlog_skip={}) coverage(near={},lod={},lod_dc={},near_mem_mb={:.2},lod_mem_mb={:.2}) saved_load(ms={:.1},attempts={},hits={},misses={},drain={},applied={},discarded={},failed={},rx_q={}=>{},apply_q={}=>{},work[sec={}=>{},edits={},chunks={},boundary={},steps={},done={},yield={},resume={},cps={:.1}],phase_ms=[{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}],step_max=[{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}],worst_ms={:.1}) deferred(pending={},applied={},chunks_touched={},dropped_caps={}) salvage(chunks={},edits={},skipped_dense={}) view={} inflight(mesh={},chunkgen={},lod={}) backlogs(mesh_rx={},chunkgen_rx={},light_rx={},save_rx={},save_ack_rx={},mesh_up_q={},lod_up_q={}){}",
             frame_dt_ms,
             top_scopes,
             self.frame_perf.process_dirty_chunk_meshes_ms,
@@ -8954,6 +9009,7 @@ impl State {
             self.storage_writer.save_result_queue_len_approx(),
             self.mesh_upload_queue.len(),
             self.pending_lod_mesh_uploads.len(),
+            stage_overruns,
         )
     }
 
@@ -10625,6 +10681,9 @@ impl State {
             lighting_rebuild_not_before: None,
             pending_chunkgen_apply_followups: VecDeque::new(),
             pending_removed_lighting_batches: VecDeque::new(),
+            active_removed_lighting_job: None,
+            stage_budget_watchdog: StageBudgetWatchdog::new(),
+            stage_budget_watchdog_last_log: None,
             pending_chunk_added_lighting_jobs: VecDeque::new(),
             pending_chunk_added_lighting_coords: HashSet::new(),
             startup_deferred_chunk_added_lighting_coords: HashSet::new(),
@@ -13216,9 +13275,16 @@ impl State {
         self.pending_chunkgen_apply_followups.len()
     }
 
+    /// Queued removal batches plus the one being stepped. The active job left
+    /// the queue but is still outstanding work.
+    fn removed_lighting_backlog_len(&self) -> usize {
+        self.pending_removed_lighting_batches.len()
+            + usize::from(self.active_removed_lighting_job.is_some())
+    }
+
     fn chunkgen_apply_lighting_backlog_len(&self) -> usize {
         self.pending_chunk_added_lighting_jobs.len()
-            + self.pending_removed_lighting_batches.len()
+            + self.removed_lighting_backlog_len()
             + self.pending_lighting_dirty_chunks.len()
             + self.lighting_results.len()
             + usize::from(self.lighting_job_inflight)
@@ -16995,6 +17061,22 @@ impl State {
             let step_ms = step_started.elapsed().as_secs_f32() * 1000.0;
             job.cpu_ms_accum += step_ms;
             steps += 1;
+            self.stage_budget_watchdog.record(
+                "lighting.chunk_added_step",
+                STREAM_CHUNK_LIGHTING_FRAME_BUDGET_MS,
+                step_ms,
+                || {
+                    format!(
+                        "batch={} split={}/{} primary={} region_chunks={} voxels={}",
+                        job.original_batch_id,
+                        job.split_job_index,
+                        job.split_job_count,
+                        job.primary_coords.len(),
+                        job.task.region_chunk_count(),
+                        step_result.stats.voxels_visited
+                    )
+                },
+            );
             self.last_lighting_step_ms = step_ms;
             self.frame_perf.lighting_incremental_steps += 1;
             self.frame_perf.lighting_incremental_step_total_ms += step_ms;
@@ -17055,7 +17137,7 @@ impl State {
                 self.lighting_job_inflight as u8,
                 self.lighting_results.len(),
                 self.pending_chunk_added_lighting_jobs.len(),
-                self.pending_removed_lighting_batches.len(),
+                self.removed_lighting_backlog_len(),
                 self.pending_block_edit_lighting_batches.len()
                     + usize::from(self.active_block_edit_lighting_job.is_some()),
                 steps,
@@ -17064,31 +17146,117 @@ impl State {
         );
     }
 
+    /// Drains removal lighting in bounded steps, like the chunk-add path.
+    ///
+    /// The batch is turned into an `IncrementalLightingTask` and stepped under
+    /// the same per-step voxel/wall-clock limits, so one oversized batch can no
+    /// longer run past the stage budget: it just resumes next frame.
     fn pump_removed_lighting_batches(&mut self) {
         let started = Instant::now();
         let frame_budget = Duration::from_secs_f32(
             (STREAM_CHUNK_LIGHTING_REMOVED_FRAME_BUDGET_MS / 1000.0).max(0.0),
         );
-        while let Some(batch) = self.pending_removed_lighting_batches.pop_front() {
-            if started.elapsed() >= frame_budget {
-                self.pending_removed_lighting_batches.push_front(batch);
+        let step_limits = IncrementalLightingStepLimits {
+            max_voxels_visited: STREAM_CHUNK_LIGHTING_MAX_VOXELS_PER_STEP,
+            max_wall_clock: Duration::from_secs_f32(
+                (STREAM_CHUNK_LIGHTING_STEP_BUDGET_MS / 1000.0).max(0.0),
+            ),
+        };
+        let mut steps = 0usize;
+
+        while steps < STREAM_CHUNK_LIGHTING_MAX_STEPS_PER_FRAME && started.elapsed() < frame_budget
+        {
+            let Some(mut job) = self.take_or_start_removed_lighting_job() else {
                 break;
-            }
-            let apply_started = Instant::now();
-            self.run_incremental_chunk_removed_lighting(&batch.coords, batch.reason);
-            let step_ms = apply_started.elapsed().as_secs_f32() * 1000.0;
+            };
+            let step_started = Instant::now();
+            let step_result = self
+                .world
+                .step_incremental_lighting_task(&mut job.task, step_limits);
+            let step_ms = step_started.elapsed().as_secs_f32() * 1000.0;
+            job.cpu_ms_accum += step_ms;
+            steps += 1;
+            self.stage_budget_watchdog.record(
+                "lighting.chunk_removed_step",
+                STREAM_CHUNK_LIGHTING_REMOVED_FRAME_BUDGET_MS,
+                step_ms,
+                || {
+                    format!(
+                        "reason={} chunks={} region_chunks={} voxels={}",
+                        job.reason,
+                        job.coords.len(),
+                        job.task.region_chunk_count(),
+                        step_result.stats.voxels_visited
+                    )
+                },
+            );
             self.last_lighting_step_ms = self.last_lighting_step_ms.max(step_ms);
+            self.frame_perf.lighting_incremental_steps += 1;
+            self.frame_perf.lighting_incremental_step_total_ms += step_ms;
+            self.frame_perf.lighting_incremental_step_max_ms = self
+                .frame_perf
+                .lighting_incremental_step_max_ms
+                .max(step_ms);
             perf_trace::record_duration_ms(
                 "lighting.incremental_remove_step",
                 step_ms,
                 &format!(
-                    "reason={} chunks={} backlog={} latency_ms={:.2}",
-                    batch.reason,
-                    batch.coords.len(),
-                    self.pending_removed_lighting_batches.len(),
-                    batch.enqueued_at.elapsed().as_secs_f32() * 1000.0
+                    "reason={} chunks={} region_chunks={} voxels_visited={} backlog={} q_pending={} latency_ms={:.2} complete={}",
+                    job.reason,
+                    job.coords.len(),
+                    job.task.region_chunk_count(),
+                    step_result.stats.voxels_visited,
+                    self.removed_lighting_backlog_len() + 1,
+                    job.task.pending_queue_len(),
+                    job.enqueued_at.elapsed().as_secs_f32() * 1000.0,
+                    step_result.complete as u8
                 ),
             );
+
+            if step_result.complete {
+                let reason = job.reason;
+                let coords = job.coords;
+                let cpu_ms = job.cpu_ms_accum;
+                let result = job.task.into_result();
+                self.commit_incremental_lighting_result(reason, &[], &coords, result, cpu_ms);
+            } else {
+                self.active_removed_lighting_job = Some(job);
+            }
+        }
+    }
+
+    /// The job in flight, or the next batch that has anything left to relight.
+    ///
+    /// Batches whose neighbors are all unloaded produce no task; they are
+    /// dropped here rather than costing a step.
+    fn take_or_start_removed_lighting_job(&mut self) -> Option<RemovedLightingJob> {
+        if let Some(job) = self.active_removed_lighting_job.take() {
+            return Some(job);
+        }
+        while let Some(batch) = self.pending_removed_lighting_batches.pop_front() {
+            if let Some(task) = self
+                .world
+                .begin_incremental_chunk_removed_lighting_task(&batch.coords)
+            {
+                return Some(RemovedLightingJob {
+                    coords: batch.coords,
+                    reason: batch.reason,
+                    task,
+                    enqueued_at: batch.enqueued_at,
+                    cpu_ms_accum: 0.0,
+                });
+            }
+            // Nothing loaded next to the removed chunks, but the per-chunk
+            // bookkeeping the commit does still has to happen.
+            self.forget_removed_chunk_lighting(&batch.coords);
+        }
+        None
+    }
+
+    fn forget_removed_chunk_lighting(&mut self, coords: &[ChunkCoord]) {
+        for &coord in coords {
+            self.chunk_lighting_progress.remove(&coord);
+            self.uploaded_final_lighting_chunks.remove(&coord);
         }
     }
 
@@ -17108,21 +17276,6 @@ impl State {
             reason,
             &active_coords,
             &[],
-            result,
-            started.elapsed().as_secs_f32() * 1000.0,
-        );
-    }
-
-    fn run_incremental_chunk_removed_lighting(&mut self, coords: &[ChunkCoord], reason: &str) {
-        if coords.is_empty() {
-            return;
-        }
-        let started = Instant::now();
-        let result = self.world.lighting_on_chunks_removed(coords);
-        self.commit_incremental_lighting_result(
-            reason,
-            &[],
-            coords,
             result,
             started.elapsed().as_secs_f32() * 1000.0,
         );
@@ -17390,6 +17543,20 @@ impl State {
             let step_ms = step_started.elapsed().as_secs_f32() * 1000.0;
             job.cpu_ms_accum += step_ms;
             steps += 1;
+            self.stage_budget_watchdog.record(
+                "lighting.block_edit_step",
+                BLOCK_EDIT_LIGHTING_FRAME_BUDGET_MS,
+                step_ms,
+                || {
+                    format!(
+                        "batch={} merged_changes={} primary_chunks={} voxels={}",
+                        job.batch_id,
+                        job.merged_changes,
+                        job.primary_chunks.len(),
+                        step_result.stats.voxels_visited
+                    )
+                },
+            );
             self.last_lighting_step_ms = self.last_lighting_step_ms.max(step_ms);
             self.frame_perf.rebuild_world_lighting_ms += step_ms;
             self.frame_perf.lighting_block_edit_process_ms += step_ms;
@@ -18351,7 +18518,7 @@ impl State {
                 self.lighting_job_inflight as u8,
                 self.lighting_results.len(),
                 self.pending_chunk_added_lighting_jobs.len(),
-                self.pending_removed_lighting_batches.len(),
+                self.removed_lighting_backlog_len(),
                 self.pending_block_edit_lighting_batches.len()
                     + usize::from(self.active_block_edit_lighting_job.is_some())
             ));
@@ -18564,7 +18731,15 @@ impl State {
                 result.layer_mask,
                 existing_mesh,
             );
+            let apply_ms = apply_started.elapsed().as_secs_f32() * 1000.0;
             apply_mesh_time += apply_started.elapsed();
+            self.stage_budget_watchdog
+                .record("mesh.upload", mesh_upload_budget_ms, apply_ms, || {
+                    format!(
+                        "coord={:?} created={} reused={}",
+                        result.coord, stats.created_buffers, stats.reused_buffer_writes
+                    )
+                });
             upload_stats.add_assign(stats);
             let has_mesh = if let Some(layered_mesh) = new_mesh {
                 self.chunk_meshes.insert(result.coord, layered_mesh);
@@ -21011,7 +21186,7 @@ impl State {
             || provisional > 0
             || visual_ready > 0
             || !self.pending_chunk_added_lighting_jobs.is_empty()
-            || !self.pending_removed_lighting_batches.is_empty()
+            || self.removed_lighting_backlog_len() > 0
             || !self.pending_block_edit_lighting_batches.is_empty()
             || self.active_block_edit_lighting_job.is_some();
         let debounce_ms_left = self
@@ -21028,7 +21203,7 @@ impl State {
             self.lighting_job_inflight,
             self.pending_lighting_dirty_chunks.len(),
             self.pending_chunk_added_lighting_jobs.len(),
-            self.pending_removed_lighting_batches.len(),
+            self.removed_lighting_backlog_len(),
             self.pending_block_edit_lighting_batches.len(),
             self.active_block_edit_lighting_job.is_some() as u8,
             self.lighting_results.len(),
@@ -21045,7 +21220,7 @@ impl State {
                 + self.mesh_upload_queue.len(),
             lighting_dirty_chunks: self.pending_lighting_dirty_chunks.len()
                 + self.pending_chunk_added_lighting_jobs.len()
-                + self.pending_removed_lighting_batches.len()
+                + self.removed_lighting_backlog_len()
                 + self.pending_block_edit_lighting_batches.len()
                 + usize::from(self.active_block_edit_lighting_job.is_some()),
             storage_loads_inflight: self.saved_column_loads_inflight.len()

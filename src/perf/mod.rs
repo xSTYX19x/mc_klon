@@ -2,6 +2,7 @@
 // unconditionally produced ~8 dead-code warnings in every normal build.
 #[cfg(feature = "allocation_tracking")]
 pub(crate) mod allocation_tracker;
+pub(crate) mod stage_budget;
 pub(crate) mod trace;
 
 use std::fmt::Write as _;
