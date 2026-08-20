@@ -2191,7 +2191,22 @@ fn relative_asset_path_from_key(texture_key: &str) -> &str {
 
 #[cfg(test)]
 mod hand_swing_tests {
-    use super::{HAND_SWING_BREAK_SECONDS, HandSwing, HandSwingKind};
+    use super::{
+        FirstPersonArmTweak, HAND_SWING_BREAK_SECONDS, HandSwing, HandSwingKind,
+    };
+
+    #[test]
+    fn a_running_swing_actually_changes_the_arm_pose() {
+        let rest = FirstPersonArmTweak::default();
+        let mut swing = HandSwing::default();
+        swing.trigger(HandSwingKind::Break);
+        swing.advance(1.0 / 60.0);
+
+        let posed = rest.with_swing(swing);
+        assert_ne!(posed.model_rot_x_rad, rest.model_rot_x_rad);
+        assert_ne!(posed.forward_offset, rest.forward_offset);
+        assert_ne!(posed.down_offset, rest.down_offset);
+    }
 
     #[test]
     fn idle_leaves_the_resting_pose_untouched() {

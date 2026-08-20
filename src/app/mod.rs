@@ -3682,6 +3682,11 @@ impl ApplicationHandler for App {
                                     &view_camera,
                                     self.player.player_mode,
                                 );
+                                // The first hit happens here, not in the frame
+                                // loop: a click shorter than the repeat cooldown
+                                // never reaches that path, so the swing has to
+                                // start at both sites.
+                                state.trigger_hand_swing(HandSwingKind::Break);
                                 self.break_cooldown_seconds =
                                     Self::block_action_repeat_cooldown_seconds();
                             }
@@ -3693,6 +3698,7 @@ impl ApplicationHandler for App {
                                         selected_block,
                                         self.player.feet_position,
                                     );
+                                    state.trigger_hand_swing(HandSwingKind::Place);
                                     self.place_cooldown_seconds =
                                         Self::block_action_repeat_cooldown_seconds();
                                 }
