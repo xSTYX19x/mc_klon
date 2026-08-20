@@ -17,7 +17,7 @@ use crate::world::fluids::{
     FluidKind, fluid_data_is_source_origin, fluid_data_is_worldgen_static, fluid_data_make_static,
     fluid_kind,
 };
-use crate::world::{CHUNK_SIZE, Chunk, ChunkCoord, WORLD_MAX_Y};
+use crate::world::{CHUNK_SIZE, Chunk, ChunkCoord, WORLD_MAX_Y, block_data_arc};
 use crate::worldgen::{
     ChunkGenerator, ColumnBuffer, GenContext, TerrainGenerator, TerrainSampler, WorldGenConfig,
     WorldGenerator, WorldgenPreset, carvers::Carvers, ores::apply_ores_to_column,
@@ -2071,7 +2071,7 @@ fn build_generated_section_snapshots(
             );
         sections.push(GeneratedSectionSnapshot {
             blocks: Arc::new(blocks),
-            block_data: Arc::new(block_data),
+            block_data: block_data_arc(block_data),
             filled_voxel_count,
             solid_voxel_count,
             worldgen_debug,

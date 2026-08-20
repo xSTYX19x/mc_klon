@@ -27,7 +27,7 @@ pub(crate) mod ticking_areas;
 pub(crate) mod time;
 
 pub(crate) use block_access::BlockAccess;
-pub(crate) use chunk::{Chunk, ChunkCoord, LightLevel};
+pub(crate) use chunk::{Chunk, ChunkCoord, LightLevel, block_data_arc};
 pub(crate) use config::WorldConfig;
 pub(crate) use environment::{PrecipitationKind, WorldEnvironment};
 pub(crate) use fluids::FluidKind;

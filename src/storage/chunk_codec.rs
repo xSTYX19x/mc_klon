@@ -33,7 +33,7 @@ use crate::perf::trace as perf_trace;
 use crate::storage::format::{
     COLUMN_PAYLOAD_FORMAT_VERSION, COLUMN_PAYLOAD_MAGIC, SECTION_BLOCK_COUNT,
 };
-use crate::world::{Chunk, ChunkCoord, World};
+use crate::world::{Chunk, ChunkCoord, World, block_data_arc};
 
 const COLUMN_RESERVED0_V1: u16 = 0;
 const SECTION_FLAGS_V1: u8 = 0;
@@ -710,7 +710,7 @@ pub(crate) fn decode_chunk_from_section_blob(
 
     Ok(Some(Chunk::from_parts(
         Arc::new(blocks),
-        Arc::new(data_bytes),
+        block_data_arc(data_bytes),
         Arc::new(vec![0; SECTION_BLOCK_COUNT]),
         0,
     )))
