@@ -1,3 +1,4 @@
+use crate::assets::AssetSource;
 use crate::texture::load_png_rgba;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -42,16 +43,16 @@ pub struct TextureImage {
 
 /// Registry für Textur-Assets:
 /// - mappt Mojang-Key -> dekodierte PNG-Daten
-/// - löst Pfade relativ zu `assets_root` auf
+/// - löst Pfade über die aktive Resource-Pack-Kette auf
 pub struct TextureRegistry {
-    assets_root: PathBuf,
+    source: AssetSource,
     textures: HashMap<AssetId, TextureImage>,
 }
 
 impl TextureRegistry {
-    pub fn new(assets_root: impl Into<PathBuf>) -> Self {
+    pub fn new(source: AssetSource) -> Self {
         Self {
-            assets_root: assets_root.into(),
+            source,
             textures: HashMap::new(),
         }
     }
@@ -60,12 +61,8 @@ impl TextureRegistry {
         // Namescheme:
         // - "minecraft:textures/block/stone.png" -> "textures/block/stone.png"
         // - "textures/block/stone.png"           -> unverändert
-        let relative = key
-            .as_str()
-            .strip_prefix("minecraft:")
-            .unwrap_or(key.as_str())
-            .trim_start_matches('/');
-        self.assets_root.join(relative)
+        // Der aktive Pack gewinnt, sonst greifen die Standard-Assets.
+        self.source.resolve(key.as_str())
     }
 
     /// Holt eine Textur aus dem Cache oder lädt sie von Disk (PNG -> RGBA8).

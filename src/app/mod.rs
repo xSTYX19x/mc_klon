@@ -14,6 +14,7 @@ use winit::{
 
 use std::path::PathBuf;
 
+use crate::assets::{self, DEFAULT_PACK_LABEL, RESOURCE_PACK_DIR};
 use crate::blocks::{BlockId, CLASSIC_PALETTE};
 use crate::camera::{Camera, CameraMode, ViewBobbing};
 use crate::commands::{self, Command};
@@ -196,7 +197,7 @@ impl OptionsScreen {
         match self {
             Self::Root => OPTIONS_ROOT_ITEMS.len(),
             Self::Gameplay => 2,
-            Self::Graphics => 4,
+            Self::Graphics => 5,
             Self::Controls => InputAction::ALL.len(),
         }
     }
@@ -567,6 +568,24 @@ impl App {
             THIRD_PERSON_PROBE_RADIUS,
         );
         eye.orbited(mode, distance)
+    }
+
+    /// Pack ids found on disk right now, so a pack dropped in while the game is
+    /// running shows up without a restart.
+    fn available_texture_pack_ids() -> Vec<String> {
+        assets::list_packs()
+            .into_iter()
+            .map(|pack| pack.id)
+            .collect()
+    }
+
+    /// True while the selected pack differs from the one whose textures are
+    /// actually on the GPU.
+    fn texture_pack_needs_restart(&self) -> bool {
+        let Some(state) = self.state.as_ref() else {
+            return false;
+        };
+        state.loaded_resource_pack() != self.settings.graphics.texture_pack.as_deref()
     }
 
     fn take_screenshot(&mut self) {
@@ -1447,6 +1466,36 @@ impl App {
                     ));
                     changed = true;
                 }
+                OptionsScreen::Graphics if options.selected == 4 => {
+                    let packs = Self::available_texture_pack_ids();
+                    let current = self
+                        .settings
+                        .graphics
+                        .texture_pack
+                        .as_ref()
+                        .and_then(|id| packs.iter().position(|candidate| candidate == id))
+                        .map_or(0, |index| index + 1);
+                    // Index 0 is "Default" (bundled assets), the rest are packs.
+                    let count = packs.len() as i32 + 1;
+                    let next = (current as i32 + delta).rem_euclid(count) as usize;
+                    let selected = if next == 0 {
+                        None
+                    } else {
+                        packs.get(next - 1).cloned()
+                    };
+                    if selected != self.settings.graphics.texture_pack {
+                        self.settings.graphics.texture_pack = selected;
+                        options.status_line = Some(format!(
+                            "Texture pack: {} - restart to apply.",
+                            self.settings
+                                .graphics
+                                .texture_pack
+                                .as_deref()
+                                .unwrap_or(DEFAULT_PACK_LABEL)
+                        ));
+                        changed = true;
+                    }
+                }
                 OptionsScreen::Graphics if options.selected == 3 => {
                     let all = GuiScale::ALL;
                     let current = self.settings.graphics.gui_scale;
@@ -2304,6 +2353,19 @@ impl App {
                                 self.settings.graphics.gui_scale.label(),
                                 self.settings.graphics.gui_scale.factor() * 100.0
                             ),
+                            format!(
+                                "Texture pack: {}{}",
+                                self.settings
+                                    .graphics
+                                    .texture_pack
+                                    .as_deref()
+                                    .unwrap_or(DEFAULT_PACK_LABEL),
+                                if Self::available_texture_pack_ids().is_empty() {
+                                    format!(" (none installed in {RESOURCE_PACK_DIR}/)")
+                                } else {
+                                    String::new()
+                                }
+                            ),
                         ],
                     ),
                     OptionsScreen::Controls => {
@@ -2344,6 +2406,8 @@ impl App {
                     ))
                 } else if let Some(status) = options.status_line.clone() {
                     Some(status)
+                } else if self.texture_pack_needs_restart() {
+                    Some("Texture pack changes apply after a restart.".to_string())
                 } else if at_defaults {
                     Some(format!("{} at defaults.", capitalize(scope.label())))
                 } else {
@@ -2795,7 +2859,10 @@ impl ApplicationHandler for App {
 
         window.set_cursor_visible(true);
 
-        let mut state = pollster::block_on(State::new(window.clone()));
+        let mut state = pollster::block_on(State::new(
+            window.clone(),
+            self.settings.graphics.texture_pack.clone(),
+        ));
         if let Some(block) = self.selected_block() {
             state.rebuild_preview_mesh(block);
         }
@@ -3174,7 +3241,9 @@ impl ApplicationHandler for App {
                             }
                         }
 
-                        if !generating && code == KeyCode::F5 && !event.repeat {
+                        // Moved off F5, which is now the rebindable camera
+                        // perspective toggle and swallows the key before this.
+                        if !generating && code == KeyCode::F11 && !event.repeat {
                             if let Some(state) = self.state.as_mut() {
                                 state.toggle_precipitation();
                             }

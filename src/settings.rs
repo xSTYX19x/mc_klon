@@ -48,13 +48,15 @@ impl GameplaySettings {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct GraphicsSettings {
     pub(crate) render_distance: RenderDistance,
     pub(crate) vsync: bool,
     pub(crate) backface_culling: bool,
     pub(crate) gui_scale: GuiScale,
+    /// Directory name under `resourcepacks/`; `None` uses the bundled assets.
+    pub(crate) texture_pack: Option<String>,
 }
 
 impl Default for GraphicsSettings {
@@ -64,6 +66,7 @@ impl Default for GraphicsSettings {
             vsync: true,
             backface_culling: true,
             gui_scale: GuiScale::default(),
+            texture_pack: None,
         }
     }
 }
@@ -374,7 +377,7 @@ impl AppSettings {
         let path = settings_file_path();
         let file = AppSettingsFile {
             gameplay: self.gameplay,
-            graphics: self.graphics,
+            graphics: self.graphics.clone(),
             controls: SavedInputBindings::from_runtime(&self.controls),
         };
         save_settings_atomic(&path, &file)

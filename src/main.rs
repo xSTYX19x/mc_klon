@@ -1,4 +1,5 @@
 mod app;
+mod assets;
 mod blocks;
 mod camera;
 mod commands;

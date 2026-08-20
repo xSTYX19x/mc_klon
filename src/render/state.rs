@@ -39,6 +39,7 @@ use super::texture_anim::{
     initial_anim_gpu_for_meta, make_missing_texture_rgba, parse_anim_meta_for_texture,
     resize_rgba_nearest,
 };
+use crate::assets::AssetSource;
 use crate::blocks::{
     BlockId, BlockModel, BlockRegistry, BlockTextureLookup, CullGroup, Face, FaceCoverage,
     REQUIRED_OVERLAY_TEXTURE_KEYS, RenderLayer, TEX_BEDROCK, TEX_DIRT, TEX_GRASS_SIDE,
@@ -49,7 +50,6 @@ use crate::camera::{
     Camera, CameraMode, CameraUniform, Frustum, build_view_proj_wgpu, chunk_in_frustum,
     sphere_in_frustum,
 };
-use crate::config::assets::ASSET_ROOT;
 use crate::config::player::{PLAYER_HEIGHT, PLAYER_RADIUS};
 use crate::config::render::{
     CROSSHAIR_HALF_LEN_PX, CROSSHAIR_THICKNESS_PX, FOG_RENDERDIST_END_MARGIN_BLOCKS,
@@ -2138,13 +2138,13 @@ fn centered_uv_rect(
 }
 
 fn load_gui_sprite_logical_rgba(
-    asset_root: &str,
+    asset_root: &Path,
     texture_key: &str,
     logical_width: u32,
     logical_height: u32,
 ) -> io::Result<(u32, u32, Vec<u8>)> {
     let rel_path = relative_asset_path_from_key(texture_key);
-    let sprite_path = Path::new(asset_root).join(rel_path);
+    let sprite_path = asset_root.join(rel_path);
     let (src_w, src_h, src_rgba) =
         load_png_rgba(&sprite_path).map_err(|err| io::Error::other(err.to_string()))?;
     let scale_x = (src_w / logical_width.max(1)).max(1);
@@ -5238,6 +5238,9 @@ pub(crate) struct State {
     inventory_overlay_cache: Option<InventoryOverlayCacheKey>,
     /// User GUI-scale multiplier, applied on top of the per-element UI scales.
     gui_scale: f32,
+    /// Pack the textures were actually loaded from; textures are baked into GPU
+    /// arrays at startup, so switching packs needs a restart.
+    loaded_resource_pack: Option<String>,
     /// Viewpoint the frame is rendered from; hides first-person-only overlays.
     camera_mode: CameraMode,
     /// Player pose for this frame; `None` in first person or outside a session.
@@ -7876,6 +7879,10 @@ impl State {
         }
     }
 
+    pub(crate) fn loaded_resource_pack(&self) -> Option<&str> {
+        self.loaded_resource_pack.as_deref()
+    }
+
     pub(crate) fn player_skin_layer(&self) -> u32 {
         self.first_person_skin_layer
     }
@@ -8564,7 +8571,7 @@ impl State {
         )
     }
 
-    pub(crate) async fn new(window: Arc<Window>) -> Self {
+    pub(crate) async fn new(window: Arc<Window>, active_resource_pack: Option<String>) -> Self {
         let _trace_scope = perf_trace::scope("state.new");
         let startup_total_start = Instant::now();
         let size = window.inner_size();
@@ -8747,7 +8754,9 @@ impl State {
         );
 
         // Registry nutzt Mojang-Keys relativ zu assets/minecraft/.
-        let mut texture_registry = TextureRegistry::new(ASSET_ROOT);
+        let asset_source = AssetSource::for_pack(active_resource_pack.as_deref());
+        let loaded_resource_pack = active_resource_pack.clone();
+        let mut texture_registry = TextureRegistry::new(asset_source.clone());
         for key in TEXTURE_SELF_TEST_KEYS {
             match texture_registry.get_or_load(key) {
                 Ok(_) => crate::console_info!("texture self-test ok: {}", key),
@@ -8917,7 +8926,7 @@ impl State {
                 (sheet_frames, frames_rgba, frame_size, None)
             };
             max_frame_size = max_frame_size.max(frame_size);
-            let anim_meta = parse_anim_meta_for_texture(key, sheet_frames);
+            let anim_meta = parse_anim_meta_for_texture(&asset_source, key, sheet_frames);
             debug_assert_eq!(anim_meta.axis, AnimAxis::Vertical);
             if let Some(layout) = texture_layout {
                 ui_texture_layouts.insert(key.clone(), layout);
@@ -9055,14 +9064,16 @@ impl State {
             "World Texture BindGroup",
         );
 
-        let sun_path = format!("{ASSET_ROOT}/textures/environment/sun.png");
+        let sun_path = asset_source.resolve("textures/environment/sun.png");
         let (sun_w, sun_h, mut sun_rgba) = load_png_rgba(&sun_path)
             .unwrap_or_else(|err| panic!("failed to load sky sun texture: {}", err));
-        let moon_path = format!("{ASSET_ROOT}/textures/environment/moon_phases.png");
+        let moon_path = asset_source.resolve("textures/environment/moon_phases.png");
         let (moon_w, moon_h, mut moon_rgba) = load_png_rgba(&moon_path)
             .unwrap_or_else(|err| panic!("failed to load sky moon texture: {}", err));
         let panorama_paths = std::array::from_fn::<_, MENU_PANORAMA_FACE_COUNT, _>(|index| {
-            format!("{ASSET_ROOT}/textures/gui/title/background/panorama_{index}.png")
+            asset_source.resolve(&format!(
+                "textures/gui/title/background/panorama_{index}.png"
+            ))
         });
         let panorama_faces = panorama_paths.map(|path| {
             load_png_rgba(&path)
@@ -9128,14 +9139,14 @@ impl State {
             "Sky Texture BindGroup",
         );
 
-        let dirt_path = format!("{ASSET_ROOT}/textures/block/dirt.png");
+        let dirt_path = asset_source.resolve("textures/block/dirt.png");
         let (dirt_w, dirt_h, dirt_rgba) = load_png_rgba(&dirt_path)
             .unwrap_or_else(|err| panic!("failed to load worldgen dirt texture: {}", err));
-        let font_path = format!("{ASSET_ROOT}/textures/font/ascii.png");
+        let font_path = asset_source.resolve("textures/font/ascii.png");
         let (font_w, font_h, font_rgba) = load_png_rgba(&font_path)
             .unwrap_or_else(|err| panic!("failed to load worldgen font texture: {}", err));
         let (menu_button_w, menu_button_h, menu_button_rgba) = load_gui_sprite_logical_rgba(
-            ASSET_ROOT,
+            asset_source.root_for(MENU_BUTTON_TEXTURE_KEY),
             MENU_BUTTON_TEXTURE_KEY,
             MENU_BUTTON_LOGICAL_WIDTH_PX,
             MENU_BUTTON_LOGICAL_HEIGHT_PX,
@@ -9143,7 +9154,7 @@ impl State {
         .unwrap_or_else(|err| panic!("failed to load menu button texture: {}", err));
         let (menu_button_highlighted_w, menu_button_highlighted_h, menu_button_highlighted_rgba) =
             load_gui_sprite_logical_rgba(
-                ASSET_ROOT,
+                asset_source.root_for(MENU_BUTTON_HIGHLIGHTED_TEXTURE_KEY),
                 MENU_BUTTON_HIGHLIGHTED_TEXTURE_KEY,
                 MENU_BUTTON_LOGICAL_WIDTH_PX,
                 MENU_BUTTON_LOGICAL_HEIGHT_PX,
@@ -9153,7 +9164,7 @@ impl State {
             });
         let (menu_button_disabled_w, menu_button_disabled_h, menu_button_disabled_rgba) =
             load_gui_sprite_logical_rgba(
-                ASSET_ROOT,
+                asset_source.root_for(MENU_BUTTON_DISABLED_TEXTURE_KEY),
                 MENU_BUTTON_DISABLED_TEXTURE_KEY,
                 MENU_BUTTON_LOGICAL_WIDTH_PX,
                 MENU_BUTTON_LOGICAL_HEIGHT_PX,
@@ -10034,6 +10045,7 @@ impl State {
             inventory_overlay_mesh: None,
             inventory_overlay_cache: None,
             gui_scale: GuiScale::default().factor(),
+            loaded_resource_pack,
             camera_mode: CameraMode::default(),
             player_model_view: None,
             _texture_registry: texture_registry,

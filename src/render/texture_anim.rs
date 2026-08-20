@@ -1,9 +1,9 @@
 use bytemuck::{Pod, Zeroable};
 use serde::Deserialize;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use crate::config::assets::ASSET_ROOT;
+use crate::assets::AssetSource;
 use crate::config::render::{
     ANIM_FLAG_ANIMATED, DEFAULT_FRAMETIME_TICKS, DEFAULT_LAVA_FRAMETIME_TICKS,
     DEFAULT_WATER_FRAMETIME_TICKS,
@@ -83,21 +83,10 @@ enum McmetaFrame {
     Indexed { index: u16, time: Option<u32> },
 }
 
-fn resolve_asset_path_for_key(key: &str) -> PathBuf {
-    let relative = key
-        .strip_prefix("minecraft:")
-        .unwrap_or(key)
-        .trim_start_matches('/');
-    Path::new(ASSET_ROOT).join(relative)
-}
-
-fn resolve_mcmeta_path_for_key(key: &str) -> PathBuf {
-    let relative = key
-        .strip_prefix("minecraft:")
-        .unwrap_or(key)
-        .trim_start_matches('/');
-    let mut path = PathBuf::from(ASSET_ROOT);
-    path.push(relative);
+/// The `.mcmeta` sidecar has to come from the same root as the texture itself,
+/// or a pack's animation timings would be applied to the default texture.
+fn resolve_mcmeta_path_for_key(source: &AssetSource, key: &str) -> PathBuf {
+    let mut path = source.resolve(key);
     path.set_extension("png.mcmeta");
     path
 }
@@ -168,11 +157,15 @@ pub(crate) fn decode_texture_frames(
     }
 }
 
-pub(crate) fn parse_anim_meta_for_texture(key: &str, sheet_frames: u32) -> AnimMeta {
+pub(crate) fn parse_anim_meta_for_texture(
+    source: &AssetSource,
+    key: &str,
+    sheet_frames: u32,
+) -> AnimMeta {
     let mut frametime_ticks = default_frametime_ticks_for_key(key);
     let mut sequence: Vec<u16> = (0..sheet_frames).map(|f| f as u16).collect();
 
-    let mcmeta_path = resolve_mcmeta_path_for_key(key);
+    let mcmeta_path = resolve_mcmeta_path_for_key(source, key);
     if let Ok(text) = fs::read_to_string(&mcmeta_path) {
         match serde_json::from_str::<McmetaFile>(&text) {
             Ok(parsed) => {

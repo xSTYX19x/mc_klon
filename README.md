@@ -36,7 +36,7 @@ Gameplay and content are still introduced in a roughly historical order, but ren
 - first mouse click in the window: enable mouse capture
 - `LMB` / `RMB`: break / place block
 - `Mouse Wheel`: hotbar selection
-- `E`: inventory
+- `B`: inventory
 - `T`: chat
 - `Space`: jump / move upward (depending on mode)
 - `Shift`: descend (while flying) / context-dependent movement
@@ -45,18 +45,24 @@ Gameplay and content are still introduced in a roughly historical order, but ren
 - `ESC`: pause / close menus
 - `N`: generate a new world
 - `Enter`: save world
-- `K`: toggle hand-tweak debug mode
-- Hand-tweak mode: mouse wheel=`scale`, arrows=`side/down`, `PageUp/PageDown`=`forward`, `[`/`]`=`roll`
+- `K`: ticking-area editor (radius / flags)
+- `F2`: screenshot -> `screenshots/<YYYY-MM-DD_HH-MM-SS>.png`
+- `F5`: cycle camera perspective (first person / third person back / front)
 - `F`: cycle render distance
 - `G`: cycle simulation distance
 - `F3`: debug overlay
 - `F4`: depth-test debug toggle
-- `F5`: frustum-culling debug toggle
 - `F6`: far LOD on/off
 - `F7`: ambient occlusion debug toggle
 - `F8`: cycle lighting debug view
+- `F9`: fluid debug line under the crosshair
+- `F10`: perf summary toggle
+- `F11`: precipitation toggle
 - `Ctrl+T`: create a ticking area at the current chunk position
 - `Ctrl+Shift+T`: remove the nearest ticking area
+
+Rebindable actions (movement, jump, sneak, sprint, inventory, chat, ticking areas,
+screenshot, camera perspective, pause) can be changed under Options -> Controls.
 
 Note: hotbar selection through number keys `1..9` is still not wired.
 
@@ -67,6 +73,14 @@ Note: hotbar selection through number keys `1..9` is still not wired.
 - Default worldgen preset: `Rd161348Like`
 - Random tick speed: `3` samples per active chunk and sim tick
 - Settings file: `save/settings.json`
+
+## Resource Packs
+
+- Drop a pack into `resourcepacks/<name>/`, then pick it under Options -> Video / Graphics
+- Both layouts are detected: `<name>/textures/...` and `<name>/assets/minecraft/textures/...`
+- A pack is an overlay: anything it does not ship falls back to the bundled `assets/minecraft`
+- Textures are uploaded into GPU arrays at startup, so switching packs takes effect after a restart
+- `.zip` packs are not supported yet (folders only)
 
 ## Save System
 
