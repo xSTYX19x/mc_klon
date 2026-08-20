@@ -154,6 +154,27 @@ impl IdMapper {
                 manifest_key_to_id.insert(key, entry.id);
             }
         }
+        // A saved manifest may spell a block with an accepted alias
+        // (`core:stone`) instead of its canonical key. Decoding resolves those,
+        // so encoding has to as well — otherwise re-saving such a world rewrites
+        // every aliased block to the missing id. Exact canonical entries win.
+        let mut aliased_ids: Vec<(NamespacedKey, u32)> = Vec::new();
+        for entry in &manifest.blocks {
+            let Some(key) = NamespacedKey::parse(&entry.key) else {
+                continue;
+            };
+            let Some(block) = reg.block_for_key(&key) else {
+                continue;
+            };
+            let canonical = block_key_for_block(block);
+            if canonical != key {
+                aliased_ids.push((canonical, entry.id));
+            }
+        }
+        for (key, id) in aliased_ids {
+            manifest_key_to_id.entry(key).or_insert(id);
+        }
+
         let fallback_manifest_id = missing_manifest_id
             .or_else(|| {
                 NamespacedKey::parse("core:air")
@@ -270,4 +291,225 @@ fn tmp_path_for(path: &Path) -> io::Result<PathBuf> {
     let mut tmp_name = file_name.to_os_string();
     tmp_name.push(".tmp");
     Ok(path.with_file_name(tmp_name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IdMapper, ManifestBlockEntry, WorldManifest, content_signature_hex};
+    use crate::blocks::{BlockId, BlockRegistry, block_key_for_block};
+    use crate::registry::NamespacedKey;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_manifest_path() -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("mc_klon_manifest_{nanos}.json"))
+    }
+
+    fn key(raw: &str) -> NamespacedKey {
+        NamespacedKey::parse(raw).expect("test key must parse")
+    }
+
+    #[test]
+    fn every_runtime_block_round_trips_through_its_own_manifest() {
+        let reg = BlockRegistry::new();
+        let manifest = WorldManifest::build_from_registry(&reg);
+        let mapper = IdMapper::from_manifest_and_registry(&manifest, &reg);
+
+        for raw in 0u16..=255 {
+            let Ok(block) = BlockId::from_u8(raw as u8) else {
+                continue;
+            };
+            assert_eq!(
+                mapper.decode_manifest_id(mapper.encode_runtime_block(block)),
+                block,
+                "block {block:?} did not survive the manifest round trip"
+            );
+        }
+        assert_eq!(mapper.missing_blocks_count(), 0);
+    }
+
+    #[test]
+    fn manifest_pins_legacy_runtime_ids_to_identical_manifest_ids() {
+        // Pre-manifest saves stored raw runtime ids, so slots 0..=255 must keep
+        // meaning the same block or every old column decodes to garbage.
+        let reg = BlockRegistry::new();
+        let manifest = WorldManifest::build_from_registry(&reg);
+        for raw in 0u16..=255 {
+            let Ok(block) = BlockId::from_u8(raw as u8) else {
+                continue;
+            };
+            let entry = manifest
+                .blocks
+                .iter()
+                .find(|entry| entry.id == raw as u32)
+                .unwrap_or_else(|| panic!("manifest has no entry for id {raw}"));
+            assert_eq!(entry.key, block_key_for_block(block).to_string());
+        }
+    }
+
+    #[test]
+    fn manifest_build_is_deterministic() {
+        let reg = BlockRegistry::new();
+        let a = WorldManifest::build_from_registry(&reg);
+        let b = WorldManifest::build_from_registry(&reg);
+        assert_eq!(a.content_signature, b.content_signature);
+        let ids_a: Vec<_> = a.blocks.iter().map(|e| (e.id, e.key.as_str())).collect();
+        let ids_b: Vec<_> = b.blocks.iter().map(|e| (e.id, e.key.as_str())).collect();
+        assert_eq!(ids_a, ids_b);
+    }
+
+    #[test]
+    fn saved_ids_are_remapped_by_key_not_by_slot() {
+        // The whole point of the manifest: a save whose ids drifted away from
+        // the current runtime order must still resolve to the right blocks.
+        let reg = BlockRegistry::new();
+        let manifest = WorldManifest {
+            format_version: 1,
+            game_version: "test".to_string(),
+            content_signature: "deadbeefdeadbeef".to_string(),
+            blocks: vec![
+                ManifestBlockEntry {
+                    id: 0,
+                    key: "minecraft:air".to_string(),
+                },
+                ManifestBlockEntry {
+                    id: 40,
+                    key: "minecraft:stone".to_string(),
+                },
+                ManifestBlockEntry {
+                    id: 41,
+                    key: "minecraft:dirt".to_string(),
+                },
+                ManifestBlockEntry {
+                    id: 42,
+                    key: super::CORE_MISSING_BLOCK_KEY.to_string(),
+                },
+            ],
+        };
+        let mapper = IdMapper::from_manifest_and_registry(&manifest, &reg);
+
+        assert_eq!(mapper.decode_manifest_id(40), BlockId::Stone);
+        assert_eq!(mapper.decode_manifest_id(41), BlockId::Dirt);
+        assert_eq!(mapper.decode_manifest_id(0), BlockId::Air);
+        // Encoding writes the save's ids back, so a re-save keeps its own layout.
+        assert_eq!(mapper.encode_runtime_block(BlockId::Stone), 40);
+        assert_eq!(mapper.encode_runtime_block(BlockId::Dirt), 41);
+        assert_eq!(mapper.missing_blocks_count(), 0);
+    }
+
+    #[test]
+    fn aliased_saved_keys_encode_back_to_their_own_slot() {
+        // `core:stone` is an accepted alias, so decoding it works. Encoding has
+        // to land on the same id, or one save/load cycle turns the block into
+        // the missing placeholder.
+        let reg = BlockRegistry::new();
+        let manifest = WorldManifest {
+            format_version: 1,
+            game_version: "test".to_string(),
+            content_signature: "deadbeefdeadbeef".to_string(),
+            blocks: vec![
+                ManifestBlockEntry {
+                    id: 0,
+                    key: "minecraft:air".to_string(),
+                },
+                ManifestBlockEntry {
+                    id: 7,
+                    key: "core:stone".to_string(),
+                },
+                ManifestBlockEntry {
+                    id: 8,
+                    key: super::CORE_MISSING_BLOCK_KEY.to_string(),
+                },
+            ],
+        };
+        let mapper = IdMapper::from_manifest_and_registry(&manifest, &reg);
+
+        assert_eq!(mapper.decode_manifest_id(7), BlockId::Stone);
+        assert_eq!(mapper.encode_runtime_block(BlockId::Stone), 7);
+    }
+
+    #[test]
+    fn unknown_saved_keys_degrade_to_missing_and_are_reported() {
+        let reg = BlockRegistry::new();
+        let manifest = WorldManifest {
+            format_version: 1,
+            game_version: "test".to_string(),
+            content_signature: "deadbeefdeadbeef".to_string(),
+            blocks: vec![
+                ManifestBlockEntry {
+                    id: 0,
+                    key: "core:air".to_string(),
+                },
+                ManifestBlockEntry {
+                    id: 1,
+                    key: "somemod:unobtainium".to_string(),
+                },
+                ManifestBlockEntry {
+                    id: 2,
+                    key: super::CORE_MISSING_BLOCK_KEY.to_string(),
+                },
+            ],
+        };
+        let mapper = IdMapper::from_manifest_and_registry(&manifest, &reg);
+
+        let missing_runtime = reg
+            .block_for_key(&key(super::CORE_MISSING_BLOCK_KEY))
+            .unwrap_or(BlockId::Air);
+        assert_eq!(mapper.decode_manifest_id(1), missing_runtime);
+        assert_eq!(mapper.missing_block_keys(), ["somemod:unobtainium"]);
+        // Ids past the end of the table must not panic or wrap into a real block.
+        assert_eq!(mapper.decode_manifest_id(9_999), missing_runtime);
+        // Runtime blocks the save never knew about fall back to the same slot.
+        assert_eq!(mapper.encode_runtime_block(BlockId::Stone), 2);
+    }
+
+    #[test]
+    fn content_signature_tracks_the_key_set() {
+        let base = [key("core:air"), key("core:dirt"), key("core:stone")];
+        let same = [key("core:air"), key("core:dirt"), key("core:stone")];
+        let added = [
+            key("core:air"),
+            key("core:dirt"),
+            key("core:gravel"),
+            key("core:stone"),
+        ];
+
+        assert_eq!(content_signature_hex(&base), content_signature_hex(&same));
+        assert_ne!(content_signature_hex(&base), content_signature_hex(&added));
+        assert_eq!(content_signature_hex(&base).len(), 16);
+    }
+
+    #[test]
+    fn manifest_file_round_trips_and_rejects_drifted_headers() {
+        let path = temp_manifest_path();
+        let reg = BlockRegistry::new();
+        let manifest = WorldManifest::build_from_registry(&reg);
+        manifest.save(&path).unwrap();
+
+        let loaded = WorldManifest::load(&path).unwrap();
+        assert_eq!(loaded.content_signature, manifest.content_signature);
+        assert_eq!(loaded.blocks.len(), manifest.blocks.len());
+        assert_eq!(loaded.short_signature(), &manifest.content_signature[..8]);
+
+        // A newer on-disk format must be refused rather than half-read.
+        let bumped = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("\"format_version\": 1", "\"format_version\": 2");
+        std::fs::write(&path, bumped).unwrap();
+        let err = WorldManifest::load(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("format_version"),
+            "expected a format_version rejection, got: {err}"
+        );
+
+        // `deny_unknown_fields` guards against silently ignoring new keys.
+        std::fs::write(&path, "{\"format_version\":1,\"game_version\":\"x\",\"content_signature\":\"0\",\"blocks\":[],\"future\":1}").unwrap();
+        assert!(WorldManifest::load(&path).is_err());
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

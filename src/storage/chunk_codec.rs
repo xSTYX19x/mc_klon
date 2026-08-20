@@ -1,3 +1,29 @@
+//! Column payload wire format.
+//!
+//! Two versions exist on disk. **v2 is the only one this crate writes**; v1 is
+//! read-only and must stay that way so pre-name-palette saves keep opening.
+//!
+//! Shared header (little endian): magic `MKCL`, `u16` format_version, `u16`
+//! column flags (must be 0), `i32` × 8 world params (cx, cz, min_y, max_y,
+//! sea_level, chunk_size, min_section_y, max_section_y), `u16` section count,
+//! `u16` reserved (must be 0). Sections follow in strictly ascending `cy`
+//! order, each prefixed by `i32 cy`, `u8` section flags and 3 zero bytes. A
+//! `u32` CRC32 over everything before it closes the payload.
+//!
+//! The versions differ only in how a section's blocks are encoded:
+//!
+//! * **v1** (section flags [`SECTION_FLAGS_V1`]): a byte array of *manifest*
+//!   block ids, palette-compressed like the block-data array. Decoding needs
+//!   the world's `IdMapper`, so v1 blobs cannot be interpreted without the
+//!   save's `manifest.json`.
+//! * **v2** (section flags [`SECTION_FLAGS_V2`]): a bitpacked index array over
+//!   a per-section palette of block *names*. Self-describing — unknown names
+//!   degrade to air instead of silently resolving to a foreign block.
+//!
+//! Adding a v3 means bumping [`COLUMN_PAYLOAD_FORMAT_VERSION`] and keeping both
+//! older branches in [`decode_column`]; see `docs/TODO.md` for the open
+//! compaction ideas.
+
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
@@ -1423,6 +1449,260 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Writes a v1 column payload. Production only ever emits v2, so without a
+    /// writer here the v1 branch of `decode_column` has no coverage at all and
+    /// could rot unnoticed until someone opens a pre-name-palette save.
+    fn encode_blob_v1(column: &super::ColumnBlob) -> io::Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(1024);
+        out.extend_from_slice(&super::COLUMN_PAYLOAD_MAGIC);
+        out.extend_from_slice(&super::COLUMN_PAYLOAD_FORMAT_VERSION_V1.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&column.cx.to_le_bytes());
+        out.extend_from_slice(&column.cz.to_le_bytes());
+        out.extend_from_slice(&column.min_y.to_le_bytes());
+        out.extend_from_slice(&column.max_y.to_le_bytes());
+        out.extend_from_slice(&column.sea_level.to_le_bytes());
+        out.extend_from_slice(&column.chunk_size.to_le_bytes());
+        out.extend_from_slice(&column.min_section_y.to_le_bytes());
+        out.extend_from_slice(&column.max_section_y.to_le_bytes());
+        out.extend_from_slice(&(column.sections.len() as u16).to_le_bytes());
+        out.extend_from_slice(&super::COLUMN_RESERVED0_V1.to_le_bytes());
+
+        for section in &column.sections {
+            let super::EncodedBlocks::LegacyManifestIds(blocks) = &section.blocks else {
+                panic!("v1 sections carry manifest ids, not a name palette");
+            };
+            out.extend_from_slice(&section.cy.to_le_bytes());
+            out.push(super::SECTION_FLAGS_V1);
+            out.extend_from_slice(&[0, 0, 0]);
+            super::write_encoded_array(&mut out, blocks)?;
+            super::write_encoded_array(&mut out, &section.data)?;
+        }
+
+        let crc = super::crc32_ieee(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        Ok(out)
+    }
+
+    /// One-section v1 column sized to `world`, so `validate_column_for_world`
+    /// accepts it on apply.
+    fn v1_column(
+        world: &World,
+        cx: i32,
+        cz: i32,
+        cy: i32,
+        manifest_ids: &[u8],
+        data: &[u8],
+    ) -> super::ColumnBlob {
+        super::ColumnBlob {
+            format_version: super::COLUMN_PAYLOAD_FORMAT_VERSION_V1,
+            cx,
+            cz,
+            min_y: world.min_y(),
+            max_y: world.max_y(),
+            sea_level: world.sea_level(),
+            chunk_size: world.chunk_size(),
+            min_section_y: world.min_chunk_y(),
+            max_section_y: world.max_chunk_y(),
+            sections: vec![super::SectionBlob {
+                cy,
+                blocks: super::EncodedBlocks::LegacyManifestIds(
+                    super::EncodedArray::from_values(manifest_ids).unwrap(),
+                ),
+                data: super::EncodedArray::from_values(data).unwrap(),
+            }],
+        }
+    }
+
+    #[test]
+    fn v1_columns_still_decode_and_map_through_the_manifest() {
+        let world = World::new();
+        let (cx, cz, cy) = (3, -7, 2);
+
+        // v1 stored one manifest id per voxel. `build_from_registry` pins ids
+        // 0..=255 to the matching runtime ids, so a fresh world round-trips the
+        // legacy bytes unchanged — that identity is the compat guarantee.
+        let mut manifest_ids = vec![BlockId::Air.to_u8(); SECTION_BLOCK_COUNT];
+        let mut data = vec![0u8; SECTION_BLOCK_COUNT];
+        let placed = [
+            (0, 0, 0, BlockId::Stone, 7u8),
+            (5, 2, 3, BlockId::Dirt, 42),
+            (15, 15, 15, BlockId::OakPlanks, 0),
+        ];
+        for &(x, y, z, block, value) in &placed {
+            let idx = crate::world::Chunk::index(x, y, z);
+            manifest_ids[idx] = block.to_u8();
+            data[idx] = value;
+        }
+
+        let bytes = encode_blob_v1(&v1_column(&world, cx, cz, cy, &manifest_ids, &data)).unwrap();
+        let decoded = decode_column(&bytes).unwrap();
+        assert_eq!(
+            decoded.format_version,
+            super::COLUMN_PAYLOAD_FORMAT_VERSION_V1
+        );
+        assert!(matches!(
+            decoded.sections[0].blocks,
+            super::EncodedBlocks::LegacyManifestIds(_)
+        ));
+
+        let mut dst = World::new();
+        apply_column(&mut dst, decoded).unwrap();
+        for &(x, y, z, block, value) in &placed {
+            let pos = IVec3::new(
+                cx * CHUNK_SIZE + x,
+                cy * CHUNK_SIZE + y,
+                cz * CHUNK_SIZE + z,
+            );
+            assert_eq!(dst.get_block(pos), block, "block mismatch at {pos:?}");
+            assert_eq!(dst.get_block_data(pos), value, "data mismatch at {pos:?}");
+        }
+    }
+
+    #[test]
+    fn v1_columns_reject_v2_section_flags() {
+        let world = World::new();
+        let blocks = vec![BlockId::Stone.to_u8(); SECTION_BLOCK_COUNT];
+        let data = vec![0u8; SECTION_BLOCK_COUNT];
+        let mut bytes = encode_blob_v1(&v1_column(&world, 0, 0, 0, &blocks, &data)).unwrap();
+
+        // Section flags sit right after the 44-byte header plus `i32 cy`.
+        let flags_offset = 44 + 4;
+        assert_eq!(bytes[flags_offset], super::SECTION_FLAGS_V1);
+        bytes[flags_offset] = super::SECTION_FLAGS_V2;
+        refresh_crc(&mut bytes);
+
+        let err = decode_column(&bytes).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("v1 section flags"),
+            "expected a v1 section-flag rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn v2_columns_reject_v1_section_flags() {
+        let mut world = World::new();
+        set(world_mut(&mut world), 0, 0, 0, 1, 1, 1, BlockId::Stone, 0);
+        let mut bytes = encode_column(&world, 0, 0).unwrap();
+
+        let flags_offset = 44 + 4;
+        assert_eq!(bytes[flags_offset], super::SECTION_FLAGS_V2);
+        bytes[flags_offset] = super::SECTION_FLAGS_V1;
+        refresh_crc(&mut bytes);
+
+        let err = decode_column(&bytes).unwrap_err();
+        assert!(
+            err.to_string().contains("section flags for v2 payload"),
+            "expected a v2 section-flag rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn decode_column_rejects_header_signature_drift() {
+        let mut world = World::new();
+        set(world_mut(&mut world), 0, 0, 0, 2, 3, 4, BlockId::Dirt, 1);
+        let good = encode_column(&world, 0, 0).unwrap();
+
+        // Every guarded header field, with the CRC refreshed so the payload
+        // fails on the field itself rather than on the checksum.
+        let cases: [(usize, &[u8], &str); 4] = [
+            (0, b"MKXX", "magic"),
+            (4, &3u16.to_le_bytes(), "format_version"),
+            (6, &1u16.to_le_bytes(), "flags"),
+            (42, &1u16.to_le_bytes(), "reserved0"),
+        ];
+        for (offset, patch, expected) in cases {
+            let mut bytes = good.clone();
+            bytes[offset..offset + patch.len()].copy_from_slice(patch);
+            refresh_crc(&mut bytes);
+            let err = decode_column(&bytes).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                err.to_string().contains(expected),
+                "offset {offset}: expected an error naming '{expected}', got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_column_rejects_truncated_and_padded_payloads() {
+        let mut world = World::new();
+        set(world_mut(&mut world), 0, 0, 0, 6, 6, 6, BlockId::Cobblestone, 9);
+        let good = encode_column(&world, 0, 0).unwrap();
+
+        let truncated = &good[..good.len() - 8];
+        assert_eq!(
+            decode_column(truncated).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut padded = good.clone();
+        padded.push(0);
+        let err = decode_column(&padded).unwrap_err();
+        assert!(
+            err.to_string().contains("trailing bytes"),
+            "expected a trailing-byte rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_block_names_decode_to_air_instead_of_failing() {
+        let world = World::new();
+        // A section from a future/modded build: one known name, one this
+        // registry has never heard of. Opening the save must not hard-fail.
+        let mut indices = vec![0u32; SECTION_BLOCK_COUNT];
+        let stone_idx = crate::world::Chunk::index(1, 1, 1);
+        let ghost_idx = crate::world::Chunk::index(2, 1, 1);
+        indices[stone_idx] = 1;
+        indices[ghost_idx] = 2;
+
+        let column = super::ColumnBlob {
+            format_version: super::COLUMN_PAYLOAD_FORMAT_VERSION,
+            cx: 0,
+            cz: 0,
+            min_y: world.min_y(),
+            max_y: world.max_y(),
+            sea_level: world.sea_level(),
+            chunk_size: world.chunk_size(),
+            min_section_y: world.min_chunk_y(),
+            max_section_y: world.max_chunk_y(),
+            sections: vec![super::SectionBlob {
+                cy: 0,
+                blocks: super::EncodedBlocks::NamePaletteBitpacked {
+                    palette: vec![
+                        "core:air".to_string(),
+                        "core:stone".to_string(),
+                        "somemod:unobtainium".to_string(),
+                    ],
+                    bits_per_entry: 2,
+                    packed_words: super::pack_indices_u32(&indices, 2).unwrap(),
+                },
+                data: super::EncodedArray::from_values(&vec![0u8; SECTION_BLOCK_COUNT]).unwrap(),
+            }],
+        };
+
+        let bytes = encode_blob(&column).unwrap();
+        let decoded = decode_column(&bytes).unwrap();
+        let mut dst = World::new();
+        apply_column(&mut dst, decoded).unwrap();
+
+        assert_eq!(dst.get_block(IVec3::new(1, 1, 1)), BlockId::Stone);
+        assert_eq!(
+            dst.get_block(IVec3::new(2, 1, 1)),
+            BlockId::Air,
+            "an unknown palette name must degrade to air, not to a neighbouring id"
+        );
+    }
+
+    /// Rewrites the CRC32 trailer so a patched payload fails on the field under
+    /// test instead of on the checksum.
+    fn refresh_crc(bytes: &mut [u8]) {
+        let len = bytes.len();
+        let crc = super::crc32_ieee(&bytes[..len - 4]);
+        bytes[len - 4..].copy_from_slice(&crc.to_le_bytes());
     }
 
     fn world_mut(world: &mut World) -> &mut World {

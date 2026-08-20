@@ -56,7 +56,7 @@ When an item ships, delete it from here instead of marking it done.
 
 ## Storage / Content Foundation
 
-- keep V1/V2 read-compatibility explicit; expand save/load tests for signature drift, unknown blocks, remap cases
+- [x] keep V1/V2 read-compatibility explicit; expand save/load tests for signature drift, unknown blocks, remap cases *(umgesetzt, wartet auf Verifikation)*
 - if measurements justify it: design a more compact v2.1/v3 column storage layout (less string overhead than the current name-palette, forward-compatible)
 - measure and, if necessary, reduce V2 storage overhead for block-name palettes
 - migrate in-memory chunk storage from `BlockId`/`block_data` `Vec`s to `BlockStateId` + separate dirty flags, then optionally palette/bitpack at runtime too
@@ -64,7 +64,6 @@ When an item ships, delete it from here instead of marking it done.
 ## UI / UX
 
 - keep expanding the options UI without reintroducing scattered hard-coded runtime settings
-- [x] Texture-Packs als `.zip` *(umgesetzt, wartet auf Verifikation)*
 
 ## Gameplay
 
