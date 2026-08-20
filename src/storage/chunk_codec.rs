@@ -1771,3 +1771,423 @@ mod tests {
         }
     }
 }
+
+/// Measures what the v2 name palette actually costs on disk.
+///
+/// The open question in `docs/TODO.md` is whether a more compact column layout
+/// is worth designing. Raw payload sizes cannot answer that: region files store
+/// zlib-compressed payloads, and a per-section palette of repeated block names
+/// is exactly the input deflate is best at. Run the report with
+/// `cargo test storage::chunk_codec::v2_size_report -- --nocapture`.
+#[cfg(test)]
+mod v2_size_report {
+    use super::{ColumnBlob, EncodedArray, EncodedBlocks, decode_column, encode_column};
+    use crate::blocks::BlockRegistry;
+    use crate::world::{CHUNK_SIZE, World, WorldConfig};
+    use crate::worldgen::WorldgenPreset;
+    use flate2::Compression;
+    use flate2::write::ZlibEncoder;
+    use std::io::Write;
+
+    /// Byte split of one encoded v2 payload, mirroring the writers in this
+    /// module. Kept as counts rather than a parser so it stays in step with
+    /// `encode_blob` by construction.
+    #[derive(Clone, Copy, Debug, Default)]
+    struct Breakdown {
+        total: usize,
+        header: usize,
+        section_headers: usize,
+        palette_names: usize,
+        block_indices: usize,
+        block_data: usize,
+        crc: usize,
+        sections: usize,
+        palette_entries: usize,
+    }
+
+    impl Breakdown {
+        fn add(&mut self, other: &Breakdown) {
+            self.total += other.total;
+            self.header += other.header;
+            self.section_headers += other.section_headers;
+            self.palette_names += other.palette_names;
+            self.block_indices += other.block_indices;
+            self.block_data += other.block_data;
+            self.crc += other.crc;
+            self.sections += other.sections;
+            self.palette_entries += other.palette_entries;
+        }
+    }
+
+    const COLUMN_HEADER_BYTES: usize = 44;
+    const SECTION_HEADER_BYTES: usize = 8;
+    const CRC_BYTES: usize = 4;
+
+    fn encoded_array_bytes(arr: &EncodedArray) -> usize {
+        match arr {
+            EncodedArray::Single(_) => 2,
+            EncodedArray::PaletteBitpacked {
+                palette,
+                packed_words,
+                ..
+            } => 1 + 2 + 1 + palette.len() + 2 + packed_words.len() * 8,
+        }
+    }
+
+    fn breakdown(column: &ColumnBlob) -> Breakdown {
+        let mut out = Breakdown {
+            total: 0,
+            header: COLUMN_HEADER_BYTES,
+            crc: CRC_BYTES,
+            sections: column.sections.len(),
+            ..Breakdown::default()
+        };
+
+        for section in &column.sections {
+            out.section_headers += SECTION_HEADER_BYTES;
+            match &section.blocks {
+                EncodedBlocks::NamePaletteBitpacked {
+                    palette,
+                    packed_words,
+                    ..
+                } => {
+                    out.palette_entries += palette.len();
+                    out.palette_names +=
+                        2 + palette.iter().map(|name| 2 + name.len()).sum::<usize>();
+                    out.block_indices += 1 + 2 + packed_words.len() * 8;
+                }
+                EncodedBlocks::LegacyManifestIds(arr) => {
+                    out.block_indices += encoded_array_bytes(arr);
+                }
+            }
+            out.block_data += encoded_array_bytes(&section.data);
+        }
+
+        out.total = out.header
+            + out.section_headers
+            + out.palette_names
+            + out.block_indices
+            + out.block_data
+            + out.crc;
+        out
+    }
+
+    /// The realistic v3 candidate: the same payload with every palette *name*
+    /// replaced by a `u16` block id. Only the size matters here, so this writes
+    /// the delta rather than a decodable format. Header and CRC are copied from
+    /// the real payload so the palette encoding is the *only* difference the
+    /// compressor sees — otherwise zeroed filler would fake a saving.
+    fn compact_id_palette_bytes(
+        encoded: &[u8],
+        column: &ColumnBlob,
+        reg: &BlockRegistry,
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(encoded.len());
+        out.extend_from_slice(&encoded[..COLUMN_HEADER_BYTES]);
+        for section in &column.sections {
+            out.extend_from_slice(&section.cy.to_le_bytes());
+            out.push(super::SECTION_FLAGS_V2);
+            out.extend_from_slice(&[0, 0, 0]);
+            if let EncodedBlocks::NamePaletteBitpacked {
+                palette,
+                bits_per_entry,
+                packed_words,
+            } = &section.blocks
+            {
+                out.extend_from_slice(&(palette.len() as u16).to_le_bytes());
+                for name in palette {
+                    let id = reg.resolve_fast(name).map(|b| b.to_u8()).unwrap_or(0);
+                    out.extend_from_slice(&u16::from(id).to_le_bytes());
+                }
+                out.push(*bits_per_entry);
+                out.extend_from_slice(&(packed_words.len() as u16).to_le_bytes());
+                for &word in packed_words {
+                    out.extend_from_slice(&word.to_le_bytes());
+                }
+            }
+            match &section.data {
+                EncodedArray::Single(value) => {
+                    out.push(0);
+                    out.push(*value);
+                }
+                EncodedArray::PaletteBitpacked {
+                    palette,
+                    bits_per_entry,
+                    packed_words,
+                } => {
+                    out.push(1);
+                    out.extend_from_slice(&(palette.len() as u16).to_le_bytes());
+                    out.push(*bits_per_entry);
+                    out.extend_from_slice(palette);
+                    out.extend_from_slice(&(packed_words.len() as u16).to_le_bytes());
+                    for &word in packed_words {
+                        out.extend_from_slice(&word.to_le_bytes());
+                    }
+                }
+            }
+        }
+        out.extend_from_slice(&encoded[encoded.len() - CRC_BYTES..]);
+        out
+    }
+
+    /// The conservative v3 candidate: keep block *names* — and with them the
+    /// self-describing decode v2 exists for — but hoist one palette to the
+    /// column so the same names stop repeating in every section. Sections then
+    /// index the column palette, which costs a bit or two more per voxel.
+    fn column_palette_bytes(encoded: &[u8], column: &ColumnBlob) -> Vec<u8> {
+        let mut names: Vec<&str> = Vec::new();
+        for section in &column.sections {
+            if let EncodedBlocks::NamePaletteBitpacked { palette, .. } = &section.blocks {
+                for name in palette {
+                    if !names.contains(&name.as_str()) {
+                        names.push(name.as_str());
+                    }
+                }
+            }
+        }
+        let column_bits = super::ceil_log2_u32(names.len() as u32).max(1);
+
+        let mut out = Vec::with_capacity(encoded.len());
+        out.extend_from_slice(&encoded[..COLUMN_HEADER_BYTES]);
+        out.extend_from_slice(&(names.len() as u16).to_le_bytes());
+        for name in &names {
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+        }
+
+        for section in &column.sections {
+            out.extend_from_slice(&section.cy.to_le_bytes());
+            out.push(super::SECTION_FLAGS_V2);
+            out.extend_from_slice(&[0, 0, 0]);
+            if let EncodedBlocks::NamePaletteBitpacked {
+                palette,
+                bits_per_entry,
+                packed_words,
+            } = &section.blocks
+            {
+                let local = super::unpack_indices_u32(*bits_per_entry, packed_words, palette.len())
+                    .expect("section indices must unpack");
+                let remapped: Vec<u32> = local
+                    .iter()
+                    .map(|&idx| {
+                        names
+                            .iter()
+                            .position(|name| *name == palette[idx as usize].as_str())
+                            .expect("name must be in the column palette") as u32
+                    })
+                    .collect();
+                let words =
+                    super::pack_indices_u32(&remapped, column_bits).expect("repack must succeed");
+                out.push(column_bits);
+                out.extend_from_slice(&(words.len() as u16).to_le_bytes());
+                for &word in &words {
+                    out.extend_from_slice(&word.to_le_bytes());
+                }
+            }
+            match &section.data {
+                EncodedArray::Single(value) => {
+                    out.push(0);
+                    out.push(*value);
+                }
+                EncodedArray::PaletteBitpacked {
+                    palette,
+                    bits_per_entry,
+                    packed_words,
+                } => {
+                    out.push(1);
+                    out.extend_from_slice(&(palette.len() as u16).to_le_bytes());
+                    out.push(*bits_per_entry);
+                    out.extend_from_slice(palette);
+                    out.extend_from_slice(&(packed_words.len() as u16).to_le_bytes());
+                    for &word in packed_words {
+                        out.extend_from_slice(&word.to_le_bytes());
+                    }
+                }
+            }
+        }
+        out.extend_from_slice(&encoded[encoded.len() - CRC_BYTES..]);
+        out
+    }
+
+    /// Same settings as `region_file.rs`, so the numbers are on-disk sizes.
+    fn zlib_len(bytes: &[u8]) -> usize {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(bytes).expect("zlib write");
+        encoder.finish().expect("zlib finish").len()
+    }
+
+    /// Signed change against the v2 baseline: positive saves bytes, negative
+    /// costs them. `pct` would clamp a regression to zero and hide it.
+    fn delta_pct(baseline: usize, candidate: usize) -> f64 {
+        if baseline == 0 {
+            0.0
+        } else {
+            (baseline as f64 - candidate as f64) * 100.0 / baseline as f64
+        }
+    }
+
+    fn pct(part: usize, whole: usize) -> f64 {
+        if whole == 0 {
+            0.0
+        } else {
+            part as f64 * 100.0 / whole as f64
+        }
+    }
+
+    #[test]
+    fn v2_name_palette_overhead_report() {
+        let presets = [
+            ("flatish", WorldgenPreset::Flatish),
+            ("classic_flatter", WorldgenPreset::ClassicFlatter),
+            ("rd161348_like", WorldgenPreset::Rd161348Like),
+            ("hilly", WorldgenPreset::Hilly),
+        ];
+        let reg = BlockRegistry::new();
+
+        let mut all = Breakdown::default();
+        let mut all_raw_z = 0usize;
+        let mut all_compact_z = 0usize;
+        let mut all_colpal_z = 0usize;
+        let mut all_columns = 0usize;
+
+        println!(
+            "\n{:<16} {:>4} {:>9} {:>9} {:>7} {:>9} {:>9} {:>7}",
+            "preset", "cols", "raw", "names", "names%", "zlib", "zlib_id", "zlib_col"
+        );
+
+        for (label, preset) in presets {
+            let mut world = World::new();
+            world.configure_world_config(WorldConfig::default(), preset);
+
+            let mut agg = Breakdown::default();
+            let mut raw_z = 0usize;
+            let mut compact_z = 0usize;
+            let mut colpal_z = 0usize;
+            let mut columns = 0usize;
+
+            // A 4x4 patch of columns, offset per preset so they do not all sample
+            // the same terrain features.
+            for cx in 0..4 {
+                for cz in 0..4 {
+                    let (wx, wz) = ((cx * CHUNK_SIZE) + 512, (cz * CHUNK_SIZE) - 512);
+                    world.ensure_column_generated(wx, wz);
+                    let (col_x, col_z) = (wx.div_euclid(CHUNK_SIZE), wz.div_euclid(CHUNK_SIZE));
+                    let bytes = encode_column(&world, col_x, col_z).expect("encode column");
+                    let blob = decode_column(&bytes).expect("decode column");
+                    assert_eq!(
+                        breakdown(&blob).total,
+                        bytes.len(),
+                        "{label}: breakdown must account for every encoded byte"
+                    );
+
+                    agg.add(&breakdown(&blob));
+                    raw_z += zlib_len(&bytes);
+                    compact_z += zlib_len(&compact_id_palette_bytes(&bytes, &blob, &reg));
+                    colpal_z += zlib_len(&column_palette_bytes(&bytes, &blob));
+                    columns += 1;
+                }
+            }
+
+            println!(
+                "{:<16} {:>4} {:>9} {:>9} {:>6.1}% {:>9} {:>9} {:>9}",
+                label,
+                columns,
+                agg.total,
+                agg.palette_names,
+                pct(agg.palette_names, agg.total),
+                raw_z,
+                compact_z,
+                colpal_z,
+            );
+
+            all.add(&agg);
+            all_raw_z += raw_z;
+            all_compact_z += compact_z;
+            all_colpal_z += colpal_z;
+            all_columns += columns;
+        }
+
+        let sections = all.sections.max(1);
+        println!(
+            "\ntotals: {} columns, {} sections, {:.1} palette entries/section",
+            all_columns,
+            all.sections,
+            all.palette_entries as f64 / sections as f64
+        );
+        println!(
+            "raw split: header {:.1}% | section headers {:.1}% | palette names {:.1}% | block indices {:.1}% | block data {:.1}%",
+            pct(all.header, all.total),
+            pct(all.section_headers, all.total),
+            pct(all.palette_names, all.total),
+            pct(all.block_indices, all.total),
+            pct(all.block_data, all.total),
+        );
+        println!(
+            "on disk: v2 {} B zlib ({:.1}% of raw) | u16-id palette {} B ({:+.1}%) | column palette {} B ({:+.1}%)\n",
+            all_raw_z,
+            pct(all_raw_z, all.total),
+            all_compact_z,
+            delta_pct(all_raw_z, all_compact_z),
+            all_colpal_z,
+            delta_pct(all_raw_z, all_colpal_z),
+        );
+
+        // Worldgen columns use ~2 names per section. Player builds are the
+        // expensive case for a per-section name palette, so bracket it: same
+        // terrain, but every section seeded with many distinct block types.
+        let mut built = World::new();
+        let mut built_agg = Breakdown::default();
+        let mut built_raw_z = 0usize;
+        let mut built_compact_z = 0usize;
+        let mut built_colpal_z = 0usize;
+        let palette_blocks: Vec<crate::blocks::BlockId> = (0u16..=255)
+            .filter_map(|raw| crate::blocks::BlockId::from_u8(raw as u8).ok())
+            .collect();
+
+        for cx in 0..4 {
+            for cz in 0..4 {
+                let (wx, wz) = (cx * CHUNK_SIZE, cz * CHUNK_SIZE);
+                built.ensure_column_generated(wx, wz);
+                for (i, &block) in palette_blocks.iter().enumerate() {
+                    let x = wx + (i % CHUNK_SIZE as usize) as i32;
+                    let z = wz + ((i / CHUNK_SIZE as usize) % CHUNK_SIZE as usize) as i32;
+                    for y in (built.min_y() + 1..built.max_y()).step_by(7) {
+                        let _ = built.set_block(glam::IVec3::new(x, y, z), block);
+                    }
+                }
+                let (col_x, col_z) = (wx.div_euclid(CHUNK_SIZE), wz.div_euclid(CHUNK_SIZE));
+                let bytes = encode_column(&built, col_x, col_z).expect("encode built column");
+                let blob = decode_column(&bytes).expect("decode built column");
+                built_agg.add(&breakdown(&blob));
+                built_raw_z += zlib_len(&bytes);
+                built_compact_z += zlib_len(&compact_id_palette_bytes(&bytes, &blob, &reg));
+                built_colpal_z += zlib_len(&column_palette_bytes(&bytes, &blob));
+            }
+        }
+
+        println!(
+            "built worst case: {} sections, {:.1} palette entries/section, names {:.1}% of raw | zlib v2 {} B | u16-id {} B ({:+.1}%) | column palette {} B ({:+.1}%)\n",
+            built_agg.sections,
+            built_agg.palette_entries as f64 / built_agg.sections.max(1) as f64,
+            pct(built_agg.palette_names, built_agg.total),
+            built_raw_z,
+            built_compact_z,
+            delta_pct(built_raw_z, built_compact_z),
+            built_colpal_z,
+            delta_pct(built_raw_z, built_colpal_z),
+        );
+
+        // Budget guard, not a target: the palette is per section and its cost
+        // grows with block variety, so a large jump means the encoder started
+        // emitting near-unique palettes and the compaction item needs revisiting.
+        let names_share = pct(all.palette_names, all.total);
+        assert!(
+            names_share < 10.0,
+            "v2 name-palette overhead grew to {names_share:.1}% of the raw payload"
+        );
+        assert!(
+            all_raw_z <= all.total,
+            "zlib must not inflate column payloads"
+        );
+    }
+}

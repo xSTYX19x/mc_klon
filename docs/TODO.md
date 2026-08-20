@@ -56,9 +56,8 @@ When an item ships, delete it from here instead of marking it done.
 
 ## Storage / Content Foundation
 
-- [x] keep V1/V2 read-compatibility explicit; expand save/load tests for signature drift, unknown blocks, remap cases *(umgesetzt, wartet auf Verifikation)*
-- if measurements justify it: design a more compact v2.1/v3 column storage layout (less string overhead than the current name-palette, forward-compatible)
-- measure and, if necessary, reduce V2 storage overhead for block-name palettes
+- if measurements justify it: design a more compact v2.1/v3 column storage layout (less string overhead than the current name-palette, forward-compatible). Measured, so this is now a cost/benefit call rather than an open question — see the numbers below. Two candidates were sized: a `u16`-id palette saves 11.7 % on disk for terrain and 34.4 % for heavily built chunks, but gives up the self-describing decode that lets unknown names degrade to air without the manifest (that is what v1 did); a column-level *name* palette keeps that property but is a measured **regression** (-18.0 % for terrain), because widening `bits_per_entry` across the whole column costs more than the repeated names save. Do not implement the column-palette variant
+- [x] measure and, if necessary, reduce V2 storage overhead for block-name palettes *(gemessen, keine Reduktion vorgenommen — wartet auf Verifikation)*. Report: `cargo test storage::chunk_codec::v2_size_report -- --nocapture`. Terrain columns across all four presets: names are 5.2 % of the raw payload, block indices 92.4 %; zlib compresses the payload to 11.9 % of raw. Built-out sections (51 distinct blocks per section) push names to 25.6 % of raw. Conclusion: the name palette is not the dominant cost and the compression already absorbs most of its repetition, so no reduction was made
 - migrate in-memory chunk storage from `BlockId`/`block_data` `Vec`s to `BlockStateId` + separate dirty flags, then optionally palette/bitpack at runtime too
 
 ## UI / UX
