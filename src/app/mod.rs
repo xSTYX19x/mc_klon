@@ -117,7 +117,6 @@ enum GameState {
         selected: usize,
     },
     LoadLevelMenu {
-        origin: MenuOrigin,
         selected: usize,
         worlds: Vec<SavedWorldMenuEntry>,
     },
@@ -141,10 +140,22 @@ enum GameState {
     },
 }
 
-#[derive(Clone, Copy)]
-enum MenuOrigin {
+/// One node in the menu navigation stack. Carries just enough to re-enter a
+/// screen; the screen's live data (world list, area snapshot, ...) is rebuilt on
+/// restore so it never goes stale while sitting on the stack.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum MenuScreen {
     MainMenu,
     PauseMenu,
+    LoadLevel,
+    Options(OptionsScreen),
+    TickingAreas(TickingAreaScreen),
+}
+
+#[derive(Clone, Copy)]
+struct MenuStackEntry {
+    screen: MenuScreen,
+    selected: usize,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -187,7 +198,6 @@ impl OptionsScreen {
 
 #[derive(Clone)]
 struct OptionsMenuState {
-    origin: MenuOrigin,
     screen: OptionsScreen,
     selected: usize,
     awaiting_rebind: Option<InputAction>,
@@ -258,6 +268,9 @@ pub(crate) struct App {
     simulation_distance: SimulationDistance,
     view_bobbing: ViewBobbing,
     game_state: GameState,
+    /// Screens below `game_state`, innermost last. Empty means the current
+    /// screen is a menu root (main menu, pause menu, ticking-area list).
+    nav_stack: Vec<MenuStackEntry>,
     last_space_tap: Option<Instant>,
     last_forward_tap: Option<Instant>,
     base_fov_y_radians: f32,
@@ -307,6 +320,7 @@ impl Default for App {
             simulation_distance: SimulationDistance::default(),
             view_bobbing: ViewBobbing::default(),
             game_state: GameState::MainMenu { selected: 0 },
+            nav_stack: Vec::new(),
             last_space_tap: None,
             last_forward_tap: None,
             base_fov_y_radians,
@@ -405,26 +419,31 @@ impl App {
         matches!(self.game_state, GameState::GeneratingWorld { .. })
     }
 
+    /// The screen `game_state` currently shows, if it is part of the menu stack.
+    fn current_menu_screen(&self) -> Option<MenuScreen> {
+        match &self.game_state {
+            GameState::MainMenu { .. } => Some(MenuScreen::MainMenu),
+            GameState::Paused { .. } => Some(MenuScreen::PauseMenu),
+            GameState::LoadLevelMenu { .. } => Some(MenuScreen::LoadLevel),
+            GameState::Options(options) => Some(MenuScreen::Options(options.screen)),
+            GameState::TickingAreas(menu) => Some(MenuScreen::TickingAreas(menu.screen)),
+            _ => None,
+        }
+    }
+
+    /// The bottom of the navigation stack decides the menu's context (world
+    /// loaded or not), which drives the panorama background and pause handling.
+    fn menu_root_screen(&self) -> Option<MenuScreen> {
+        let current = self.current_menu_screen()?;
+        Some(self.nav_stack.first().map_or(current, |entry| entry.screen))
+    }
+
     fn is_main_menu(&self) -> bool {
-        matches!(
-            self.game_state,
-            GameState::MainMenu { .. }
-                | GameState::LoadLevelMenu {
-                    origin: MenuOrigin::MainMenu,
-                    ..
-                }
-        )
+        matches!(self.menu_root_screen(), Some(MenuScreen::MainMenu))
     }
 
     fn is_paused(&self) -> bool {
-        matches!(
-            self.game_state,
-            GameState::Paused { .. }
-                | GameState::LoadLevelMenu {
-                    origin: MenuOrigin::PauseMenu,
-                    ..
-                }
-        )
+        matches!(self.menu_root_screen(), Some(MenuScreen::PauseMenu))
     }
 
     fn is_options_open(&self) -> bool {
@@ -436,10 +455,7 @@ impl App {
     }
 
     fn is_menu_open(&self) -> bool {
-        self.is_main_menu()
-            || self.is_paused()
-            || self.is_options_open()
-            || self.is_ticking_areas_open()
+        self.current_menu_screen().is_some()
     }
 
     fn is_in_game(&self) -> bool {
@@ -825,6 +841,7 @@ impl App {
     fn enter_main_menu(&mut self) {
         self.reset_chat_state();
         self.clear_menu_press();
+        self.nav_stack.clear();
         self.game_state = GameState::MainMenu { selected: 0 };
         self.clear_action_state();
         if let Some(window) = self.window.as_ref() {
@@ -835,6 +852,7 @@ impl App {
     fn enter_pause(&mut self) {
         self.reset_chat_state();
         self.clear_menu_press();
+        self.nav_stack.clear();
         self.game_state = GameState::Paused { selected: 0 };
         self.clear_action_state();
         if let Some(state) = self.state.as_mut() {
@@ -847,6 +865,7 @@ impl App {
 
     fn leave_pause(&mut self) {
         self.clear_menu_press();
+        self.nav_stack.clear();
         self.game_state = GameState::InGame;
         self.clear_action_state();
         if let Some(state) = self.state.as_mut() {
@@ -860,6 +879,7 @@ impl App {
     fn enter_inventory(&mut self) {
         self.reset_chat_state();
         self.clear_menu_press();
+        self.nav_stack.clear();
         let selected_palette = self
             .selected_block()
             .and_then(|block| {
@@ -882,6 +902,7 @@ impl App {
 
     fn leave_inventory(&mut self) {
         self.clear_menu_press();
+        self.nav_stack.clear();
         self.game_state = GameState::InGame;
         self.clear_action_state();
         if let Some(window) = self.window.as_ref() {
@@ -889,36 +910,8 @@ impl App {
         }
     }
 
-    fn open_options_menu(&mut self, origin: MenuOrigin) {
-        self.reset_chat_state();
-        self.clear_menu_press();
-        self.game_state = GameState::Options(OptionsMenuState {
-            origin,
-            screen: OptionsScreen::Root,
-            selected: 0,
-            awaiting_rebind: None,
-            status_line: None,
-            pending_reset: None,
-        });
-        self.clear_action_state();
-        if let Some(window) = self.window.as_ref() {
-            self.controller.set_mouse_capture(window, false);
-        }
-    }
-
-    fn close_options_menu(&mut self, options: OptionsMenuState) {
-        self.clear_menu_press();
-        match options.origin {
-            MenuOrigin::MainMenu => self.enter_main_menu(),
-            MenuOrigin::PauseMenu => self.enter_pause(),
-        }
-    }
-
-    fn enter_load_level_menu(&mut self, origin: MenuOrigin) {
-        self.reset_chat_state();
-        self.clear_menu_press();
-        let worlds = self
-            .state
+    fn saved_world_menu_entries(&self) -> Vec<SavedWorldMenuEntry> {
+        self.state
             .as_ref()
             .map(|state| {
                 state
@@ -936,12 +929,86 @@ impl App {
                     })
                     .collect::<Vec<_>>()
             })
-            .unwrap_or_default();
-        self.game_state = GameState::LoadLevelMenu {
-            origin,
+            .unwrap_or_default()
+    }
+
+    /// Descends one level: remembers the current screen (and its highlighted
+    /// row) on the stack, then shows `screen` with its first row selected.
+    fn push_menu_screen(&mut self, screen: MenuScreen) {
+        if let Some(current) = self.current_menu_screen() {
+            let selected = self.selected_menu_index().unwrap_or(0);
+            self.nav_stack.push(MenuStackEntry {
+                screen: current,
+                selected,
+            });
+        }
+        self.show_menu_screen(MenuStackEntry {
+            screen,
             selected: 0,
-            worlds,
+        });
+    }
+
+    /// Goes back exactly one level. Returns false only at a menu root that has
+    /// nowhere to go (the main menu).
+    fn pop_menu_screen(&mut self) -> bool {
+        if let Some(entry) = self.nav_stack.pop() {
+            self.show_menu_screen(entry);
+            return true;
+        }
+        match &self.game_state {
+            GameState::Paused { .. } => {
+                self.leave_pause();
+                true
+            }
+            GameState::TickingAreas(_) => {
+                self.leave_ticking_area_menu();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn show_menu_screen(&mut self, entry: MenuStackEntry) {
+        self.reset_chat_state();
+        self.clear_menu_press();
+        self.game_state = match entry.screen {
+            MenuScreen::MainMenu => GameState::MainMenu {
+                selected: entry.selected,
+            },
+            MenuScreen::PauseMenu => GameState::Paused {
+                selected: entry.selected,
+            },
+            MenuScreen::LoadLevel => {
+                let worlds = self.saved_world_menu_entries();
+                GameState::LoadLevelMenu {
+                    selected: entry.selected,
+                    worlds,
+                }
+            }
+            MenuScreen::Options(screen) => GameState::Options(OptionsMenuState {
+                screen,
+                selected: entry.selected,
+                awaiting_rebind: None,
+                status_line: None,
+                pending_reset: None,
+            }),
+            MenuScreen::TickingAreas(screen) => {
+                let areas = self
+                    .state
+                    .as_ref()
+                    .map(|state| state.ticking_areas_snapshot())
+                    .unwrap_or_default();
+                GameState::TickingAreas(TickingAreaMenuState {
+                    screen,
+                    selected: entry.selected,
+                    areas,
+                    status_line: None,
+                    pending_delete: None,
+                })
+            }
         };
+        let max_index = self.menu_item_count().saturating_sub(1);
+        self.set_selected_menu_index(entry.selected.min(max_index));
         self.clear_action_state();
         if let Some(window) = self.window.as_ref() {
             self.controller.set_mouse_capture(window, false);
@@ -1017,6 +1084,7 @@ impl App {
     fn enter_world_loading_screen(&mut self, title: &str, phase: &str) {
         self.reset_chat_state();
         self.clear_menu_press();
+        self.nav_stack.clear();
         self.game_state = GameState::GeneratingWorld {
             title: title.to_string(),
             progress: 0.0,
@@ -1155,8 +1223,8 @@ impl App {
         };
         match selected {
             0 => self.start_new_default_level_generation(),
-            1 => self.enter_load_level_menu(MenuOrigin::MainMenu),
-            2 => self.open_options_menu(MenuOrigin::MainMenu),
+            1 => self.push_menu_screen(MenuScreen::LoadLevel),
+            2 => self.push_menu_screen(MenuScreen::Options(OptionsScreen::Root)),
             3 => event_loop.exit(),
             _ => {}
         }
@@ -1171,14 +1239,14 @@ impl App {
         match selected {
             0 => self.leave_pause(),
             1 => self.start_new_default_level_generation(),
-            2 => self.enter_load_level_menu(MenuOrigin::PauseMenu),
+            2 => self.push_menu_screen(MenuScreen::LoadLevel),
             3 => {
                 if let Some(state) = self.state.as_mut() {
                     state.save_world();
                     crate::console_info!("Saved.");
                 }
             }
-            4 => self.open_options_menu(MenuOrigin::PauseMenu),
+            4 => self.push_menu_screen(MenuScreen::Options(OptionsScreen::Root)),
             5 => {
                 if let Some(state) = self.state.as_mut() {
                     state.save_world();
@@ -1191,31 +1259,15 @@ impl App {
     }
 
     fn activate_load_level_menu_selected(&mut self) {
-        let (origin, save_root) = match &self.game_state {
-            GameState::LoadLevelMenu {
-                origin,
-                selected,
-                worlds,
-            } => {
-                if *selected >= worlds.len() {
-                    (*origin, None)
-                } else {
-                    (
-                        *origin,
-                        worlds
-                            .get(*selected)
-                            .map(|entry| entry.summary.save_root.clone()),
-                    )
-                }
-            }
+        let save_root = match &self.game_state {
+            GameState::LoadLevelMenu { selected, worlds } => worlds
+                .get(*selected)
+                .map(|entry| entry.summary.save_root.clone()),
             _ => return,
         };
 
         if save_root.is_none() {
-            match origin {
-                MenuOrigin::MainMenu => self.enter_main_menu(),
-                MenuOrigin::PauseMenu => self.enter_pause(),
-            }
+            self.pop_menu_screen();
             return;
         }
 
@@ -1229,40 +1281,39 @@ impl App {
     }
 
     fn activate_options_selected(&mut self) {
-        let mut options = match self.game_state {
-            GameState::Options(ref options) => Some(options.clone()),
-            _ => None,
-        };
-        let Some(mut options) = options.take() else {
+        let GameState::Options(options) = &self.game_state else {
             return;
         };
-
         if options.awaiting_rebind.is_some() {
             return;
         }
-
         let screen = options.screen;
-        if options.selected == screen.reset_row() {
+        let selected = options.selected;
+
+        if selected == screen.reset_row() {
             self.activate_options_reset_row(screen);
             return;
         }
-        if options.selected > screen.reset_row() {
-            self.close_options_menu(options);
+        // The "Back" row goes exactly one level up, same as Escape.
+        if selected > screen.reset_row() {
+            self.pop_menu_screen();
             return;
         }
 
         match screen {
-            OptionsScreen::Root => match options.selected {
-                0 => options.screen = OptionsScreen::Gameplay,
-                1 => options.screen = OptionsScreen::Graphics,
-                _ => options.screen = OptionsScreen::Controls,
-            },
+            OptionsScreen::Root => {
+                let sub = match selected {
+                    0 => OptionsScreen::Gameplay,
+                    1 => OptionsScreen::Graphics,
+                    _ => OptionsScreen::Controls,
+                };
+                self.push_menu_screen(MenuScreen::Options(sub));
+            }
             OptionsScreen::Gameplay | OptionsScreen::Graphics => {
                 self.apply_selected_option_step(1);
-                return;
             }
             OptionsScreen::Controls => {
-                let action = InputAction::ALL[options.selected];
+                let action = InputAction::ALL[selected];
                 if let GameState::Options(state) = &mut self.game_state {
                     state.awaiting_rebind = Some(action);
                     state.pending_reset = None;
@@ -1271,15 +1322,8 @@ impl App {
                         action.label()
                     ));
                 }
-                return;
             }
         }
-
-        options.selected = 0;
-        options.awaiting_rebind = None;
-        options.status_line = None;
-        options.pending_reset = None;
-        self.game_state = GameState::Options(options);
     }
 
     /// Two-step reset: the first activation arms a confirmation, the second one
@@ -1341,6 +1385,7 @@ impl App {
     fn open_ticking_area_menu(&mut self) {
         self.reset_chat_state();
         self.clear_menu_press();
+        self.nav_stack.clear();
         let areas = self
             .state
             .as_ref()
@@ -1361,6 +1406,7 @@ impl App {
 
     fn leave_ticking_area_menu(&mut self) {
         self.clear_menu_press();
+        self.nav_stack.clear();
         self.game_state = GameState::InGame;
         self.clear_action_state();
         if let Some(window) = self.window.as_ref() {
@@ -1377,21 +1423,27 @@ impl App {
         } else {
             Vec::new()
         };
+        let mut vanished = false;
         if let GameState::TickingAreas(menu) = &mut self.game_state {
             menu.areas = areas;
             menu.pending_delete = None;
-            if let Some(status) = status {
+            if let Some(status) = status.clone() {
                 menu.status_line = Some(status);
             }
-            // An edited area can disappear (deleted elsewhere); fall back to the list.
-            if let TickingAreaScreen::Edit { id } = menu.screen
-                && menu.area(id).is_none()
-            {
-                menu.screen = TickingAreaScreen::List;
-                menu.selected = 0;
-            }
+            // An edited area can disappear (deleted from the edit screen itself).
+            vanished =
+                matches!(menu.screen, TickingAreaScreen::Edit { id } if menu.area(id).is_none());
             let max_index = menu.item_count().saturating_sub(1);
             menu.selected = menu.selected.min(max_index);
+        }
+        if vanished {
+            // Leave the dead edit screen via the stack so navigation stays consistent.
+            self.pop_menu_screen();
+            if let Some(status) = status
+                && let GameState::TickingAreas(menu) = &mut self.game_state
+            {
+                menu.status_line = Some(status);
+            }
         }
     }
 
@@ -1471,12 +1523,7 @@ impl App {
                         GameState::TickingAreas(menu) => menu.areas[selected].id,
                         _ => return,
                     };
-                    if let GameState::TickingAreas(menu) = &mut self.game_state {
-                        menu.screen = TickingAreaScreen::Edit { id };
-                        menu.selected = TICKING_EDIT_ROW_RADIUS;
-                        menu.pending_delete = None;
-                        menu.status_line = None;
-                    }
+                    self.push_menu_screen(MenuScreen::TickingAreas(TickingAreaScreen::Edit { id }));
                 } else if selected == add_row {
                     let (cx, cz) = self.player_chunk_xz();
                     let created = self
@@ -1491,18 +1538,13 @@ impl App {
                         None => self.refresh_ticking_areas(Some("No world loaded.".to_string())),
                     }
                 } else {
-                    self.leave_ticking_area_menu();
+                    self.pop_menu_screen();
                 }
             }
             TickingAreaScreen::Edit { id } => match selected {
                 TICKING_EDIT_ROW_DELETE => self.activate_ticking_area_delete(id),
                 TICKING_EDIT_ROW_BACK => {
-                    if let GameState::TickingAreas(menu) = &mut self.game_state {
-                        menu.screen = TickingAreaScreen::List;
-                        menu.selected = 0;
-                        menu.pending_delete = None;
-                        menu.status_line = None;
-                    }
+                    self.pop_menu_screen();
                 }
                 _ => {
                     self.apply_ticking_area_step(1);
@@ -1534,40 +1576,8 @@ impl App {
         } else {
             format!("Area #{id} no longer exists.")
         };
-        if let GameState::TickingAreas(menu) = &mut self.game_state {
-            menu.screen = TickingAreaScreen::List;
-            menu.selected = 0;
-        }
+        // `refresh_ticking_areas` notices the area is gone and pops the edit screen.
         self.refresh_ticking_areas(Some(status));
-    }
-
-    fn handle_ticking_areas_back(&mut self) -> bool {
-        let Some((screen, pending_delete)) = (match &self.game_state {
-            GameState::TickingAreas(menu) => Some((menu.screen, menu.pending_delete)),
-            _ => None,
-        }) else {
-            return false;
-        };
-
-        if pending_delete.is_some() {
-            if let GameState::TickingAreas(menu) = &mut self.game_state {
-                menu.pending_delete = None;
-                menu.status_line = Some("Delete cancelled.".to_string());
-            }
-            return true;
-        }
-
-        match screen {
-            TickingAreaScreen::List => self.leave_ticking_area_menu(),
-            TickingAreaScreen::Edit { .. } => {
-                if let GameState::TickingAreas(menu) = &mut self.game_state {
-                    menu.screen = TickingAreaScreen::List;
-                    menu.selected = 0;
-                    menu.status_line = None;
-                }
-            }
-        }
-        true
     }
 
     fn set_options_status(&mut self, pending_reset: Option<SettingsScope>, status: String) {
@@ -1577,38 +1587,38 @@ impl App {
         }
     }
 
-    fn handle_options_back(&mut self) -> bool {
-        let mut options = match &self.game_state {
-            GameState::Options(options) => Some(options.clone()),
-            _ => None,
-        };
-        let Some(mut options) = options.take() else {
-            return false;
-        };
-
-        if options.awaiting_rebind.is_some() {
-            if let GameState::Options(state) = &mut self.game_state {
-                state.awaiting_rebind = None;
-                state.status_line = Some("Rebind cancelled.".to_string());
-            }
+    /// "Back" for every menu screen: first let the current screen swallow it to
+    /// cancel a pending confirmation, otherwise pop one level off the stack.
+    fn handle_menu_back(&mut self) -> bool {
+        if self.cancel_pending_menu_action() {
             return true;
         }
+        self.pop_menu_screen()
+    }
 
-        if options.pending_reset.take().is_some() {
-            self.set_options_status(None, "Reset cancelled.".to_string());
-            return true;
-        }
-
-        match options.screen {
-            OptionsScreen::Root => self.close_options_menu(options),
-            _ => {
-                options.screen = OptionsScreen::Root;
-                options.selected = 0;
-                options.status_line = None;
-                self.game_state = GameState::Options(options);
+    /// Escape on an armed rebind/reset/delete cancels that instead of navigating.
+    fn cancel_pending_menu_action(&mut self) -> bool {
+        match &mut self.game_state {
+            GameState::Options(options) => {
+                if options.awaiting_rebind.take().is_some() {
+                    options.status_line = Some("Rebind cancelled.".to_string());
+                    return true;
+                }
+                if options.pending_reset.take().is_some() {
+                    options.status_line = Some("Reset cancelled.".to_string());
+                    return true;
+                }
+                false
             }
+            GameState::TickingAreas(menu) => {
+                if menu.pending_delete.take().is_some() {
+                    menu.status_line = Some("Delete cancelled.".to_string());
+                    return true;
+                }
+                false
+            }
+            _ => false,
         }
-        true
     }
 
     fn handle_rebind_input(&mut self, code: KeyCode) -> bool {
@@ -1741,11 +1751,7 @@ impl App {
                 enabled: vec![true; MAIN_MENU_ITEMS.len()],
                 show_panorama: true,
             }),
-            GameState::LoadLevelMenu {
-                origin,
-                selected,
-                worlds,
-            } => {
+            GameState::LoadLevelMenu { selected, worlds } => {
                 let mut items = if worlds.is_empty() {
                     vec!["No saved levels found".to_string()]
                 } else {
@@ -1767,7 +1773,7 @@ impl App {
                     footer,
                     selected: *selected,
                     enabled,
-                    show_panorama: matches!(origin, MenuOrigin::MainMenu),
+                    show_panorama: self.is_main_menu(),
                 })
             }
             GameState::Paused { selected } => Some(MenuScreenContent {
@@ -1873,7 +1879,7 @@ impl App {
                     enabled,
                     items,
                     footer,
-                    show_panorama: matches!(options.origin, MenuOrigin::MainMenu),
+                    show_panorama: self.is_main_menu(),
                 })
             }
             GameState::TickingAreas(menu) => Some(self.ticking_area_menu_content(menu)),
@@ -2408,7 +2414,6 @@ impl ApplicationHandler for App {
                     _ => None,
                 };
                 let generating = self.is_generating_world();
-                let paused = self.is_paused();
                 let inventory_open = self.is_inventory_open();
                 let options_open = self.is_options_open();
                 let ticking_areas_open = self.is_ticking_areas_open();
@@ -2433,7 +2438,7 @@ impl ApplicationHandler for App {
                     && options.awaiting_rebind.is_some()
                 {
                     if code == KeyCode::Escape {
-                        self.handle_options_back();
+                        self.handle_menu_back();
                     } else {
                         self.handle_rebind_input(code);
                     }
@@ -2450,17 +2455,8 @@ impl ApplicationHandler for App {
                         }
                         if inventory_open {
                             self.leave_inventory();
-                        } else if let GameState::LoadLevelMenu { origin, .. } = &self.game_state {
-                            match origin {
-                                MenuOrigin::MainMenu => self.enter_main_menu(),
-                                MenuOrigin::PauseMenu => self.enter_pause(),
-                            }
-                        } else if options_open {
-                            self.handle_options_back();
-                        } else if ticking_areas_open {
-                            self.handle_ticking_areas_back();
-                        } else if paused {
-                            self.leave_pause();
+                        } else if menu_open {
+                            self.handle_menu_back();
                         } else if self.is_in_game() {
                             self.enter_pause();
                         }
@@ -2468,7 +2464,7 @@ impl ApplicationHandler for App {
                     }
 
                     if code == inventory_key && !event.repeat {
-                        if generating || paused || options_open || self.is_main_menu() {
+                        if generating {
                             return;
                         }
                         if inventory_open {
@@ -2480,7 +2476,7 @@ impl ApplicationHandler for App {
                     }
 
                     if code == ticking_areas_key && !event.repeat {
-                        if generating || paused || options_open || self.is_main_menu() {
+                        if generating {
                             return;
                         }
                         if ticking_areas_open {
