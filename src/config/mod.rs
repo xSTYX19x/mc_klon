@@ -163,6 +163,22 @@ pub(crate) mod render {
     pub(crate) const BASE_FOV_STEP_DEG: u32 = 5;
     pub(crate) const BASE_FOV_DEFAULT_DEG: u32 = 70;
 
+    /// Base FOV as a 0..1 slider fill.
+    pub(crate) fn base_fov_fill01(deg: u32) -> f32 {
+        let span = (BASE_FOV_MAX_DEG - BASE_FOV_MIN_DEG) as f32;
+        ((deg as f32 - BASE_FOV_MIN_DEG as f32) / span).clamp(0.0, 1.0)
+    }
+
+    /// Inverse of [`base_fov_fill01`], snapped to `BASE_FOV_STEP_DEG` so dragging
+    /// lands on the same values the arrow keys produce.
+    pub(crate) fn base_fov_from_fill01(fill01: f32) -> u32 {
+        let span = (BASE_FOV_MAX_DEG - BASE_FOV_MIN_DEG) as f32;
+        let step = BASE_FOV_STEP_DEG.max(1) as f32;
+        let raw = fill01.clamp(0.0, 1.0) * span;
+        let snapped = (raw / step).round() * step + BASE_FOV_MIN_DEG as f32;
+        (snapped.round() as i32).clamp(BASE_FOV_MIN_DEG as i32, BASE_FOV_MAX_DEG as i32) as u32
+    }
+
     /// Multiplier applied on top of the per-element UI scales (hotbar, inventory,
     /// menu buttons, text). `Normal` is 1.0, i.e. the scales the code already had.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -387,6 +403,10 @@ pub(crate) mod sim {
 #[cfg(test)]
 mod tests {
     use super::render::RenderDistance;
+    use super::render::{
+        BASE_FOV_DEFAULT_DEG, BASE_FOV_MAX_DEG, BASE_FOV_MIN_DEG, BASE_FOV_STEP_DEG,
+        base_fov_fill01, base_fov_from_fill01,
+    };
 
     #[test]
     fn render_distance_extends_to_thirty_two_chunks() {
@@ -405,6 +425,43 @@ mod tests {
         assert!(
             RenderDistance::Insane.far_lod_gpu_uploads_per_frame()
                 >= RenderDistance::Ultra.far_lod_gpu_uploads_per_frame()
+        );
+    }
+
+    #[test]
+    fn fov_slider_ends_hit_the_limits() {
+        assert_eq!(base_fov_from_fill01(0.0), BASE_FOV_MIN_DEG);
+        assert_eq!(base_fov_from_fill01(1.0), BASE_FOV_MAX_DEG);
+        // Out-of-range drags clamp instead of wrapping.
+        assert_eq!(base_fov_from_fill01(-3.0), BASE_FOV_MIN_DEG);
+        assert_eq!(base_fov_from_fill01(9.0), BASE_FOV_MAX_DEG);
+        assert!((base_fov_fill01(BASE_FOV_MIN_DEG) - 0.0).abs() < 1e-6);
+        assert!((base_fov_fill01(BASE_FOV_MAX_DEG) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fov_slider_snaps_to_the_step_size() {
+        for fill in 0..=100 {
+            let deg = base_fov_from_fill01(fill as f32 / 100.0);
+            assert_eq!(
+                (deg - BASE_FOV_MIN_DEG) % BASE_FOV_STEP_DEG,
+                0,
+                "fill {fill} produced off-step {deg}"
+            );
+            assert!((BASE_FOV_MIN_DEG..=BASE_FOV_MAX_DEG).contains(&deg));
+        }
+    }
+
+    #[test]
+    fn fov_slider_roundtrips_every_step() {
+        let mut deg = BASE_FOV_MIN_DEG;
+        while deg <= BASE_FOV_MAX_DEG {
+            assert_eq!(base_fov_from_fill01(base_fov_fill01(deg)), deg);
+            deg += BASE_FOV_STEP_DEG;
+        }
+        assert_eq!(
+            base_fov_from_fill01(base_fov_fill01(BASE_FOV_DEFAULT_DEG)),
+            BASE_FOV_DEFAULT_DEG
         );
     }
 }

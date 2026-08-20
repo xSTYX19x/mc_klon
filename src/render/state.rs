@@ -1032,6 +1032,8 @@ const MENU_BUTTON_DISABLED_TEXTURE_KEY: &str =
 const MENU_BUTTON_LOGICAL_WIDTH_PX: u32 = 200;
 const MENU_BUTTON_LOGICAL_HEIGHT_PX: u32 = 20;
 const MENU_BUTTON_NINE_SLICE_BORDER_PX: f32 = 2.0;
+/// Width of the slider knob at gui scale 1.0; scales with the buttons.
+const MENU_SLIDER_HANDLE_WIDTH_PX: f32 = 28.0;
 const MENU_BUTTON_TEXT_NORMAL: [f32; 3] = [0.88, 0.88, 0.88];
 const MENU_BUTTON_TEXT_HOVERED: [f32; 3] = [1.0, 1.0, 0.64];
 const MENU_BUTTON_TEXT_DISABLED: [f32; 3] = [0.62, 0.62, 0.62];
@@ -2445,6 +2447,8 @@ pub(crate) struct MenuOverlay<'a> {
     pub pressed: Option<usize>,
     pub items: &'a [&'a str],
     pub enabled: Option<&'a [bool]>,
+    /// Per row: `Some(fill01)` renders a slider instead of a button.
+    pub sliders: Option<&'a [Option<f32>]>,
     pub footer: Option<&'a str>,
     pub show_panorama: bool,
 }
@@ -4595,6 +4599,121 @@ fn menu_button_visual_state(
     }
 }
 
+/// Draws a slider using the *button* atlas: the disabled sprite makes the
+/// recessed track, the normal/highlighted sprite makes the knob. The pack ships
+/// no dedicated `slider`/`slider_handle` sprites, so this keeps the widget in
+/// the same nine-slice atlas as every other menu row.
+#[allow(clippy::too_many_arguments)]
+fn append_menu_slider_widget(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    view_width: u32,
+    view_height: u32,
+    font: &BitmapFont,
+    button_atlas: &MenuButtonAtlas,
+    label: &str,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    fill01: f32,
+    state: MenuButtonVisualState,
+    text_scale: f32,
+    gui_scale: f32,
+) {
+    append_ui_textured_nine_slice_px(
+        vertices,
+        indices,
+        view_width,
+        view_height,
+        x,
+        y,
+        w,
+        h,
+        button_atlas.disabled,
+        button_atlas.nine_slice_border_px,
+        [1.0, 1.0, 1.0],
+    );
+
+    let (handle_sprite, tint, text_color) = match state {
+        MenuButtonVisualState::Hovered => (
+            button_atlas.highlighted,
+            [1.0, 1.0, 1.0],
+            MENU_BUTTON_TEXT_HOVERED,
+        ),
+        MenuButtonVisualState::Pressed => (
+            button_atlas.highlighted,
+            MENU_BUTTON_PRESSED_TINT,
+            MENU_BUTTON_TEXT_HOVERED,
+        ),
+        MenuButtonVisualState::Disabled => (
+            button_atlas.disabled,
+            [1.0, 1.0, 1.0],
+            MENU_BUTTON_TEXT_DISABLED,
+        ),
+        MenuButtonVisualState::Normal => (
+            button_atlas.normal,
+            [1.0, 1.0, 1.0],
+            MENU_BUTTON_TEXT_NORMAL,
+        ),
+    };
+
+    let handle_w = menu_slider_handle_width_px(w, gui_scale);
+    let handle_x = x + (w - handle_w) * fill01.clamp(0.0, 1.0);
+    append_ui_textured_nine_slice_px(
+        vertices,
+        indices,
+        view_width,
+        view_height,
+        handle_x,
+        y,
+        handle_w,
+        h,
+        handle_sprite,
+        button_atlas.nine_slice_border_px,
+        tint,
+    );
+
+    let glyph_h = font.glyph_h as f32 * text_scale;
+    let label_x = x + (w - bitmap_text_width_px(font, label, text_scale)) * 0.5;
+    let label_y = y + (h - glyph_h) * 0.5;
+    append_bitmap_text_with_shadow_color(
+        vertices,
+        indices,
+        view_width,
+        view_height,
+        font,
+        label,
+        label_x,
+        label_y,
+        text_scale,
+        text_color,
+    );
+}
+
+fn menu_slider_handle_width_px(track_w: f32, gui_scale: f32) -> f32 {
+    (MENU_SLIDER_HANDLE_WIDTH_PX * gui_scale).clamp(8.0, (track_w * 0.5).max(8.0))
+}
+
+/// Maps a cursor x inside a slider row to its 0..1 value. The knob's own width
+/// is subtracted so grabbing either end reaches the extremes exactly.
+pub(crate) fn menu_slider_fill_at_pos_px(
+    view_width: u32,
+    view_height: u32,
+    item_count: usize,
+    index: usize,
+    x: f32,
+    gui_scale: f32,
+) -> Option<f32> {
+    let (bx, _, bw, _) =
+        pause_menu_button_rect_px(view_width, view_height, item_count, index, gui_scale)?;
+    // Must match the scale the widget was drawn with, not the raw request.
+    let row_scale = clamp_gui_scale_for_rows(view_height, item_count, gui_scale);
+    let handle_w = menu_slider_handle_width_px(bw, row_scale);
+    let travel = (bw - handle_w).max(1.0);
+    Some(((x - bx - handle_w * 0.5) / travel).clamp(0.0, 1.0))
+}
+
 fn append_menu_button_widget(
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<u32>,
@@ -4680,6 +4799,7 @@ fn build_menu_overlay_mesh(
     pressed: Option<usize>,
     items: &[&str],
     enabled: Option<&[bool]>,
+    sliders: Option<&[Option<f32>]>,
     footer: Option<&str>,
     gui_scale: f32,
 ) -> (Vec<Vertex>, Vec<u32>) {
@@ -4740,21 +4860,45 @@ fn build_menu_overlay_mesh(
             .and_then(|flags| flags.get(index))
             .copied()
             .unwrap_or(true);
-        append_menu_button_widget(
-            &mut vertices,
-            &mut indices,
-            view_width,
-            view_height,
-            font,
-            button_atlas,
-            label,
-            button_x,
-            y,
-            button_w,
-            button_h,
-            menu_button_visual_state(index, selected_index, pressed, is_enabled),
-            text_scale,
-        );
+        let visual_state = menu_button_visual_state(index, selected_index, pressed, is_enabled);
+        let slider_fill = sliders
+            .and_then(|values| values.get(index))
+            .copied()
+            .flatten();
+        match slider_fill {
+            Some(fill01) => append_menu_slider_widget(
+                &mut vertices,
+                &mut indices,
+                view_width,
+                view_height,
+                font,
+                button_atlas,
+                label,
+                button_x,
+                y,
+                button_w,
+                button_h,
+                fill01,
+                visual_state,
+                text_scale,
+                row_scale,
+            ),
+            None => append_menu_button_widget(
+                &mut vertices,
+                &mut indices,
+                view_width,
+                view_height,
+                font,
+                button_atlas,
+                label,
+                button_x,
+                y,
+                button_w,
+                button_h,
+                visual_state,
+                text_scale,
+            ),
+        }
     }
 
     if let Some(footer) = footer.filter(|text| !text.trim().is_empty()) {
@@ -19172,6 +19316,7 @@ impl State {
                 overlay.pressed,
                 overlay.items,
                 overlay.enabled,
+                overlay.sliders,
                 overlay.footer,
                 self.gui_scale,
             );

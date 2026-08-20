@@ -21,7 +21,7 @@ use crate::config::app::DOUBLE_SPACE_WINDOW;
 use crate::config::player::PLAYER_TUNING_MINECRAFT;
 use crate::config::render::{
     BASE_FOV_MAX_DEG, BASE_FOV_MIN_DEG, BASE_FOV_STEP_DEG, GuiScale, HIGHLIGHT_BLINK_MS,
-    RenderDistance, SimulationDistance,
+    RenderDistance, SimulationDistance, base_fov_fill01, base_fov_from_fill01,
 };
 use crate::input::CameraController;
 use crate::perf::trace as perf_trace;
@@ -31,7 +31,7 @@ use crate::render::State;
 use crate::render::state::{
     ChatOverlay, ChatOverlayLine, DebugOverlay, GenerationOverlay, HitchCounters, InventoryOverlay,
     MenuOverlay, SavedWorldSummary, WorldGenParams, WorldGenRequest, WorldLoadStageStats,
-    pause_menu_item_at_pos_px,
+    menu_slider_fill_at_pos_px, pause_menu_item_at_pos_px,
 };
 use crate::settings::{AppSettings, InputAction, SettingsScope, keycode_label};
 use crate::storage::world_meta;
@@ -66,6 +66,7 @@ const PAUSE_MENU_ITEMS: [&str; 6] = [
     "Exit to main menu",
 ];
 const OPTIONS_ROOT_ITEMS: [&str; 3] = ["General / Gameplay", "Video / Graphics", "Controls"];
+const OPTIONS_GAMEPLAY_ROW_FOV: usize = 1;
 const TICKING_EDIT_FLAG_ROWS: [(u32, &str); 4] = [
     (TickingFlags::KEEP_LOADED, "Keep loaded"),
     (TickingFlags::TICK_FLUIDS, "Tick fluids"),
@@ -115,7 +116,16 @@ struct MenuScreenContent {
     footer: Option<String>,
     selected: usize,
     enabled: Vec<bool>,
+    /// Per row: `Some(fill01)` draws a slider instead of a button.
+    sliders: Vec<Option<f32>>,
     show_panorama: bool,
+}
+
+impl MenuScreenContent {
+    /// Convenience for the screens that have no slider rows at all.
+    fn no_sliders(len: usize) -> Vec<Option<f32>> {
+        vec![None; len]
+    }
 }
 
 enum GameState {
@@ -305,6 +315,8 @@ pub(crate) struct App {
     base_fov_y_radians: f32,
     cursor_pos: (f32, f32),
     menu_pressed_index: Option<usize>,
+    /// Row of the slider currently being dragged with the left mouse button.
+    menu_slider_drag: Option<usize>,
     mouse_wheel_accum_y: f32,
     show_debug_overlay: bool,
     chat_lines: VecDeque<ChatLine>,
@@ -357,6 +369,7 @@ impl Default for App {
             base_fov_y_radians,
             cursor_pos: (0.0, 0.0),
             menu_pressed_index: None,
+            menu_slider_drag: None,
             mouse_wheel_accum_y: 0.0,
             show_debug_overlay: false,
             chat_lines: VecDeque::with_capacity(CHAT_MAX_LINES),
@@ -399,6 +412,7 @@ impl App {
     }
 
     fn clear_menu_press(&mut self) {
+        self.menu_slider_drag = None;
         self.menu_pressed_index = None;
     }
 
@@ -432,6 +446,52 @@ impl App {
                 state.rebuild_preview_mesh(selected);
             }
         }
+    }
+
+    /// Sets the base FOV from a 0..1 slider position, snapped to the step size.
+    fn set_base_fov_from_fill01(&mut self, fill01: f32) -> bool {
+        let next = base_fov_from_fill01(fill01);
+        if next == self.settings.gameplay.base_fov_deg {
+            return false;
+        }
+        self.settings.gameplay.base_fov_deg = next;
+        let status = format!("Field of view: {next}\u{b0}");
+        self.apply_settings_to_state();
+        self.set_options_status(None, status);
+        true
+    }
+
+    /// The one place that decides which menu rows render as sliders.
+    fn menu_row_is_slider(&self, index: usize) -> bool {
+        matches!(&self.game_state, GameState::Options(options)
+            if matches!(options.screen, OptionsScreen::Gameplay)
+                && index == OPTIONS_GAMEPLAY_ROW_FOV)
+    }
+
+    /// Slider fill for the row under the cursor, if that row is a slider.
+    fn menu_slider_fill_at_cursor(&self, index: usize) -> Option<f32> {
+        if !self.menu_row_is_slider(index) {
+            return None;
+        }
+        let window = self.window.as_ref()?;
+        let size = window.inner_size();
+        menu_slider_fill_at_pos_px(
+            size.width,
+            size.height,
+            self.menu_item_count(),
+            index,
+            self.cursor_pos.0,
+            self.settings.graphics.gui_scale.factor(),
+        )
+    }
+
+    /// Applies a slider drag on `index`; returns true when the row is a slider.
+    fn drag_menu_slider(&mut self, index: usize) -> bool {
+        let Some(fill01) = self.menu_slider_fill_at_cursor(index) else {
+            return false;
+        };
+        self.set_base_fov_from_fill01(fill01);
+        true
     }
 
     fn take_screenshot(&mut self) {
@@ -2070,6 +2130,7 @@ impl App {
                 footer: Some("Classic parity flow: generate, load, options.".to_string()),
                 selected: *selected,
                 enabled: vec![true; MAIN_MENU_ITEMS.len()],
+                sliders: MenuScreenContent::no_sliders(MAIN_MENU_ITEMS.len()),
                 show_panorama: true,
             }),
             GameState::LoadLevelMenu { selected, worlds } => {
@@ -2090,6 +2151,7 @@ impl App {
                 };
                 let footer = footer.map(|text| format!("{text}  |  Enter: manage / load"));
                 Some(MenuScreenContent {
+                    sliders: MenuScreenContent::no_sliders(items.len()),
                     title: "Load level".to_string(),
                     items,
                     footer,
@@ -2107,6 +2169,7 @@ impl App {
                 footer: None,
                 selected: *selected,
                 enabled: vec![true; PAUSE_MENU_ITEMS.len()],
+                sliders: MenuScreenContent::no_sliders(PAUSE_MENU_ITEMS.len()),
                 show_panorama: false,
             }),
             GameState::Options(options) => {
@@ -2190,6 +2253,12 @@ impl App {
                 items.push("Back".to_string());
                 let mut enabled = vec![true; items.len()];
                 enabled[options.screen.reset_row()] = !at_defaults;
+                let mut sliders = MenuScreenContent::no_sliders(items.len());
+                for (index, slot) in sliders.iter_mut().enumerate() {
+                    if self.menu_row_is_slider(index) {
+                        *slot = Some(base_fov_fill01(self.settings.gameplay.base_fov_deg));
+                    }
+                }
 
                 let footer = if let Some(action) = options.awaiting_rebind {
                     Some(format!(
@@ -2207,6 +2276,7 @@ impl App {
                     title,
                     selected: options.selected,
                     enabled,
+                    sliders,
                     items,
                     footer,
                     show_panorama: self.is_main_menu(),
@@ -2251,6 +2321,7 @@ impl App {
             title: menu.display_name.clone(),
             selected: menu.selected,
             enabled,
+            sliders: MenuScreenContent::no_sliders(items.len()),
             items,
             footer,
             show_panorama: false,
@@ -2287,6 +2358,7 @@ impl App {
                 MenuScreenContent {
                     title: "Ticking areas".to_string(),
                     enabled: vec![true; items.len()],
+                    sliders: MenuScreenContent::no_sliders(items.len()),
                     items,
                     footer,
                     selected: menu.selected,
@@ -2301,6 +2373,7 @@ impl App {
                         footer: Some(format!("Area #{id} no longer exists.")),
                         selected: 0,
                         enabled: vec![true],
+                        sliders: vec![None],
                         show_panorama: false,
                     };
                 };
@@ -2334,6 +2407,7 @@ impl App {
                 MenuScreenContent {
                     title: format!("Ticking area #{id}"),
                     enabled: vec![true; items.len()],
+                    sliders: MenuScreenContent::no_sliders(items.len()),
                     items,
                     footer,
                     selected: menu.selected,
@@ -2706,7 +2780,11 @@ impl ApplicationHandler for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x as f32, position.y as f32);
-                if self.is_menu_open()
+                if let Some(index) = self.menu_slider_drag {
+                    // Keep tracking outside the row so the drag does not snap
+                    // back when the cursor leaves the widget vertically.
+                    self.drag_menu_slider(index);
+                } else if self.is_menu_open()
                     && let Some(index) = self.menu_item_at_cursor()
                 {
                     self.set_selected_menu_index(index);
@@ -3158,15 +3236,28 @@ impl ApplicationHandler for App {
                                 self.menu_pressed_index = self.menu_item_at_cursor();
                                 if let Some(index) = self.menu_pressed_index {
                                     self.set_selected_menu_index(index);
+                                    // A slider jumps to the click position and
+                                    // keeps following the cursor while held.
+                                    if self.drag_menu_slider(index) {
+                                        self.menu_slider_drag = Some(index);
+                                    }
                                 }
                             }
                             ElementState::Released => {
                                 let pressed_index = self.menu_pressed_index.take();
+                                let dragging_slider = self.menu_slider_drag.take().is_some();
+                                if dragging_slider {
+                                    // One write per drag, not one per cursor move.
+                                    if let Some(error) = self.persist_settings() {
+                                        self.set_options_status(None, error);
+                                    }
+                                }
                                 let released_index = self.menu_item_at_cursor();
                                 if let Some(index) = released_index {
                                     self.set_selected_menu_index(index);
                                 }
-                                if let Some(index) = pressed_index
+                                if !dragging_slider
+                                    && let Some(index) = pressed_index
                                     && released_index == Some(index)
                                 {
                                     self.activate_current_menu_selected(event_loop);
@@ -3438,6 +3529,9 @@ impl ApplicationHandler for App {
                 let menu_enabled_owned = menu_overlay_owned
                     .as_ref()
                     .map(|content| content.enabled.clone());
+                let menu_sliders_owned = menu_overlay_owned
+                    .as_ref()
+                    .map(|content| content.sliders.clone());
                 let menu_open_for_render = self.is_menu_open();
                 let show_menu_panorama = menu_overlay_owned
                     .as_ref()
@@ -3726,6 +3820,7 @@ impl ApplicationHandler for App {
                             pressed: self.menu_pressed_index,
                             items: items.as_slice(),
                             enabled: Some(enabled.as_slice()),
+                            sliders: menu_sliders_owned.as_deref(),
                             footer: content.footer.as_deref(),
                             show_panorama: show_menu_panorama,
                         });
