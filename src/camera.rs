@@ -219,6 +219,38 @@ fn exp_approach_vec3(current: Vec3, target: Vec3, response: f32, dt_seconds: f32
     current.lerp(target, alpha)
 }
 
+/// Which viewpoint the world is rendered from. Targeting always stays on the
+/// player's eye, so only the *render* camera is affected.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum CameraMode {
+    #[default]
+    FirstPerson,
+    ThirdPersonBack,
+    ThirdPersonFront,
+}
+
+impl CameraMode {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::FirstPerson => Self::ThirdPersonBack,
+            Self::ThirdPersonBack => Self::ThirdPersonFront,
+            Self::ThirdPersonFront => Self::FirstPerson,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::FirstPerson => "First person",
+            Self::ThirdPersonBack => "Third person (back)",
+            Self::ThirdPersonFront => "Third person (front)",
+        }
+    }
+
+    pub(crate) fn is_first_person(self) -> bool {
+        matches!(self, Self::FirstPerson)
+    }
+}
+
 /// Welt-Konvention:
 /// - +Y = oben
 /// - Startvorwaertsrichtung in -Z (typisch fuer RH setups)
@@ -283,6 +315,38 @@ impl Camera {
             pitch: self.pitch + bobbing.pitch_radians,
             roll: self.roll + bobbing.roll_radians,
             ..self
+        }
+    }
+
+    /// Moves the camera `distance` blocks along the orbit axis for `mode`.
+    ///
+    /// The front view is placed in front of the player and turned around, so it
+    /// looks back at them; yaw flips by half a turn and pitch is mirrored.
+    pub(crate) fn orbited(self, mode: CameraMode, distance: f32) -> Self {
+        match mode {
+            CameraMode::FirstPerson => self,
+            CameraMode::ThirdPersonBack => {
+                let mut camera = self;
+                camera.position -= self.forward() * distance;
+                camera
+            }
+            CameraMode::ThirdPersonFront => {
+                let mut camera = self;
+                camera.position += self.forward() * distance;
+                camera.yaw += std::f32::consts::PI;
+                camera.pitch = -self.pitch;
+                camera
+            }
+        }
+    }
+
+    /// Direction the camera travels away from the eye for `mode`, used for the
+    /// collision sweep before `orbited` is applied.
+    pub(crate) fn orbit_direction(self, mode: CameraMode) -> Vec3 {
+        match mode {
+            CameraMode::FirstPerson => Vec3::ZERO,
+            CameraMode::ThirdPersonBack => -self.forward(),
+            CameraMode::ThirdPersonFront => self.forward(),
         }
     }
 
@@ -391,5 +455,62 @@ impl CameraUniform {
         self.fog_params = [fog_start, fog_end, darken, fog_blend];
         self.fog_color = [fog_color[0], fog_color[1], fog_color[2], overlay_alpha];
         self.sky_params = [1.0, 0.0, 0.0, 0.0];
+    }
+}
+
+#[cfg(test)]
+mod camera_mode_tests {
+    use super::{Camera, CameraMode};
+    use glam::Vec3;
+
+    fn eye() -> Camera {
+        let mut camera = Camera::new(Vec3::new(10.0, 70.0, -4.0));
+        camera.yaw = 0.7;
+        camera.pitch = -0.3;
+        camera
+    }
+
+    #[test]
+    fn cycles_through_every_mode() {
+        let mut mode = CameraMode::FirstPerson;
+        mode = mode.next();
+        assert_eq!(mode, CameraMode::ThirdPersonBack);
+        mode = mode.next();
+        assert_eq!(mode, CameraMode::ThirdPersonFront);
+        mode = mode.next();
+        assert_eq!(mode, CameraMode::FirstPerson);
+        assert!(CameraMode::default().is_first_person());
+    }
+
+    #[test]
+    fn first_person_orbit_is_a_no_op() {
+        let eye = eye();
+        let orbited = eye.orbited(CameraMode::FirstPerson, 4.0);
+        assert!((orbited.position - eye.position).length() < 1e-6);
+        assert_eq!(eye.orbit_direction(CameraMode::FirstPerson), Vec3::ZERO);
+    }
+
+    #[test]
+    fn back_view_sits_behind_the_eye_and_keeps_the_direction() {
+        let eye = eye();
+        let orbited = eye.orbited(CameraMode::ThirdPersonBack, 4.0);
+        let expected = eye.position - eye.forward() * 4.0;
+        assert!((orbited.position - expected).length() < 1e-5);
+        // Same look direction, so the view only pulls back.
+        assert!((orbited.forward() - eye.forward()).length() < 1e-5);
+        assert!((eye.orbit_direction(CameraMode::ThirdPersonBack) + eye.forward()).length() < 1e-6);
+    }
+
+    #[test]
+    fn front_view_sits_ahead_and_looks_back_at_the_player() {
+        let eye = eye();
+        let orbited = eye.orbited(CameraMode::ThirdPersonFront, 4.0);
+        let expected = eye.position + eye.forward() * 4.0;
+        assert!((orbited.position - expected).length() < 1e-5);
+        // Turned around: exactly the mirrored view direction.
+        assert!((orbited.forward() + eye.forward()).length() < 1e-5);
+        // ...which means it points back at the eye position.
+        let to_eye = (eye.position - orbited.position).normalize();
+        assert!((orbited.forward() - to_eye).length() < 1e-5);
     }
 }

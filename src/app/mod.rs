@@ -15,7 +15,7 @@ use winit::{
 use std::path::PathBuf;
 
 use crate::blocks::{BlockId, CLASSIC_PALETTE};
-use crate::camera::{Camera, ViewBobbing};
+use crate::camera::{Camera, CameraMode, ViewBobbing};
 use crate::commands::{self, Command};
 use crate::config::app::DOUBLE_SPACE_WINDOW;
 use crate::config::player::PLAYER_TUNING_MINECRAFT;
@@ -47,6 +47,10 @@ const FOV_EFFECT_SCALE_FLIGHT: f32 = 0.18;
 const FOV_FLIGHT_MAX_MULTIPLIER: f32 = 1.05;
 const FOV_RESPONSE_RATE: f32 = 10.0;
 const FOV_MIN_DEG: f32 = 30.0;
+const THIRD_PERSON_DISTANCE_BLOCKS: f32 = 4.0;
+/// Half-size of the box swept along the orbit ray, so the near plane cannot
+/// poke through a wall once the camera is pulled in.
+const THIRD_PERSON_PROBE_RADIUS: f32 = 0.12;
 const FOV_MAX_DEG: f32 = 150.0;
 const HOTBAR_SLOT_COUNT: usize = 9;
 const SPAWN_SEARCH_RADIUS_BLOCKS: i32 = 8;
@@ -306,6 +310,8 @@ pub(crate) struct App {
     hotbar: [Option<BlockId>; HOTBAR_SLOT_COUNT],
     simulation_distance: SimulationDistance,
     view_bobbing: ViewBobbing,
+    /// Render viewpoint. Runtime-only, like Minecraft's F5.
+    camera_mode: CameraMode,
     game_state: GameState,
     /// Screens below `game_state`, innermost last. Empty means the current
     /// screen is a menu root (main menu, pause menu, ticking-area list).
@@ -362,6 +368,7 @@ impl Default for App {
             hotbar: [None; HOTBAR_SLOT_COUNT],
             simulation_distance: SimulationDistance::default(),
             view_bobbing: ViewBobbing::default(),
+            camera_mode: CameraMode::default(),
             game_state: GameState::MainMenu { selected: 0 },
             nav_stack: Vec::new(),
             last_space_tap: None,
@@ -492,6 +499,39 @@ impl App {
         };
         self.set_base_fov_from_fill01(fill01);
         true
+    }
+
+    fn cycle_camera_mode(&mut self) {
+        self.camera_mode = self.camera_mode.next();
+        if let Some(state) = self.state.as_mut() {
+            state.set_camera_mode(self.camera_mode);
+        }
+        crate::console_info!("Camera: {}", self.camera_mode.label());
+    }
+
+    /// Back to first person whenever a world session ends, so a fresh world
+    /// never starts in an orbit view left over from the previous one.
+    fn reset_camera_mode(&mut self) {
+        self.camera_mode = CameraMode::default();
+        if let Some(state) = self.state.as_mut() {
+            state.set_camera_mode(self.camera_mode);
+        }
+    }
+
+    /// The camera the world is rendered from. In third person the eye camera is
+    /// orbited away from the player and pulled back in on terrain contact; the
+    /// eye camera itself is untouched so targeting stays first-person.
+    fn compose_render_camera(mode: CameraMode, state: &State, eye: Camera) -> Camera {
+        if mode.is_first_person() {
+            return eye;
+        }
+        let distance = state.third_person_camera_distance(
+            eye.position,
+            eye.orbit_direction(mode),
+            THIRD_PERSON_DISTANCE_BLOCKS,
+            THIRD_PERSON_PROBE_RADIUS,
+        );
+        eye.orbited(mode, distance)
     }
 
     fn take_screenshot(&mut self) {
@@ -953,6 +993,7 @@ impl App {
     }
 
     fn enter_main_menu(&mut self) {
+        self.reset_camera_mode();
         self.reset_chat_state();
         self.clear_menu_press();
         self.nav_stack.clear();
@@ -1253,6 +1294,7 @@ impl App {
     }
 
     fn enter_world_loading_screen(&mut self, title: &str, phase: &str) {
+        self.reset_camera_mode();
         self.reset_chat_state();
         self.clear_menu_press();
         self.nav_stack.clear();
@@ -2903,6 +2945,22 @@ impl ApplicationHandler for App {
                     return;
                 }
 
+                if !awaiting_rebind
+                    && event.state == ElementState::Pressed
+                    && !event.repeat
+                    && let Some(code) = code
+                    && code
+                        == self
+                            .settings
+                            .controls
+                            .key_for(InputAction::ToggleCameraMode)
+                {
+                    if self.is_in_game() {
+                        self.cycle_camera_mode();
+                    }
+                    return;
+                }
+
                 if options_open
                     && event.state == ElementState::Pressed
                     && !event.repeat
@@ -3768,10 +3826,14 @@ impl ApplicationHandler for App {
                     let render_camera = if show_menu_panorama {
                         Camera::default()
                     } else {
-                        Self::compose_view_camera(
-                            self.camera,
-                            self.settings.gameplay.view_bobbing,
-                            self.view_bobbing,
+                        Self::compose_render_camera(
+                            self.camera_mode,
+                            state,
+                            Self::compose_view_camera(
+                                self.camera,
+                                self.settings.gameplay.view_bobbing,
+                                self.view_bobbing,
+                            ),
                         )
                     };
                     let world_time = state.world_time;

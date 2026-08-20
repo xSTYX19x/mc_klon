@@ -81,11 +81,12 @@ pub(crate) enum InputAction {
     OpenChat,
     OpenTickingAreas,
     Screenshot,
+    ToggleCameraMode,
     PauseMenu,
 }
 
 impl InputAction {
-    pub(crate) const ALL: [Self; 12] = [
+    pub(crate) const ALL: [Self; 13] = [
         Self::MoveForward,
         Self::MoveBackward,
         Self::MoveLeft,
@@ -97,6 +98,7 @@ impl InputAction {
         Self::OpenChat,
         Self::OpenTickingAreas,
         Self::Screenshot,
+        Self::ToggleCameraMode,
         Self::PauseMenu,
     ];
 
@@ -113,7 +115,8 @@ impl InputAction {
             Self::OpenChat => 8,
             Self::OpenTickingAreas => 9,
             Self::Screenshot => 10,
-            Self::PauseMenu => 11,
+            Self::ToggleCameraMode => 11,
+            Self::PauseMenu => 12,
         }
     }
 
@@ -130,6 +133,7 @@ impl InputAction {
             Self::OpenChat => "Chat",
             Self::OpenTickingAreas => "Ticking areas",
             Self::Screenshot => "Screenshot",
+            Self::ToggleCameraMode => "Camera perspective",
             Self::PauseMenu => "Pause menu",
         }
     }
@@ -147,6 +151,7 @@ impl InputAction {
             Self::OpenChat => KeyCode::KeyT,
             Self::OpenTickingAreas => KeyCode::KeyK,
             Self::Screenshot => KeyCode::F2,
+            Self::ToggleCameraMode => KeyCode::F5,
             Self::PauseMenu => KeyCode::Escape,
         }
     }
@@ -227,6 +232,7 @@ struct SavedInputBindings {
     open_chat: String,
     open_ticking_areas: String,
     screenshot: String,
+    toggle_camera_mode: String,
     pause_menu: String,
 }
 
@@ -252,6 +258,9 @@ impl SavedInputBindings {
                 bindings.key_for(InputAction::OpenTickingAreas),
             ),
             screenshot: keycode_config_name(bindings.key_for(InputAction::Screenshot)),
+            toggle_camera_mode: keycode_config_name(
+                bindings.key_for(InputAction::ToggleCameraMode),
+            ),
             pause_menu: keycode_config_name(bindings.key_for(InputAction::PauseMenu)),
         }
     }
@@ -271,6 +280,7 @@ impl SavedInputBindings {
             (InputAction::OpenChat, self.open_chat),
             (InputAction::OpenTickingAreas, self.open_ticking_areas),
             (InputAction::Screenshot, self.screenshot),
+            (InputAction::ToggleCameraMode, self.toggle_camera_mode),
             (InputAction::PauseMenu, self.pause_menu),
         ];
         for (action, raw) in entries {

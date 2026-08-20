@@ -46,7 +46,8 @@ use crate::blocks::{
     TEXTURE_SELF_TEST_KEYS, TINT_NONE, debug_assert_block_blueprint_integrity,
 };
 use crate::camera::{
-    Camera, CameraUniform, Frustum, build_view_proj_wgpu, chunk_in_frustum, sphere_in_frustum,
+    Camera, CameraMode, CameraUniform, Frustum, build_view_proj_wgpu, chunk_in_frustum,
+    sphere_in_frustum,
 };
 use crate::config::assets::ASSET_ROOT;
 use crate::config::player::{PLAYER_HEIGHT, PLAYER_RADIUS};
@@ -5235,6 +5236,8 @@ pub(crate) struct State {
     inventory_overlay_cache: Option<InventoryOverlayCacheKey>,
     /// User GUI-scale multiplier, applied on top of the per-element UI scales.
     gui_scale: f32,
+    /// Viewpoint the frame is rendered from; hides first-person-only overlays.
+    camera_mode: CameraMode,
     _texture_registry: TextureRegistry,
     _world_texture_array: TextureArray,
     _sky_texture_array: TextureArray,
@@ -7869,6 +7872,10 @@ impl State {
         }
     }
 
+    pub(crate) fn set_camera_mode(&mut self, mode: CameraMode) {
+        self.camera_mode = mode;
+    }
+
     pub(crate) fn set_gui_scale(&mut self, gui_scale: GuiScale) {
         let factor = gui_scale.factor();
         if (self.gui_scale - factor).abs() < f32::EPSILON {
@@ -7888,6 +7895,60 @@ impl State {
 
     /// Arms a capture; the next rendered frame is copied back and written out.
     /// Returns false when the surface cannot be read back on this adapter.
+    /// Largest distance the third-person camera can back off before it would
+    /// clip into terrain. Probes a small box around the ray so the near plane
+    /// does not poke through a wall at the pulled-in distance.
+    pub(crate) fn third_person_camera_distance(
+        &self,
+        eye: Vec3,
+        direction: Vec3,
+        desired: f32,
+        probe_radius: f32,
+    ) -> f32 {
+        if direction.length_squared() <= f32::EPSILON || desired <= 0.0 {
+            return 0.0;
+        }
+        let dir = direction.normalize();
+        // Any two vectors perpendicular to dir; used to offset the corner probes.
+        let side = if dir.y.abs() > 0.9 {
+            Vec3::X.cross(dir).normalize()
+        } else {
+            Vec3::Y.cross(dir).normalize()
+        };
+        let up = dir.cross(side).normalize();
+
+        const STEP: f32 = 0.1;
+        let steps = (desired / STEP).ceil() as i32;
+        let mut safe = 0.0_f32;
+        for i in 1..=steps {
+            let t = (i as f32 * STEP).min(desired);
+            let center = eye + dir * t;
+            let blocked = [
+                Vec3::ZERO,
+                side * probe_radius,
+                -side * probe_radius,
+                up * probe_radius,
+                -up * probe_radius,
+            ]
+            .into_iter()
+            .any(|offset| {
+                let probe = center + offset;
+                let block = self.world.get_block(IVec3::new(
+                    probe.x.floor() as i32,
+                    probe.y.floor() as i32,
+                    probe.z.floor() as i32,
+                ));
+                crate::world::raycast::blocks_raycast_targeting(block)
+            });
+            if blocked {
+                // Stop just short of the obstruction.
+                return (safe - probe_radius).max(0.0);
+            }
+            safe = t;
+        }
+        safe
+    }
+
     pub(crate) fn request_screenshot(&mut self) -> bool {
         if !self.surface_copy_src {
             return false;
@@ -9944,6 +10005,7 @@ impl State {
             inventory_overlay_mesh: None,
             inventory_overlay_cache: None,
             gui_scale: GuiScale::default().factor(),
+            camera_mode: CameraMode::default(),
             _texture_registry: texture_registry,
             _world_texture_array: world_texture_array,
             _sky_texture_array: sky_texture_array,
@@ -19489,8 +19551,10 @@ impl State {
             self.hotbar_overlay_mesh = None;
             self.hotbar_overlay_cache = None;
         }
-        let show_first_person_overlay =
-            !showing_generation_screen && !showing_pause_menu && !showing_inventory;
+        let show_first_person_overlay = self.camera_mode.is_first_person()
+            && !showing_generation_screen
+            && !showing_pause_menu
+            && !showing_inventory;
         if show_first_person_overlay {
             let held_block =
                 hotbar[selected_hotbar_slot.min(HUD_HOTBAR_SLOT_COUNT.saturating_sub(1))];
@@ -19870,7 +19934,13 @@ impl State {
                 rpass.draw_indexed(0..self.water_overlay_mesh.index_count, 0, 0..1);
             }
 
-            if !showing_generation_screen && !showing_pause_menu && !showing_inventory {
+            // The crosshair marks where the *eye* is aiming, which no longer
+            // lines up with the view once the camera orbits away.
+            if self.camera_mode.is_first_person()
+                && !showing_generation_screen
+                && !showing_pause_menu
+                && !showing_inventory
+            {
                 rpass.set_bind_group(0, &self.world_texture_bind_group, &[]);
                 rpass.set_vertex_buffer(0, self.crosshair_mesh.vertex_buffer.slice(..));
                 rpass.set_index_buffer(
