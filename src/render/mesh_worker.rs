@@ -37,6 +37,12 @@ pub(crate) struct MeshWorkerPool {
 }
 
 impl MeshWorkerPool {
+    /// Threads actually spawned. The dispatcher sizes its in-flight cap off
+    /// this, so the cap follows the machine instead of a guessed constant.
+    pub(crate) fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+
     pub(crate) fn new(
         texture_lookup: Arc<BlockTextureLookup>,
         job_rx: Receiver<MeshJob>,

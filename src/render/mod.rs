@@ -2,12 +2,14 @@ pub(crate) mod chunkgen_worker;
 pub(crate) mod depth;
 pub(crate) mod lighting_budget;
 pub(crate) mod lighting_worker;
+pub(crate) mod mesh_dispatch;
 pub(crate) mod mesh_gpu;
 pub(crate) mod mesh_worker;
 pub(crate) mod pause_backdrop;
 pub(crate) mod player_model;
 pub(crate) mod screenshot;
 pub(crate) mod shaders;
+pub(crate) mod stall_attribution;
 pub(crate) mod state;
 pub(crate) mod texture_anim;
 

@@ -684,7 +684,7 @@ Der Report oben ist die Analyse auf `8f7634d`. Diese Tabelle hält nach, was dav
 | §1.5 | `eprintln!` in Hot Paths | ✅ behoben | working tree |
 | §1.3 | 512-Iterationen-Spin im Main-Thread | ✅ behoben | working tree |
 | §5 (klein) | Precipitation-Panic, `transparent_chunks`-Clone, Pool-Ratchet, Neighborhood-Fills, Buffer-Labels | ✅ behoben | working tree |
-| §1.4 | Mesh-Job-Priority-Inversion | offen (bewusst) | |
+| §1.4 | Mesh-Job-Priority-Inversion | ✅ behoben | working tree (2026-08-20) |
 | §2.5 | `blocks_skylight` vs. `OcclusionShape` | offen (bewusst) | |
 | §5 (Rest) | Chunk-Mesh-Suballocation statt Buffer pro Layer | offen (bewusst) | |
 | §2.2 (Rest) | Lighting auf den Worker-Pool | offen (bewusst) | |
@@ -693,6 +693,7 @@ Der Report oben ist die Analyse auf `8f7634d`. Diese Tabelle hält nach, was dav
 | §D.2 | Lint-Befehl aus `CLAUDE.md` schlägt fehl | 🟡 Clippy-Errors weg, Warning-Schulden offen | working tree |
 | §D.3 | Chunk-Entladung repariert Lighting synchron (188 ms) | ✅ behoben | working tree |
 | §D.4 | `tops`-Kategorienliste ohne Unload-Bucket | ✅ behoben | working tree |
+| §D.4 (Rest) | `tops`-Buckets zählen verschachtelte Zeit doppelt | ✅ behoben | working tree (2026-08-20) |
 | §D.5 | Ring-Buffer deckt statt 10 s nur ~900 ms ab | ✅ behoben | working tree (2026-08-20) |
 | §1.6 | Trace-`format!` läuft auch ohne Arbeit | ✅ behoben | working tree |
 | §1.7 | Einzelnes Item kann das Stage-Budget sprengen | 🟡 Watchdog meldet es jetzt; Splitten bleibt pro Stage | working tree (2026-08-20) |
@@ -837,6 +838,28 @@ darf der Chunk-Add-Pump bis zu 6 ms statt seiner alten privaten 6 ms nutzen, sob
 beiden nichts zu tun haben, statt an einer starren Aufteilung zu hängen. Die Budget-Arithmetik ist
 als reine Funktion herausgezogen und mit 7 Tests belegt, inklusive »kein Stage-Stack über dem
 alten Worst Case« und »keine Stage wird ausgehungert«.
+
+**Neu — Mesh-Job-Priority-Inversion (§1.4, `src/render/mesh_dispatch.rs`).** Der Job-Channel ist
+unbounded und die Worker sind FIFO, also fror die Sende-Reihenfolge die Priorität beim Enqueue ein:
+bei gemessenen 148 gleichzeitig laufenden Jobs wartet ein Chunk, der *in diesem* Frame nah und
+sichtbar wurde, hinter ~140 Chunks, die vor zwei Sekunden nah waren. Jetzt dürfen nur
+`worker_count * 3` Jobs gleichzeitig bei den Workern liegen (Warmup `* 8`, Minimum 4); der Rest
+bleibt in der jeden Frame umsortierten Dirty-Queue. Der Einwand aus dem Audit (»ein falsches
+In-Flight-Limit tauscht Stutter gegen Starvation«) ist konstruktiv adressiert statt geraten: der Cap
+skaliert mit den Worker-Threads, jeder Worker hat einen Job plus mindestens einen dahinter, und das
+Ergebnis-Drain-Limit (64/Frame) liegt weit über dem Cap, kann den Dispatcher also nicht blockieren.
+Gezählt wird ein eigener Zähler (gesendet minus zurückgekommen), **nicht** `inflight.len()` — das
+enthält auch fertige Ergebnisse in der Upload-Queue, und die wird ohnehin jeden Frame umsortiert.
+Stall-Report: `inflight_jobs=n/cap,cap_hits=k`.
+
+**Neu — `tops`-Aliasing zu Ende geprüft (§D.4 Rest, `src/render/stall_attribution.rs`).** Die
+verbliebenen Buckets wurden durchgesehen. Zwei echte Fälle: `stream` enthält die
+Saved-Column-Requests, die `saved_load` bereits zählt, und `chunkgen`/`unload` können inline
+ausgelöste Lighting-Zeit enthalten, die `lighting` zählt. Die Liste wird jetzt aus **exklusiver**
+Zeit gebaut — jeder Bucket meldet, was er an andere Buckets verrechnet hat — und der Report hängt
+`attrib_overflow=+X.Xms/Y.Yms` an, wenn die Buckets zusammen mehr beanspruchen als die Stage, die
+sie enthält. Damit fällt künftige, noch nicht deklarierte Verschachtelung auf, statt das Ranking
+still zu verzerren. Das Sekundenfenster rechnet nach derselben Regel.
 
 ### Warum das zusammen so viel bringt
 

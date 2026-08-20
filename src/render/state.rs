@@ -69,6 +69,8 @@ use crate::meshing::{
     face_corner_ao_shades, face_from_normal, face_shade,
 };
 use super::lighting_budget::LightingFrameBudget;
+use super::mesh_dispatch::mesh_inflight_job_cap;
+use super::stall_attribution::{StageSample, attribution_overflow_ms, format_top_stages};
 use crate::perf::stage_budget::StageBudgetWatchdog;
 use crate::perf::trace as perf_trace;
 use crate::player::PlayerMode;
@@ -1519,6 +1521,13 @@ pub(crate) struct StateFramePerf {
     pub(crate) placeholder_salvage_skipped_dense: usize,
 
     pub(crate) mesh_results_drained: usize,
+    pub(crate) mesh_inflight_job_cap: usize,
+    /// Parts of a stage's own time that another `tops` bucket already counts.
+    /// See `render/stall_attribution.rs`.
+    pub(crate) stream_nested_saved_load_ms: f32,
+    pub(crate) chunkgen_nested_lighting_ms: f32,
+    pub(crate) unload_nested_lighting_ms: f32,
+    pub(crate) mesh_dispatch_inflight_capped: usize,
     pub(crate) mesh_results_backlog_before: usize,
     pub(crate) mesh_results_backlog_after: usize,
     pub(crate) mesh_upload_queue_before: usize,
@@ -1713,6 +1722,11 @@ impl StateFramePerf {
             placeholder_salvage_edits_enqueued: 0,
             placeholder_salvage_skipped_dense: 0,
             mesh_results_drained: 0,
+            mesh_inflight_job_cap: 0,
+            stream_nested_saved_load_ms: 0.0,
+            chunkgen_nested_lighting_ms: 0.0,
+            unload_nested_lighting_ms: 0.0,
+            mesh_dispatch_inflight_capped: 0,
             mesh_results_backlog_before: 0,
             mesh_results_backlog_after: 0,
             mesh_upload_queue_before: 0,
@@ -1881,11 +1895,15 @@ impl PerfSummaryWindow {
         self.frames = self.frames.saturating_add(1);
         self.max_frame_ms = self.max_frame_ms.max(perf.frame_dt_ms);
         self.sum_process_dirty_chunk_meshes_ms += perf.process_dirty_chunk_meshes_ms;
-        self.sum_chunkgen_ms += perf.pump_chunkgen_results_ms;
+        // Exclusive time, like the stall report's `tops` list: `chunkgen` and
+        // `stream` contain work that `lighting` / `saved_load` already count.
+        self.sum_chunkgen_ms +=
+            (perf.pump_chunkgen_results_ms - perf.chunkgen_nested_lighting_ms).max(0.0);
         self.sum_mesh_ms += perf.pump_mesh_results_ms;
         self.sum_storage_ms += perf.pump_storage_save_results_ms + perf.autosave_total_ms;
         self.sum_lighting_ms += perf.rebuild_world_lighting_ms;
-        self.sum_stream_ms += perf.enqueue_chunks_within_view_ms;
+        self.sum_stream_ms +=
+            (perf.enqueue_chunks_within_view_ms - perf.stream_nested_saved_load_ms).max(0.0);
         self.sum_saved_load_ms += perf.ensure_saved_column_load_ms;
         self.sum_mesh_upload_wait_ms += perf.mesh_upload_wait_total_ms;
         self.sum_mesh_upload_wait_samples += perf.mesh_upload_wait_samples;
@@ -5666,6 +5684,7 @@ pub(crate) struct State {
     saved_player_spawn: Option<PlayerSpawn>,
     block_texture_lookup: Arc<BlockTextureLookup>,
     _mesh_pool: MeshWorkerPool,
+    mesh_worker_count: usize,
     _chunkgen_pool: ChunkGenWorkerPool,
     _lighting_pool: LightingWorkerPool,
     mesh_results: CrossbeamReceiver<MeshResult>,
@@ -5675,6 +5694,13 @@ pub(crate) struct State {
     chunkgen_jobs: CrossbeamSender<ChunkGenJob>,
     lighting_jobs: CrossbeamSender<LightingJob>,
     inflight: HashMap<ChunkCoord, u64>,
+    /// Jobs handed to the mesh workers that have not come back yet.
+    ///
+    /// Deliberately *not* `inflight.len()`: that also counts results already
+    /// waiting in the upload queue, which the dispatcher must not throttle on —
+    /// the upload queue is reprioritized every frame and is not the inverted
+    /// part of the pipeline.
+    mesh_jobs_outstanding: usize,
     chunkgen_inflight: HashSet<ChunkCoord>,
     lod_chunkgen_inflight: HashSet<LodColumnCoord>,
     generated_empty_chunks: HashSet<ChunkCoord>,
@@ -6103,6 +6129,10 @@ impl State {
         self.chunkgen_results = chunkgen_results;
         self.lighting_jobs = lighting_jobs;
         self.lighting_results = lighting_results;
+        self.mesh_worker_count = mesh_pool.worker_count();
+        // The old channels go with the old pool, so anything still queued there
+        // will never come back and must not keep the dispatcher capped.
+        self.mesh_jobs_outstanding = 0;
         self._mesh_pool = mesh_pool;
         self._chunkgen_pool = chunkgen_pool;
         self._lighting_pool = lighting_pool;
@@ -6201,6 +6231,7 @@ impl State {
         self.pending_sand_gravity_check_set.clear();
         self.mesh_upload_queue.clear();
         self.inflight.clear();
+        self.mesh_jobs_outstanding = 0;
         self.chunkgen_inflight.clear();
         self.lod_chunkgen_inflight.clear();
         self.pending_lod_mesh_uploads.clear();
@@ -8761,27 +8792,41 @@ impl State {
         // lands in `rebuild_world_lighting_ms`. Without it a 188 ms unload frame
         // reads as `lighting=188.0ms`, pointing the investigation at the wrong
         // subsystem — which is exactly what happened.
-        let mut scopes = [
-            ("chunkgen", self.frame_perf.pump_chunkgen_results_ms),
-            ("mesh", self.frame_perf.pump_mesh_results_ms),
-            ("autosave", self.frame_perf.autosave_total_ms),
-            ("storage", self.frame_perf.pump_storage_save_results_ms),
-            ("lighting", self.frame_perf.rebuild_world_lighting_ms),
-            (
+        let scopes = [
+            StageSample::nested(
+                "chunkgen",
+                self.frame_perf.pump_chunkgen_results_ms,
+                self.frame_perf.chunkgen_nested_lighting_ms,
+            ),
+            StageSample::flat("mesh", self.frame_perf.pump_mesh_results_ms),
+            StageSample::flat("autosave", self.frame_perf.autosave_total_ms),
+            StageSample::flat("storage", self.frame_perf.pump_storage_save_results_ms),
+            StageSample::flat("lighting", self.frame_perf.rebuild_world_lighting_ms),
+            StageSample::nested(
                 "unload",
                 self.frame_perf.proc_unload_chunks_outside_keep_radius_ms,
+                self.frame_perf.unload_nested_lighting_ms,
             ),
-            ("stream", self.frame_perf.enqueue_chunks_within_view_ms),
-            ("saved_load", self.frame_perf.ensure_saved_column_load_ms),
+            StageSample::nested(
+                "stream",
+                self.frame_perf.enqueue_chunks_within_view_ms,
+                self.frame_perf.stream_nested_saved_load_ms,
+            ),
+            StageSample::flat("saved_load", self.frame_perf.ensure_saved_column_load_ms),
         ];
-        scopes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let top_scopes = scopes
-            .iter()
-            .take(4)
-            .filter(|(_, ms)| *ms > 0.05)
-            .map(|(name, ms)| format!("{name}={ms:.1}ms"))
-            .collect::<Vec<_>>()
-            .join(",");
+        let top_scopes = format_top_stages(&scopes, 4, 0.05);
+        // Non-zero means some nesting is still undeclared, so the ranking above
+        // may be naming a container instead of the actual cost.
+        let attribution_overflow =
+            attribution_overflow_ms(&scopes, self.frame_perf.process_dirty_chunk_meshes_ms);
+        let attribution_note = if attribution_overflow > 0.05 {
+            format!(
+                " attrib_overflow=+{attribution_overflow:.1}ms/{:.1}ms",
+                self.frame_perf.process_dirty_chunk_meshes_ms
+            )
+        } else {
+            String::new()
+        };
         let mut proc_scopes = [
             (
                 "proc.pump_chunkgen_results",
@@ -8854,7 +8899,7 @@ impl State {
             .unwrap_or_default();
 
         format!(
-            "[perf][stall] frame={:.1}ms tops=[{}] process_dirty_chunk_meshes(ms={:.1},tops=[{}]) chunkgen(ms={:.1},drain={},q={}=>{},applied={},pure_ms={:.1},sidefx_ms={:.1},sidefx_q={}=>{},queued={},done={},light[a={},r={}],fluid_cells={},fluid_scans={},overshoot={},sched[pend={},heap={},reprio={},rebuild={}@{:.1}ms,fcache={}/{}@{:.1}ms,hcache={}/{}@{:.1}ms],lod_results={},lod_req={},lod_up={},lod_up_q={},lod_gpu_ms={:.1}) mesh(ms={:.1},drain={},q={}=>{},up_q={}=>{},uploads={},gpu_up_ms={:.1},wait_avg/max_ms={:.2}/{:.2},near_first={}@{:.2}/{:.2}ms,near_final={}@{:.2}/{:.2}ms,final_upgrades={},budget_boost_ms={:.2},dirty[g={},l={},b={}],coalesced={},avoided={},dispatch[b={},l={}]) storage(ms={:.1},drain={},q={}=>{},ok={},fail={},autosave_q={}) lighting(ms={:.1},drain={},q={}=>{},changed={},inc_jobs={},steps={},primary={},region={},inc_chunks={},voxels={},boundary={},split_jobs={},step_max_ms={:.2},backlog={},edit[batches={},merged={},enqueue_ms={:.2},proc_ms={:.2},steps={},voxels={},changed={},chunks={},budget_ms={:.2}]) stream(ms={:.1},far_lod={},lod_center={:?},lod_center_changes={},lod_cpu_skip={},lod_backlog_skip={}) coverage(near={},lod={},lod_dc={},near_mem_mb={:.2},lod_mem_mb={:.2}) saved_load(ms={:.1},attempts={},hits={},misses={},drain={},applied={},discarded={},failed={},rx_q={}=>{},apply_q={}=>{},work[sec={}=>{},edits={},chunks={},boundary={},steps={},done={},yield={},resume={},cps={:.1}],phase_ms=[{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}],step_max=[{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}],worst_ms={:.1}) deferred(pending={},applied={},chunks_touched={},dropped_caps={}) salvage(chunks={},edits={},skipped_dense={}) view={} inflight(mesh={},chunkgen={},lod={}) backlogs(mesh_rx={},chunkgen_rx={},light_rx={},save_rx={},save_ack_rx={},mesh_up_q={},lod_up_q={}){}",
+            "[perf][stall] frame={:.1}ms tops=[{}] process_dirty_chunk_meshes(ms={:.1},tops=[{}]) chunkgen(ms={:.1},drain={},q={}=>{},applied={},pure_ms={:.1},sidefx_ms={:.1},sidefx_q={}=>{},queued={},done={},light[a={},r={}],fluid_cells={},fluid_scans={},overshoot={},sched[pend={},heap={},reprio={},rebuild={}@{:.1}ms,fcache={}/{}@{:.1}ms,hcache={}/{}@{:.1}ms],lod_results={},lod_req={},lod_up={},lod_up_q={},lod_gpu_ms={:.1}) mesh(ms={:.1},drain={},q={}=>{},up_q={}=>{},uploads={},gpu_up_ms={:.1},wait_avg/max_ms={:.2}/{:.2},near_first={}@{:.2}/{:.2}ms,near_final={}@{:.2}/{:.2}ms,final_upgrades={},budget_boost_ms={:.2},dirty[g={},l={},b={}],coalesced={},avoided={},dispatch[b={},l={}],inflight_jobs={}/{},cap_hits={}) storage(ms={:.1},drain={},q={}=>{},ok={},fail={},autosave_q={}) lighting(ms={:.1},drain={},q={}=>{},changed={},inc_jobs={},steps={},primary={},region={},inc_chunks={},voxels={},boundary={},split_jobs={},step_max_ms={:.2},backlog={},edit[batches={},merged={},enqueue_ms={:.2},proc_ms={:.2},steps={},voxels={},changed={},chunks={},budget_ms={:.2}]) stream(ms={:.1},far_lod={},lod_center={:?},lod_center_changes={},lod_cpu_skip={},lod_backlog_skip={}) coverage(near={},lod={},lod_dc={},near_mem_mb={:.2},lod_mem_mb={:.2}) saved_load(ms={:.1},attempts={},hits={},misses={},drain={},applied={},discarded={},failed={},rx_q={}=>{},apply_q={}=>{},work[sec={}=>{},edits={},chunks={},boundary={},steps={},done={},yield={},resume={},cps={:.1}],phase_ms=[{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}],step_max=[{:.1}/{:.1}/{:.1}/{:.1}/{:.1}/{:.1}],worst_ms={:.1}) deferred(pending={},applied={},chunks_touched={},dropped_caps={}) salvage(chunks={},edits={},skipped_dense={}) view={} inflight(mesh={},chunkgen={},lod={}) backlogs(mesh_rx={},chunkgen_rx={},light_rx={},save_rx={},save_ack_rx={},mesh_up_q={},lod_up_q={}){}{}",
             frame_dt_ms,
             top_scopes,
             self.frame_perf.process_dirty_chunk_meshes_ms,
@@ -8931,6 +8976,9 @@ impl State {
             self.frame_perf.mesh_avoided_remeshes,
             self.frame_perf.mesh_boundary_dispatches,
             self.frame_perf.mesh_lighting_dispatches,
+            self.mesh_jobs_outstanding,
+            self.frame_perf.mesh_inflight_job_cap,
+            self.frame_perf.mesh_dispatch_inflight_capped,
             self.frame_perf.pump_storage_save_results_ms + self.frame_perf.autosave_total_ms,
             self.frame_perf.storage_save_results_drained,
             self.frame_perf.storage_save_results_backlog_before,
@@ -9027,6 +9075,7 @@ impl State {
             self.mesh_upload_queue.len(),
             self.pending_lod_mesh_uploads.len(),
             stage_overruns,
+            attribution_note,
         )
     }
 
@@ -10588,6 +10637,7 @@ impl State {
             hand_swing: HandSwing::default(),
             saved_player_spawn: None,
             block_texture_lookup,
+            mesh_worker_count: mesh_pool.worker_count(),
             _mesh_pool: mesh_pool,
             _chunkgen_pool: chunkgen_pool,
             _lighting_pool: lighting_pool,
@@ -10598,6 +10648,7 @@ impl State {
             chunkgen_jobs: chunkgen_jobs_tx,
             lighting_jobs: lighting_jobs_tx,
             inflight: HashMap::new(),
+            mesh_jobs_outstanding: 0,
             chunkgen_inflight: HashSet::new(),
             lod_chunkgen_inflight: HashSet::new(),
             generated_empty_chunks: HashSet::new(),
@@ -14535,6 +14586,9 @@ impl State {
             )
         };
         let saved_load_ms = saved_started.elapsed().as_secs_f32() * 1000.0;
+        // Charged to `ensure_saved_column_load_ms` as well — declare it so the
+        // `stream` bucket does not claim the `saved_load` bucket's time.
+        self.frame_perf.stream_nested_saved_load_ms += saved_load_ms;
         if !self.saved_loads_suspended() {
             self.report_saved_column_request_rate_if_due();
         }
@@ -18207,6 +18261,13 @@ impl State {
             .frame_perf
             .stream_dispatch_budget_ms
             .max(dispatch_budget_ms);
+        // Warmup runs behind the loading screen, where throughput outranks the
+        // ordering this cap protects.
+        let inflight_job_cap = mesh_inflight_job_cap(
+            self.mesh_worker_count,
+            self.world_generation_task.is_some(),
+        );
+        self.frame_perf.mesh_inflight_job_cap = inflight_job_cap;
 
         let dispatch_loop_ms = {
             let _scope = perf_trace::scope("proc.dispatch_mesh_jobs_loop_total");
@@ -18219,6 +18280,12 @@ impl State {
                 if loop_iterations > 0
                     && started.elapsed().as_secs_f32() * 1000.0 >= dispatch_budget_ms
                 {
+                    break;
+                }
+                // Checked before popping: an item taken off the dirty queue and
+                // put back would lose its place in the reprioritized order.
+                if self.mesh_jobs_outstanding >= inflight_job_cap {
+                    self.frame_perf.mesh_dispatch_inflight_capped += 1;
                     break;
                 }
                 loop_iterations += 1;
@@ -18360,6 +18427,7 @@ impl State {
                 dispatch_send_mesh_job_ms += send_started.elapsed().as_secs_f32() * 1000.0;
                 if send_ok {
                     dispatched_jobs += 1;
+                    self.mesh_jobs_outstanding = self.mesh_jobs_outstanding.saturating_add(1);
                     self.fluid_dirty_due_to_fluids.remove(&coord);
                     self.deferred_mesh_until_frame.remove(&coord);
                     if let Some(entry) = self.fluid_mesh_coalesce.get_mut(&coord) {
@@ -18489,7 +18557,10 @@ impl State {
         {
             let _scope = perf_trace::scope("proc.pump_chunkgen_results");
             let started = Instant::now();
+            let lighting_before = self.frame_perf.rebuild_world_lighting_ms;
             self.pump_chunkgen_results();
+            self.frame_perf.chunkgen_nested_lighting_ms +=
+                self.frame_perf.rebuild_world_lighting_ms - lighting_before;
             let ms = started.elapsed().as_secs_f32() * 1000.0;
             self.frame_perf.proc_pump_chunkgen_results_ms += ms;
             perf_trace::record_duration_ms("proc.pump_chunkgen_results", ms, "");
@@ -18512,7 +18583,10 @@ impl State {
         {
             let _scope = perf_trace::scope("proc.unload_chunks_outside_keep_radius");
             let started = Instant::now();
+            let lighting_before = self.frame_perf.rebuild_world_lighting_ms;
             self.unload_chunks_outside_keep_radius(camera);
+            self.frame_perf.unload_nested_lighting_ms +=
+                self.frame_perf.rebuild_world_lighting_ms - lighting_before;
             let ms = started.elapsed().as_secs_f32() * 1000.0;
             self.frame_perf.proc_unload_chunks_outside_keep_radius_ms += ms;
             perf_trace::record_duration_ms("proc.unload_chunks_outside_keep_radius", ms, "");
@@ -18611,6 +18685,7 @@ impl State {
             let Ok(result) = self.mesh_results.try_recv() else {
                 break;
             };
+            self.mesh_jobs_outstanding = self.mesh_jobs_outstanding.saturating_sub(1);
             self.mesh_upload_queue.push_back(QueuedMeshUpload {
                 result,
                 queued_at: Instant::now(),
