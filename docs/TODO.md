@@ -56,6 +56,107 @@ When an item ships, delete it from here instead of marking it done.
 
 ## Performance
 
+### Decouple frame rate from chunk streaming
+
+Frame time must stop tracking streaming activity. Today it does, and not by
+accident — the current design permits it. Do **not** "fix" this by lowering the
+existing constants: they were raised deliberately, and shrinking them trades
+stutter for slow streaming. The fix is to stop letting the stages decide their
+cost independently of the frame deadline.
+
+What was verified in the code before writing this item:
+
+- **The per-stage budgets are additive and none of them knows the frame
+  deadline.** Every stage is a separate constant and every stage may spend its
+  full budget in the same frame: chunkgen apply 3.0
+  (`STREAM_CHUNKGEN_APPLY_BUDGET_MS`, `config/mod.rs:343`), apply follow-ups 1.5,
+  saved-column load apply 2.0, streaming lighting 6.0, removal lighting 3.0,
+  block-edit lighting 1.5, changed-chunk dirty apply 0.5, mesh dispatch 2.0,
+  mesh upload 3.0 (5.5 low-speed, 10.0 warmup), prune 1.0, evict 1.5, block-edit
+  side effects 1.5, fluid sim 3.0. That sums to **~30 ms before `render` even
+  starts** — a 60 Hz frame is 16.6 ms. The engine is currently *specified* to
+  drop to ~30 fps whenever every stage has work, which is the definition of
+  "chunks are generating".
+- **Burst mode widens the budget exactly when the frame is already heavy.**
+  `update_stream_burst_mode_for_camera` (`state.rs:11228`) turns burst on when
+  meshes near the camera are missing, and `stream_budget_for_stage_ms`
+  (`state.rs:11245`) then hands out up to `STREAM_BURST_MAX_TOTAL_BUDGET_MS =
+  25.0` across three stages alone. That shared cap is the right shape — it is
+  just capped too high, applies only in burst, and covers only 3 of ~12 stages.
+- **There is no frame-time feedback anywhere.** No budget in `render/state.rs`
+  or `app/mod.rs` reads a measured frame time; all of them are compile-time
+  constants. Nothing widens the budget on a cheap frame or narrows it after an
+  overrun.
+- **Three worker pools each spawn `available_parallelism()` threads**
+  (`mesh_worker.rs:45`, `chunkgen_worker.rs:3162`, `lighting_worker.rs:28`), all
+  at default OS priority. On an 8-thread CPU that is up to 24 runnable workers
+  competing with the one thread that has to simulate *and* render. A main thread
+  that respects its budget perfectly still loses wall-clock time here, so budget
+  work alone cannot close this.
+- **The world can only be mutated on the frame thread.** `World.chunks` is a
+  plain `HashMap<ChunkCoord, Chunk>` (`world/mod.rs:51`) owned by `State`
+  (`state.rs:5532`), so applying a generated chunk needs `&mut World` inline.
+  This is the structural reason apply, lighting hooks and fluid bootstrap cannot
+  move off the frame thread today.
+- **GPU resources are created inside the frame.** `upload_cpu_mesh_to_gpu_reuse`
+  (`mesh_gpu.rs:203`) calls `device.create_buffer` + `queue.write_buffer` on the
+  frame thread; buffer creation is a driver allocation whose cost lands *after*
+  the budget check that admitted it.
+
+Work items, in the order they should be attempted:
+
+1. **Bound per-item overshoot first** (already listed below as "stop a single
+   item from blowing a stage budget"). A frame-level budget is only as tight as
+   its worst single item, and the measured worst items are far above any frame
+   budget: removal lighting was 8-19 ms *per chunk* while chunk apply is
+   0.51 ms. Until one item cannot exceed its stage, a frame controller cannot
+   hold a deadline.
+2. **Replace the independent constants with one frame-level admission
+   controller.** Derive the frame's total streaming allowance from the actual
+   deadline (present mode is `Fifo` by default, see `preferred_present_mode`,
+   `state.rs:10689`), subtract the measured cost of the parts that are not
+   optional (sim, render, present), and hand each stage a *share of what
+   remains* instead of its own constant. Generalise `stream_budget_for_stage_ms`
+   into that single allowance and route every stage through it. Give each stage
+   a guaranteed floor so streaming cannot starve — the existing
+   `if iterations > 0 && elapsed >= budget` pattern already guarantees one item
+   of progress per stage, so the floor is free.
+3. **Close the feedback loop.** Feed the previous frames' measured
+   `frame_dt_ms` (already written per frame to `gpu.csv`) into the allowance as
+   an EMA: shrink after overruns, grow while frames sit under the deadline.
+   This is what makes the result hold on hardware that was never measured, and
+   it is why the constants must go rather than be retuned.
+4. **Measure and fix CPU oversubscription.** Size the three pools against one
+   shared thread total (or a single shared pool) instead of each taking
+   `available_parallelism()`, and/or drop worker priority below the frame
+   thread. Gate on measurement: run a fixed scene, compare per-stage main-thread
+   scope times with pools saturated vs. capped. If the main thread's own scope
+   times inflate while its item counts stay constant, the loss is OS scheduling
+   and no budget change will recover it.
+5. **Move GPU buffer creation out of the frame.** Do the arena suballocation
+   item below first (it removes most allocations outright); afterwards decide
+   whether the remaining create+write should move to an upload thread — wgpu 28
+   `Device`/`Queue` are cheap to clone and `Send`, so a worker can hand finished
+   `ChunkMesh` values to the frame thread.
+6. **Only then consider making world mutation concurrent** (per-chunk locks, or
+   a double-buffered insert queue swapped once per frame). This is the large,
+   risky change; steps 1-5 must fail to close the gap before it is justified.
+
+Related items already listed below that are part of this problem, not separate
+from it: the mesh-job priority inversion, the mesh GPU suballocation, moving
+incremental lighting onto the idle `LightingWorkerPool`, stepping chunk-removal
+lighting, and the per-item stage watchdog.
+
+Acceptance: a fixed scene flown at constant speed through ungenerated terrain,
+with `gpu.csv` captured for the whole run. The metric is **p99 `frame_dt_ms`
+while streaming vs. p99 while standing still in already-loaded terrain** — an
+average hides exactly the spikes that are the complaint. Record applied
+chunks/second in the same run, otherwise a "fix" that simply streams slower
+looks like a win. The startup burst path stays exempt: it runs behind the
+loading screen, where throughput legitimately outranks frame time.
+
+### Other performance work
+
 - finish the streaming-lag hunt — the open half of the reported symptom. Measured after the fixes in `07_performance_rendering_audit.md`: streaming frames are median **10.6 ms / p90 53.1 ms**, and `state.process_dirty_chunk_meshes` alone is **mean 12.9 ms**, ~60 % of a 21 ms frame. Chunk apply is no longer the cost (104 ms → 0.51 ms per applied chunk). The p90 spikes are what feels laggy, and they never cross the 200 ms stall threshold, so no stall report ever contained them. Open: where the remaining ~9 ms/frame inside `process_dirty_chunk_meshes` goes. The `gpu.csv` breakdown columns answer this from one normal play session — read them before changing anything else here
 - document reproducible startup and streaming benchmark scenes as a baseline
 - measure startup warmup and first-playable-frame timing under fixed scenes
@@ -64,7 +165,7 @@ When an item ships, delete it from here instead of marking it done.
 - continue consolidating legacy worldgen/storage paths that still duplicate logic
 - preset-specific worldgen tuning with snapshot tests
 - refine additional upload/dispatch metrics in the debug overlay
-- give the stall ring buffer a useful window: it is capped at `RING_MAX_EVENTS = 8192`, which under streaming load covers only ~900 ms instead of the intended 10 s, so whatever caused a stall has usually been evicted before the report is written. Either raise the cap or cut per-frame event volume
+- ~~give the stall ring buffer a useful window~~ **done**: the flat `RING_MAX_EVENTS = 8192` cap is gone. `perf/trace.rs` now evicts by retention time with a 16 MB byte budget as the backstop (`MC_KLON_TRACE_RING_MB` overrides), which holds >10 s at the measured ~9.1 k events/s. Thread labels are `Arc<str>` (one allocation per thread instead of a `String` clone per event) and `push_ring` no longer re-reads the clock. The stall report header prints the **actual** covered span, event count and `dropped_by_budget`, so a truncated window is no longer indistinguishable from a complete one
 - the stall summary's coarse `tops=[…]` list aggregates by subsystem counter, so cost can be attributed to the wrong system (unload-triggered lighting showed up as `lighting=188.0ms`). An `unload` bucket was added; check the remaining buckets for the same aliasing
 - complete ticking-area workflows (radius/flags/UX) beyond the shortcut baseline
 - mesh-job priority inversion (`state.rs:5678`): the mesh job channel is `unbounded` and workers are FIFO, so dispatch order freezes priority at enqueue time and far chunks get meshed ahead of near ones (`inflight(mesh=148)`, upload waits up to 413 ms in older logs). The dirty queue is already reprioritized every frame, so the fix is to cap in-flight jobs and keep the rest in the reorderable queue. Needs measurement first: a wrong in-flight limit trades stutter for starvation
