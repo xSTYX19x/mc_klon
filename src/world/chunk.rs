@@ -274,10 +274,22 @@ impl PalettedBlocks {
         }
 
         let bits = (usize::BITS - (palette.len().max(2) - 1).leading_zeros()).max(1) as u8;
+        // `BLOCK_COUNT * bits` is always a multiple of 64, so the last entry
+        // ends exactly on a word boundary and the carry below never runs past
+        // the end.
         let mut words = vec![0u64; Chunk::BLOCK_COUNT * bits as usize / 64];
         for (i, &index) in indices.iter().enumerate() {
             let bit = i * bits as usize;
-            words[bit / 64] |= u64::from(index) << (bit % 64);
+            let word = bit / 64;
+            let offset = bit % 64;
+            words[word] |= u64::from(index) << offset;
+            // Widths that do not divide 64 (3, 5, 6, 7 bits) leave entries
+            // straddling a word boundary; the high part belongs to the next
+            // word. Dropping it silently corrupted every section with 5 or more
+            // distinct blocks.
+            if offset + bits as usize > 64 {
+                words[word + 1] |= u64::from(index) >> (64 - offset);
+            }
         }
         Self {
             palette,
@@ -287,19 +299,27 @@ impl PalettedBlocks {
     }
 
     #[inline(always)]
+    fn raw_index(&self, voxel: usize) -> u64 {
+        let bits = self.bits as usize;
+        let bit = voxel * bits;
+        let word = bit / 64;
+        let offset = bit % 64;
+        let mut raw = self.words[word] >> offset;
+        if offset + bits > 64 {
+            // `offset` is non-zero here (bits <= 8), so the shift is in range.
+            raw |= self.words[word + 1] << (64 - offset);
+        }
+        raw & ((1u64 << bits) - 1)
+    }
+
+    #[inline(always)]
     fn get(&self, voxel: usize) -> BlockId {
-        let bit = voxel * self.bits as usize;
-        let mask = (1u64 << self.bits) - 1;
-        let raw = (self.words[bit / 64] >> (bit % 64)) & mask;
-        self.palette[raw as usize]
+        self.palette[self.raw_index(voxel) as usize]
     }
 
     fn decode_into(&self, dst: &mut [BlockId]) {
-        let mask = (1u64 << self.bits) - 1;
         for (i, slot) in dst.iter_mut().enumerate() {
-            let bit = i * self.bits as usize;
-            let raw = (self.words[bit / 64] >> (bit % 64)) & mask;
-            *slot = self.palette[raw as usize];
+            *slot = self.palette[self.raw_index(i) as usize];
         }
     }
 
@@ -465,6 +485,7 @@ pub(crate) struct ChunkCoord {
 mod block_storage_tests {
     use super::{Chunk, ChunkBlocks, block_data_arc};
     use crate::blocks::BlockId;
+    use crate::world::CHUNK_SIZE;
     use std::sync::Arc;
 
     fn flat_section(fill: BlockId) -> Vec<BlockId> {
@@ -520,6 +541,49 @@ mod block_storage_tests {
         let mut range = vec![BlockId::Air; 16];
         compact.copy_range_into(0, &mut range);
         assert_eq!(range, blocks[..16]);
+    }
+
+    #[test]
+    fn every_palette_width_round_trips() {
+        // Regression: entries straddling a 64-bit word boundary used to lose
+        // their high bits, which silently corrupted every section whose palette
+        // needed a width that does not divide 64 (5..=8 distinct blocks and up).
+        // The earlier tests all happened to use <= 4 blocks, i.e. 2 bits.
+        let ids: Vec<BlockId> = (0u16..=255)
+            .filter_map(|raw| BlockId::from_u8(raw as u8).ok())
+            .collect();
+        assert!(ids.len() >= 9, "need enough block ids to exercise 4 bits");
+
+        for distinct in 1..=ids.len() {
+            let mut blocks = Vec::with_capacity(Chunk::BLOCK_COUNT);
+            for i in 0..Chunk::BLOCK_COUNT {
+                blocks.push(ids[i % distinct]);
+            }
+            let stored = ChunkBlocks::compact(blocks.clone());
+            assert_eq!(
+                stored.to_vec(),
+                blocks,
+                "bulk decode wrong for {distinct} distinct blocks"
+            );
+            for (index, &block) in blocks.iter().enumerate() {
+                assert_eq!(
+                    stored.get(index),
+                    block,
+                    "single read wrong at {index} for {distinct} distinct blocks"
+                );
+            }
+            // The path the meshing neighborhood actually uses: one 16-wide run
+            // per (y, z), i.e. every possible bit offset within a word.
+            let mut run = vec![BlockId::Air; CHUNK_SIZE as usize];
+            for start in (0..Chunk::BLOCK_COUNT).step_by(CHUNK_SIZE as usize) {
+                stored.copy_range_into(start, &mut run);
+                assert_eq!(
+                    run.as_slice(),
+                    &blocks[start..start + CHUNK_SIZE as usize],
+                    "range copy wrong at {start} for {distinct} distinct blocks"
+                );
+            }
+        }
     }
 
     #[test]
@@ -728,6 +792,11 @@ mod storage_report {
         let rounds = if cfg!(debug_assertions) { 2 } else { 200 };
         let mut scratch = vec![BlockId::Air; VOXELS];
 
+        // Single timing runs swing by 50 % here, so take the minimum of a few
+        // attempts: the fastest run is the one least polluted by other load.
+        let best_of = |mut attempt: Box<dyn FnMut() -> f64 + '_>| {
+            (0..5).map(|_| attempt()).fold(f64::INFINITY, f64::min)
+        };
         let bulk_ns = |storage: &[ChunkBlocks], scratch: &mut Vec<BlockId>| {
             let start = Instant::now();
             for _ in 0..rounds {
@@ -738,8 +807,8 @@ mod storage_report {
             }
             start.elapsed().as_nanos() as f64 / (rounds * storage.len()) as f64
         };
-        let flat_bulk = bulk_ns(&flat, &mut scratch);
-        let compact_bulk = bulk_ns(&compact, &mut scratch);
+        let flat_bulk = best_of(Box::new(|| bulk_ns(&flat, &mut scratch)));
+        let compact_bulk = best_of(Box::new(|| bulk_ns(&compact, &mut scratch)));
 
         // Scattered single reads at a realistic resident size — the pattern the
         // light BFS uses, and the only one where the compact form costs.
@@ -773,8 +842,8 @@ mod storage_report {
             }
             start.elapsed().as_nanos() as f64 / (big_rounds * probes.len()) as f64
         };
-        let flat_random = random_ns(&big_flat);
-        let compact_random = random_ns(&big_compact);
+        let flat_random = best_of(Box::new(|| random_ns(&big_flat)));
+        let compact_random = best_of(Box::new(|| random_ns(&big_compact)));
 
         println!(
             "\nbulk decode into the meshing staging buffer: flat {:.2} us | compact {:.2} us ({:+.2} us per mesh job, {:.3} % of a 12.9 ms mesh pass)",
