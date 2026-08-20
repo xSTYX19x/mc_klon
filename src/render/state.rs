@@ -68,6 +68,7 @@ use crate::meshing::{
     CpuMeshData, FULLBRIGHT_LIGHT_PACKED, MeshLayerMask, Vertex, WorldVertex,
     face_corner_ao_shades, face_from_normal, face_shade,
 };
+use super::lighting_budget::LightingFrameBudget;
 use crate::perf::stage_budget::StageBudgetWatchdog;
 use crate::perf::trace as perf_trace;
 use crate::player::PlayerMode;
@@ -1264,6 +1265,22 @@ const STREAM_CHUNK_LIGHTING_FRAME_BUDGET_MS: f32 = 6.0;
 /// regardless, which only worked because chunk eviction repaired its own lighting
 /// synchronously. It no longer does.
 const STREAM_CHUNK_LIGHTING_REMOVED_FRAME_BUDGET_MS: f32 = 3.0;
+/// One shared per-frame CPU budget for all three incremental lighting stages.
+///
+/// They used to hold private budgets that ran back to back, so their worst cases
+/// added up to 1.5 + 6.0 + 3.0 = 10.5 ms of a 16.6 ms frame. The shared budget
+/// caps the stack *and* raises throughput for whichever stage is actually busy:
+/// during pure streaming the chunk-add pump can now use the whole 7 ms instead
+/// of its old private 6 ms. The per-stage constants above stay in force as caps.
+const LIGHTING_FRAME_BUDGET_MS: f32 = 7.0;
+/// Kept back by the block-edit stage for the two behind it.
+const LIGHTING_BLOCK_EDIT_STAGE_RESERVE_MS: f32 = 2.0;
+/// Kept back by the chunk-add stage for the removal stage behind it.
+const LIGHTING_CHUNK_ADDED_STAGE_RESERVE_MS: f32 = 1.0;
+/// Every stage gets at least this much even on an exhausted budget, so none of
+/// them can be starved into an unbounded backlog. Costs at most one bounded step.
+const LIGHTING_STAGE_FLOOR_MS: f32 = 0.25;
+
 /// Console rate limit for stage-budget overruns. The trace event is unthrottled.
 const STAGE_BUDGET_OVERRUN_LOG_INTERVAL: Duration = Duration::from_secs(5);
 /// Must stay above `FRAME_BUDGET_MS / STEP_BUDGET_MS`, otherwise the step count
@@ -17030,11 +17047,15 @@ impl State {
         );
     }
 
-    fn pump_chunk_added_lighting_jobs(&mut self) {
+    fn pump_chunk_added_lighting_jobs(&mut self, budget: &LightingFrameBudget) {
         let _trace_scope = perf_trace::scope("render.lighting.step");
         let started = Instant::now();
-        let frame_budget =
-            Duration::from_secs_f32((STREAM_CHUNK_LIGHTING_FRAME_BUDGET_MS / 1000.0).max(0.0));
+        let stage_budget_ms = budget.stage_budget_ms(
+            STREAM_CHUNK_LIGHTING_FRAME_BUDGET_MS,
+            LIGHTING_CHUNK_ADDED_STAGE_RESERVE_MS,
+            LIGHTING_STAGE_FLOOR_MS,
+        );
+        let frame_budget = Duration::from_secs_f32((stage_budget_ms / 1000.0).max(0.0));
         let step_limits = IncrementalLightingStepLimits {
             max_voxels_visited: STREAM_CHUNK_LIGHTING_MAX_VOXELS_PER_STEP,
             max_wall_clock: Duration::from_secs_f32(
@@ -17063,7 +17084,7 @@ impl State {
             steps += 1;
             self.stage_budget_watchdog.record(
                 "lighting.chunk_added_step",
-                STREAM_CHUNK_LIGHTING_FRAME_BUDGET_MS,
+                stage_budget_ms,
                 step_ms,
                 || {
                     format!(
@@ -17151,11 +17172,14 @@ impl State {
     /// The batch is turned into an `IncrementalLightingTask` and stepped under
     /// the same per-step voxel/wall-clock limits, so one oversized batch can no
     /// longer run past the stage budget: it just resumes next frame.
-    fn pump_removed_lighting_batches(&mut self) {
+    fn pump_removed_lighting_batches(&mut self, budget: &LightingFrameBudget) {
         let started = Instant::now();
-        let frame_budget = Duration::from_secs_f32(
-            (STREAM_CHUNK_LIGHTING_REMOVED_FRAME_BUDGET_MS / 1000.0).max(0.0),
+        let stage_budget_ms = budget.stage_budget_ms(
+            STREAM_CHUNK_LIGHTING_REMOVED_FRAME_BUDGET_MS,
+            0.0,
+            LIGHTING_STAGE_FLOOR_MS,
         );
+        let frame_budget = Duration::from_secs_f32((stage_budget_ms / 1000.0).max(0.0));
         let step_limits = IncrementalLightingStepLimits {
             max_voxels_visited: STREAM_CHUNK_LIGHTING_MAX_VOXELS_PER_STEP,
             max_wall_clock: Duration::from_secs_f32(
@@ -17178,7 +17202,7 @@ impl State {
             steps += 1;
             self.stage_budget_watchdog.record(
                 "lighting.chunk_removed_step",
-                STREAM_CHUNK_LIGHTING_REMOVED_FRAME_BUDGET_MS,
+                stage_budget_ms,
                 step_ms,
                 || {
                     format!(
@@ -17515,10 +17539,14 @@ impl State {
         );
     }
 
-    fn pump_block_edit_lighting_repairs(&mut self) {
+    fn pump_block_edit_lighting_repairs(&mut self, budget: &LightingFrameBudget) {
         let started = Instant::now();
-        let frame_budget =
-            Duration::from_secs_f32((BLOCK_EDIT_LIGHTING_FRAME_BUDGET_MS / 1000.0).max(0.0));
+        let stage_budget_ms = budget.stage_budget_ms(
+            BLOCK_EDIT_LIGHTING_FRAME_BUDGET_MS,
+            LIGHTING_BLOCK_EDIT_STAGE_RESERVE_MS,
+            LIGHTING_STAGE_FLOOR_MS,
+        );
+        let frame_budget = Duration::from_secs_f32((stage_budget_ms / 1000.0).max(0.0));
         let step_limits = LocalizedLightingRepairStepLimits {
             max_voxels_visited: BLOCK_EDIT_LIGHTING_MAX_VOXELS_PER_STEP,
             max_wall_clock: Duration::from_secs_f32(
@@ -17545,7 +17573,7 @@ impl State {
             steps += 1;
             self.stage_budget_watchdog.record(
                 "lighting.block_edit_step",
-                BLOCK_EDIT_LIGHTING_FRAME_BUDGET_MS,
+                stage_budget_ms,
                 step_ms,
                 || {
                     format!(
@@ -17949,9 +17977,25 @@ impl State {
     fn rebuild_world_lighting_if_dirty(&mut self) {
         let _trace_scope = perf_trace::scope("state.rebuild_world_lighting_if_dirty");
         self.pump_lighting_results();
-        self.pump_removed_lighting_batches();
-        self.pump_chunk_added_lighting_jobs();
-        self.pump_block_edit_lighting_repairs();
+        // Order is priority order for the shared budget: block edits are the
+        // player's own action and must feel immediate, freshly streamed chunks
+        // are visible next, and removal lighting only fixes neighbors of chunks
+        // that just left the view. Each stage keeps a reserve for the ones
+        // behind it, and every stage has a floor, so the order sets priority
+        // without starving anyone.
+        let budget = LightingFrameBudget::new(LIGHTING_FRAME_BUDGET_MS);
+        self.pump_block_edit_lighting_repairs(&budget);
+        self.pump_chunk_added_lighting_jobs(&budget);
+        self.pump_removed_lighting_batches(&budget);
+        perf_trace::record_duration_ms(
+            "lighting.frame_budget",
+            budget.used_ms(),
+            &format!(
+                "budget_ms={:.2} remaining_ms={:.2}",
+                budget.total_ms(),
+                budget.remaining_ms()
+            ),
+        );
         self.pump_pending_lighting_dirty_chunk_marks();
         self.schedule_lighting_rebuild_if_needed();
     }

@@ -56,6 +56,8 @@ When an item ships, delete it from here instead of marking it done.
 
 ## Performance
 
+- **Referenzmessung 2026-08-20: Chunk-Streaming ~50 FPS (vorher 10-20).** Details und Ursachenkette in `docs/07_performance_rendering_audit.md` → "Nachtrag 2026-08-20". Vor weiterem Streaming-Tuning einen frischen `stall.txt` + `gpu.csv` aufnehmen — alle Messwerte unten stammen von *vor* dieser Runde
+
 ### Decouple frame rate from chunk streaming
 
 Frame time must stop tracking streaming activity. Today it does, and not by
@@ -106,7 +108,11 @@ What was verified in the code before writing this item:
 Work items, in the order they should be attempted:
 
 1. **Bound per-item overshoot first** (already listed below as "stop a single
-   item from blowing a stage budget"). A frame-level budget is only as tight as
+   item from blowing a stage budget"). *Stand 2026-08-20: der Watchdog meldet
+   solche Items jetzt aggregiert pro Frame (`src/perf/stage_budget.rs`), und der
+   gemessene Worst Case (Removal-Lighting, 8-19 ms pro Chunk) ist gestuft und
+   damit weg. Das Muster selbst bleibt: jede Stage kann weiterhin um einen
+   begrenzten Step überziehen.* A frame-level budget is only as tight as
    its worst single item, and the measured worst items are far above any frame
    budget: removal lighting was 8-19 ms *per chunk* while chunk apply is
    0.51 ms. Until one item cannot exceed its stage, a frame controller cannot
@@ -121,6 +127,18 @@ Work items, in the order they should be attempted:
    a guaranteed floor so streaming cannot starve — the existing
    `if iterations > 0 && elapsed >= budget` pattern already guarantees one item
    of progress per stage, so the floor is free.
+
+   **Teilweise umgesetzt (2026-08-20), bisher nur für Lighting:**
+   `LightingFrameBudget` (`src/render/lighting_budget.rs`) ersetzt die drei
+   privaten Lighting-Budgets (1.5 + 6.0 + 3.0 = 10.5 ms) durch **ein** geteiltes
+   7-ms-Budget, vergeben in Prioritätsreihenfolge Block-Edit → Chunk-Add →
+   Chunk-Remove. Jede Stage behält ihren alten Wert als Cap, hält eine Reserve
+   für die Stages hinter sich zurück und hat einen Starvation-Floor von 0.25 ms.
+   Das ist die Form, die dieser Punkt für *alle* Stages verlangt — die Vorlage
+   steht, die Allowance ist aber weiterhin eine Konstante statt aus dem Frame-
+   Deadline abgeleitet (das bleibt Punkt 3). Offen für die nächste Messung: ob
+   7.0 ms der richtige Wert ist und ob der Removal-Backlog unter Dauer-Unload
+   mit dem Floor auskommt.
 3. **Close the feedback loop.** Feed the previous frames' measured
    `frame_dt_ms` (already written per frame to `gpu.csv`) into the allowance as
    an EMA: shrink after overruns, grow while frames sit under the deadline.
