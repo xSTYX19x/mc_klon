@@ -80,11 +80,12 @@ pub(crate) enum InputAction {
     OpenInventory,
     OpenChat,
     OpenTickingAreas,
+    Screenshot,
     PauseMenu,
 }
 
 impl InputAction {
-    pub(crate) const ALL: [Self; 11] = [
+    pub(crate) const ALL: [Self; 12] = [
         Self::MoveForward,
         Self::MoveBackward,
         Self::MoveLeft,
@@ -95,6 +96,7 @@ impl InputAction {
         Self::OpenInventory,
         Self::OpenChat,
         Self::OpenTickingAreas,
+        Self::Screenshot,
         Self::PauseMenu,
     ];
 
@@ -110,7 +112,8 @@ impl InputAction {
             Self::OpenInventory => 7,
             Self::OpenChat => 8,
             Self::OpenTickingAreas => 9,
-            Self::PauseMenu => 10,
+            Self::Screenshot => 10,
+            Self::PauseMenu => 11,
         }
     }
 
@@ -126,6 +129,7 @@ impl InputAction {
             Self::OpenInventory => "Inventory",
             Self::OpenChat => "Chat",
             Self::OpenTickingAreas => "Ticking areas",
+            Self::Screenshot => "Screenshot",
             Self::PauseMenu => "Pause menu",
         }
     }
@@ -142,6 +146,7 @@ impl InputAction {
             Self::OpenInventory => KeyCode::KeyB,
             Self::OpenChat => KeyCode::KeyT,
             Self::OpenTickingAreas => KeyCode::KeyK,
+            Self::Screenshot => KeyCode::F2,
             Self::PauseMenu => KeyCode::Escape,
         }
     }
@@ -221,6 +226,7 @@ struct SavedInputBindings {
     open_inventory: String,
     open_chat: String,
     open_ticking_areas: String,
+    screenshot: String,
     pause_menu: String,
 }
 
@@ -245,6 +251,7 @@ impl SavedInputBindings {
             open_ticking_areas: keycode_config_name(
                 bindings.key_for(InputAction::OpenTickingAreas),
             ),
+            screenshot: keycode_config_name(bindings.key_for(InputAction::Screenshot)),
             pause_menu: keycode_config_name(bindings.key_for(InputAction::PauseMenu)),
         }
     }
@@ -263,6 +270,7 @@ impl SavedInputBindings {
             (InputAction::OpenInventory, self.open_inventory),
             (InputAction::OpenChat, self.open_chat),
             (InputAction::OpenTickingAreas, self.open_ticking_areas),
+            (InputAction::Screenshot, self.screenshot),
             (InputAction::PauseMenu, self.pause_menu),
         ];
         for (action, raw) in entries {

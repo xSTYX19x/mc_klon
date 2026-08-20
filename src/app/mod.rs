@@ -434,6 +434,20 @@ impl App {
         }
     }
 
+    fn take_screenshot(&mut self) {
+        // The capture happens on the next rendered frame; the encoder thread
+        // reports the final path (or the failure) to the console.
+        let armed = self
+            .state
+            .as_mut()
+            .is_some_and(|state| state.request_screenshot());
+        if !armed {
+            crate::console_error!(
+                "Screenshot unavailable: this GPU/backend cannot read back the window surface."
+            );
+        }
+    }
+
     fn toggle_debug_overlay(&mut self) {
         self.show_debug_overlay = !self.show_debug_overlay;
         crate::console_info!(
@@ -2792,6 +2806,22 @@ impl ApplicationHandler for App {
                     && matches!(&self.game_state, GameState::WorldActions(menu) if menu.rename_input.is_some())
                     && self.handle_world_rename_key(code, event.text.as_deref())
                 {
+                    return;
+                }
+
+                // Skipped while the Controls screen is capturing a key, so the
+                // screenshot key itself stays rebindable.
+                let awaiting_rebind = matches!(
+                    &self.game_state,
+                    GameState::Options(options) if options.awaiting_rebind.is_some()
+                );
+                if !awaiting_rebind
+                    && event.state == ElementState::Pressed
+                    && !event.repeat
+                    && let Some(code) = code
+                    && code == self.settings.controls.key_for(InputAction::Screenshot)
+                {
+                    self.take_screenshot();
                     return;
                 }
 
