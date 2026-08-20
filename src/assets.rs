@@ -211,6 +211,32 @@ pub(crate) fn normalize_relative(key: &str) -> String {
         .to_string()
 }
 
+/// Creates `resourcepacks/` next to `save/`, `logs/` and `screenshots/` if it is
+/// missing, so there is a visible place to drop packs into before any exist.
+pub(crate) fn ensure_resource_pack_dir() {
+    match ensure_pack_dir_in(Path::new(".")) {
+        Ok(Some(path)) => crate::console_info!(
+            "[assets] created {} - drop resource pack folders or .zip files here",
+            path.display()
+        ),
+        Ok(None) => {}
+        Err(err) => {
+            crate::console_error!("[assets] could not create {RESOURCE_PACK_DIR}/: {err}")
+        }
+    }
+}
+
+/// Returns `Ok(Some(path))` only when the directory was actually created, so an
+/// existing pack folder is never touched or reported twice.
+fn ensure_pack_dir_in(root: &Path) -> std::io::Result<Option<PathBuf>> {
+    let path = root.join(RESOURCE_PACK_DIR);
+    if path.is_dir() {
+        return Ok(None);
+    }
+    fs::create_dir_all(&path)?;
+    Ok(Some(path))
+}
+
 /// Every pack under `resourcepacks/`, sorted by id so the options row keeps a
 /// stable order across launches.
 pub(crate) fn list_packs() -> Vec<ResourcePack> {
@@ -481,6 +507,31 @@ mod tests {
         for dir in [flat, mojang, empty] {
             let _ = fs::remove_dir_all(dir);
         }
+    }
+
+    /// The folder has to exist before anyone can put a pack in it, and a second
+    /// launch must neither fail nor disturb what is already in there.
+    #[test]
+    fn ensuring_the_pack_dir_is_idempotent() {
+        let dir = temp_dir("ensure");
+        let packs = dir.join(RESOURCE_PACK_DIR);
+        assert!(!packs.exists());
+
+        let created = ensure_pack_dir_in(&dir).unwrap();
+        assert_eq!(
+            created.as_deref(),
+            Some(packs.as_path()),
+            "first run creates"
+        );
+        assert!(packs.is_dir());
+
+        let marker = packs.join("keep.txt");
+        fs::write(&marker, b"keep").unwrap();
+
+        let again = ensure_pack_dir_in(&dir).unwrap();
+        assert_eq!(again, None, "second run reports nothing new");
+        assert_eq!(fs::read(&marker).unwrap(), b"keep", "contents survive");
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

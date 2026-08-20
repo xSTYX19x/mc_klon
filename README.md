@@ -76,7 +76,8 @@ Note: hotbar selection through number keys `1..9` is still not wired.
 
 ## Resource Packs
 
-- Drop a pack into `resourcepacks/` as a folder or a `.zip`, then pick it under Options -> Video / Graphics
+- `resourcepacks/` is created next to `save/`, `logs/` and `screenshots/` on first launch
+- Drop a pack in as a folder or a `.zip`, then pick it under Options -> Video / Graphics
 - Both layouts are detected: `textures/...` and `assets/minecraft/textures/...` (folder or archive root)
 - A pack is an overlay: anything it does not ship falls back to the bundled `assets/minecraft`
 - `.mcmeta` animation sidecars are read from the same pack as their texture

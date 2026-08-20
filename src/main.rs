@@ -33,6 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let _ = perf::trace::trace_init();
+    assets::ensure_resource_pack_dir();
     let result = app::run();
     perf::trace::trace_shutdown();
     result
