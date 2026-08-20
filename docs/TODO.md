@@ -61,8 +61,7 @@ When an item ships, delete it from here instead of marking it done.
 ## UI / UX
 
 - keep expanding the options UI without reintroducing scattered hard-coded runtime settings
-- [x] auswählbare Texture-Packs (Ordner) *(umgesetzt, wartet auf Verifikation)*
-- support texture packs as `.zip` archives, not just folders: pack loading in `texture_registry.rs`/`src/texture.rs` (`resolve_path`, `load_png_rgba`) assumes a flat filesystem folder — add a `zip` crate dependency and an abstraction (e.g. a small `PackSource` trait with folder and zip implementations) so `resolve_path`/PNG loads read through either a real directory or an in-memory zip archive index, needed before per-pack switching (above) is worth exposing to users
+- [x] Texture-Packs als `.zip` *(umgesetzt, wartet auf Verifikation)*
 
 ## Gameplay
 

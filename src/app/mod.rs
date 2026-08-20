@@ -228,6 +228,9 @@ struct OptionsMenuState {
     status_line: Option<String>,
     /// Armed by the first activation of a reset row; the second activation performs it.
     pending_reset: Option<SettingsScope>,
+    /// Installed pack ids, scanned once when the screen opens instead of every
+    /// frame the Graphics rows are rendered.
+    texture_packs: Vec<String>,
 }
 
 const WORLD_ACTION_ROW_LOAD: usize = 0;
@@ -1245,6 +1248,7 @@ impl App {
                 awaiting_rebind: None,
                 status_line: None,
                 pending_reset: None,
+                texture_packs: Self::available_texture_pack_ids(),
             }),
             MenuScreen::WorldActions(save_root) => {
                 GameState::WorldActions(self.build_world_actions_state(save_root, entry.selected))
@@ -1467,7 +1471,7 @@ impl App {
                     changed = true;
                 }
                 OptionsScreen::Graphics if options.selected == 4 => {
-                    let packs = Self::available_texture_pack_ids();
+                    let packs = options.texture_packs.clone();
                     let current = self
                         .settings
                         .graphics
@@ -2360,7 +2364,7 @@ impl App {
                                     .texture_pack
                                     .as_deref()
                                     .unwrap_or(DEFAULT_PACK_LABEL),
-                                if Self::available_texture_pack_ids().is_empty() {
+                                if options.texture_packs.is_empty() {
                                     format!(" (none installed in {RESOURCE_PACK_DIR}/)")
                                 } else {
                                     String::new()

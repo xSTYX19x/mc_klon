@@ -1,14 +1,14 @@
 use anyhow::{Context, Result, ensure};
-use std::path::Path;
 
-/// CPU-seitiger PNG-Loader:
-/// - liest eine PNG von Disk
-/// - dekodiert in RGBA8 (row-major, 4 bytes/pixel)
+/// CPU-seitiger PNG-Decoder:
+/// - dekodiert PNG-Bytes in RGBA8 (row-major, 4 bytes/pixel)
 /// - gibt (width, height, raw_rgba) zurück
-pub fn load_png_rgba(path: impl AsRef<Path>) -> Result<(u32, u32, Vec<u8>)> {
-    let path = path.as_ref();
-    let image = image::open(path)
-        .with_context(|| format!("failed to decode PNG at '{}'", path.display()))?;
+///
+/// Nimmt Bytes statt eines Pfades, damit Assets auch aus einem Zip-Pack kommen
+/// können; `label` taucht nur in Fehlermeldungen auf.
+pub fn decode_png_rgba(bytes: &[u8], label: &str) -> Result<(u32, u32, Vec<u8>)> {
+    let image = image::load_from_memory(bytes)
+        .with_context(|| format!("failed to decode PNG at '{label}'"))?;
     let rgba = image.to_rgba8();
     let (width, height) = rgba.dimensions();
     Ok((width, height, rgba.into_raw()))

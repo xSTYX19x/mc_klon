@@ -83,7 +83,7 @@ use crate::storage::{
     RegionStorage, StorageColumnLoadStatus, StorageColumnSaveResult, StorageLoadWorker,
     StorageWorker, WorldStorage,
 };
-use crate::texture::{TextureArray, load_png_rgba};
+use crate::texture::{TextureArray, decode_png_rgba};
 use crate::texture_registry::TextureRegistry;
 use crate::world::block_entities_system::BlockEntitiesSystem;
 use crate::world::fluids::{
@@ -2138,15 +2138,13 @@ fn centered_uv_rect(
 }
 
 fn load_gui_sprite_logical_rgba(
-    asset_root: &Path,
+    source: &AssetSource,
     texture_key: &str,
     logical_width: u32,
     logical_height: u32,
 ) -> io::Result<(u32, u32, Vec<u8>)> {
-    let rel_path = relative_asset_path_from_key(texture_key);
-    let sprite_path = asset_root.join(rel_path);
     let (src_w, src_h, src_rgba) =
-        load_png_rgba(&sprite_path).map_err(|err| io::Error::other(err.to_string()))?;
+        read_asset_png(source, texture_key).map_err(|err| io::Error::other(err.to_string()))?;
     let scale_x = (src_w / logical_width.max(1)).max(1);
     let scale_y = (src_h / logical_height.max(1)).max(1);
     let scale = scale_x.min(scale_y).max(1);
@@ -2158,6 +2156,15 @@ fn load_gui_sprite_logical_rgba(
         src_rgba
     };
     Ok((dst_w, dst_h, dst_rgba))
+}
+
+/// Reads an asset through the resource pack chain and decodes it as RGBA8.
+fn read_asset_png(source: &AssetSource, key: &str) -> anyhow::Result<(u32, u32, Vec<u8>)> {
+    let location = source.describe(key);
+    let bytes = source
+        .read(key)
+        .ok_or_else(|| anyhow::anyhow!("missing asset '{key}' (looked at '{location}')"))?;
+    decode_png_rgba(&bytes, &location)
 }
 
 fn relative_asset_path_from_key(texture_key: &str) -> &str {
@@ -9064,20 +9071,18 @@ impl State {
             "World Texture BindGroup",
         );
 
-        let sun_path = asset_source.resolve("textures/environment/sun.png");
-        let (sun_w, sun_h, mut sun_rgba) = load_png_rgba(&sun_path)
-            .unwrap_or_else(|err| panic!("failed to load sky sun texture: {}", err));
-        let moon_path = asset_source.resolve("textures/environment/moon_phases.png");
-        let (moon_w, moon_h, mut moon_rgba) = load_png_rgba(&moon_path)
-            .unwrap_or_else(|err| panic!("failed to load sky moon texture: {}", err));
-        let panorama_paths = std::array::from_fn::<_, MENU_PANORAMA_FACE_COUNT, _>(|index| {
-            asset_source.resolve(&format!(
-                "textures/gui/title/background/panorama_{index}.png"
-            ))
-        });
-        let panorama_faces = panorama_paths.map(|path| {
-            load_png_rgba(&path)
-                .unwrap_or_else(|err| panic!("failed to load menu panorama texture: {}", err))
+        let (sun_w, sun_h, mut sun_rgba) =
+            read_asset_png(&asset_source, "textures/environment/sun.png")
+                .unwrap_or_else(|err| panic!("failed to load sky sun texture: {}", err));
+        let (moon_w, moon_h, mut moon_rgba) =
+            read_asset_png(&asset_source, "textures/environment/moon_phases.png")
+                .unwrap_or_else(|err| panic!("failed to load sky moon texture: {}", err));
+        let panorama_faces = std::array::from_fn::<_, MENU_PANORAMA_FACE_COUNT, _>(|index| {
+            read_asset_png(
+                &asset_source,
+                &format!("textures/gui/title/background/panorama_{index}.png"),
+            )
+            .unwrap_or_else(|err| panic!("failed to load menu panorama texture: {}", err))
         });
         apply_black_alpha_mask(&mut sun_rgba);
         apply_black_alpha_mask(&mut moon_rgba);
@@ -9139,14 +9144,12 @@ impl State {
             "Sky Texture BindGroup",
         );
 
-        let dirt_path = asset_source.resolve("textures/block/dirt.png");
-        let (dirt_w, dirt_h, dirt_rgba) = load_png_rgba(&dirt_path)
+        let (dirt_w, dirt_h, dirt_rgba) = read_asset_png(&asset_source, "textures/block/dirt.png")
             .unwrap_or_else(|err| panic!("failed to load worldgen dirt texture: {}", err));
-        let font_path = asset_source.resolve("textures/font/ascii.png");
-        let (font_w, font_h, font_rgba) = load_png_rgba(&font_path)
+        let (font_w, font_h, font_rgba) = read_asset_png(&asset_source, "textures/font/ascii.png")
             .unwrap_or_else(|err| panic!("failed to load worldgen font texture: {}", err));
         let (menu_button_w, menu_button_h, menu_button_rgba) = load_gui_sprite_logical_rgba(
-            asset_source.root_for(MENU_BUTTON_TEXTURE_KEY),
+            &asset_source,
             MENU_BUTTON_TEXTURE_KEY,
             MENU_BUTTON_LOGICAL_WIDTH_PX,
             MENU_BUTTON_LOGICAL_HEIGHT_PX,
@@ -9154,7 +9157,7 @@ impl State {
         .unwrap_or_else(|err| panic!("failed to load menu button texture: {}", err));
         let (menu_button_highlighted_w, menu_button_highlighted_h, menu_button_highlighted_rgba) =
             load_gui_sprite_logical_rgba(
-                asset_source.root_for(MENU_BUTTON_HIGHLIGHTED_TEXTURE_KEY),
+                &asset_source,
                 MENU_BUTTON_HIGHLIGHTED_TEXTURE_KEY,
                 MENU_BUTTON_LOGICAL_WIDTH_PX,
                 MENU_BUTTON_LOGICAL_HEIGHT_PX,
@@ -9164,7 +9167,7 @@ impl State {
             });
         let (menu_button_disabled_w, menu_button_disabled_h, menu_button_disabled_rgba) =
             load_gui_sprite_logical_rgba(
-                asset_source.root_for(MENU_BUTTON_DISABLED_TEXTURE_KEY),
+                &asset_source,
                 MENU_BUTTON_DISABLED_TEXTURE_KEY,
                 MENU_BUTTON_LOGICAL_WIDTH_PX,
                 MENU_BUTTON_LOGICAL_HEIGHT_PX,

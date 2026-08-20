@@ -1,7 +1,5 @@
 use bytemuck::{Pod, Zeroable};
 use serde::Deserialize;
-use std::fs;
-use std::path::PathBuf;
 
 use crate::assets::AssetSource;
 use crate::config::render::{
@@ -83,12 +81,14 @@ enum McmetaFrame {
     Indexed { index: u16, time: Option<u32> },
 }
 
-/// The `.mcmeta` sidecar has to come from the same root as the texture itself,
+/// The `.mcmeta` sidecar has to come from the same source as the texture itself,
 /// or a pack's animation timings would be applied to the default texture.
-fn resolve_mcmeta_path_for_key(source: &AssetSource, key: &str) -> PathBuf {
-    let mut path = source.resolve(key);
-    path.set_extension("png.mcmeta");
-    path
+fn mcmeta_key_for(key: &str) -> String {
+    let relative = crate::assets::normalize_relative(key);
+    match relative.strip_suffix(".png") {
+        Some(stem) => format!("{stem}.png.mcmeta"),
+        None => format!("{relative}.mcmeta"),
+    }
 }
 
 fn default_frametime_ticks_for_key(key: &str) -> u32 {
@@ -165,8 +165,8 @@ pub(crate) fn parse_anim_meta_for_texture(
     let mut frametime_ticks = default_frametime_ticks_for_key(key);
     let mut sequence: Vec<u16> = (0..sheet_frames).map(|f| f as u16).collect();
 
-    let mcmeta_path = resolve_mcmeta_path_for_key(source, key);
-    if let Ok(text) = fs::read_to_string(&mcmeta_path) {
+    let mcmeta_key = mcmeta_key_for(key);
+    if let Some(text) = source.read_to_string(&mcmeta_key) {
         match serde_json::from_str::<McmetaFile>(&text) {
             Ok(parsed) => {
                 if let Some(anim) = parsed.animation {

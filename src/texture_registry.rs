@@ -1,8 +1,7 @@
 use crate::assets::AssetSource;
-use crate::texture::load_png_rgba;
+use crate::texture::decode_png_rgba;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Mojang-ähnlicher Asset-Key:
@@ -57,14 +56,6 @@ impl TextureRegistry {
         }
     }
 
-    fn resolve_path(&self, key: &AssetId) -> PathBuf {
-        // Namescheme:
-        // - "minecraft:textures/block/stone.png" -> "textures/block/stone.png"
-        // - "textures/block/stone.png"           -> unverändert
-        // Der aktive Pack gewinnt, sonst greifen die Standard-Assets.
-        self.source.resolve(key.as_str())
-    }
-
     /// Holt eine Textur aus dem Cache oder lädt sie von Disk (PNG -> RGBA8).
     /// Fehlermeldungen enthalten sowohl Key als auch finalen Dateipfad.
     pub fn get_or_load(&mut self, key: impl Into<AssetId>) -> Result<TextureHandle> {
@@ -73,15 +64,20 @@ impl TextureRegistry {
             return Ok(key);
         }
 
-        let path = self.resolve_path(&key);
-        let (width, height, rgba) = load_png_rgba(&path).with_context(|| {
-            // Use static string formatting to avoid allocation in hot path
+        // Namescheme:
+        // - "minecraft:textures/block/stone.png" -> "textures/block/stone.png"
+        // - "textures/block/stone.png"           -> unverändert
+        // Der aktive Pack gewinnt, sonst greifen die Standard-Assets.
+        let location = self.source.describe(key.as_str());
+        let bytes = self.source.read(key.as_str()).with_context(|| {
             format!(
                 "failed to load texture key '{}' from '{}'",
                 key.as_str(),
-                path.display()
+                location
             )
         })?;
+        let (width, height, rgba) = decode_png_rgba(&bytes, &location)
+            .with_context(|| format!("failed to decode texture key '{}'", key.as_str()))?;
         // Clone is now just cloning the Arc, much cheaper than cloning String
         self.textures.insert(
             key.clone(),
