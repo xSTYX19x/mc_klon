@@ -244,6 +244,35 @@ fn shared_zero_block_data() -> &'static Arc<Vec<u8>> {
     ZERO_BLOCK_DATA.get_or_init(|| Arc::new(vec![0; Chunk::BLOCK_COUNT]))
 }
 
+fn shared_uniform_blocks(block: BlockId) -> Arc<Vec<BlockId>> {
+    static UNIFORM_BLOCKS: [OnceLock<Arc<Vec<BlockId>>>; 256] = [const { OnceLock::new() }; 256];
+    UNIFORM_BLOCKS[block.to_u8() as usize]
+        .get_or_init(|| Arc::new(vec![block; Chunk::BLOCK_COUNT]))
+        .clone()
+}
+
+/// Wraps a freshly built `blocks` buffer, collapsing single-block sections onto
+/// one shared allocation per block id.
+///
+/// About half of all stored sections hold exactly one block state — solid rock
+/// below the surface, mostly (measured, see the `memory_report` test). Those
+/// need no private array at all. Same copy-on-write contract as
+/// [`block_data_arc`]: the first edit inside such a section clones the buffer,
+/// so sharing is invisible to every reader and writer.
+///
+/// `Chunk::new_empty` deliberately keeps its own buffer — it exists to be filled
+/// immediately, so sharing would only add a copy-on-write memcpy.
+pub(crate) fn blocks_arc(blocks: Vec<BlockId>) -> Arc<Vec<BlockId>> {
+    debug_assert_eq!(blocks.len(), Chunk::BLOCK_COUNT);
+    if blocks.len() == Chunk::BLOCK_COUNT
+        && let Some(&first) = blocks.first()
+        && blocks.iter().all(|&block| block == first)
+    {
+        return shared_uniform_blocks(first);
+    }
+    Arc::new(blocks)
+}
+
 /// Wraps a freshly built `block_data` buffer, collapsing the all-zero case onto
 /// one shared allocation.
 ///
@@ -272,7 +301,7 @@ pub(crate) struct ChunkCoord {
 
 #[cfg(test)]
 mod block_data_sharing_tests {
-    use super::{Chunk, block_data_arc};
+    use super::{Chunk, block_data_arc, blocks_arc};
     use crate::blocks::BlockId;
     use std::sync::Arc;
 
@@ -293,6 +322,56 @@ mod block_data_sharing_tests {
             "a section with real block data must own its buffer"
         );
         assert_eq!(c[7], 1);
+    }
+
+    #[test]
+    fn uniform_sections_share_one_buffer_per_block_id() {
+        let stone_a = blocks_arc(vec![BlockId::Stone; Chunk::BLOCK_COUNT]);
+        let stone_b = blocks_arc(vec![BlockId::Stone; Chunk::BLOCK_COUNT]);
+        let dirt = blocks_arc(vec![BlockId::Dirt; Chunk::BLOCK_COUNT]);
+        assert!(Arc::ptr_eq(&stone_a, &stone_b));
+        assert!(
+            !Arc::ptr_eq(&stone_a, &dirt),
+            "each block id needs its own shared buffer"
+        );
+        assert!(dirt.iter().all(|&block| block == BlockId::Dirt));
+
+        let mut mixed = vec![BlockId::Stone; Chunk::BLOCK_COUNT];
+        mixed[Chunk::BLOCK_COUNT - 1] = BlockId::Dirt;
+        let mixed = blocks_arc(mixed);
+        assert!(
+            !Arc::ptr_eq(&stone_a, &mixed),
+            "a section with more than one block must own its buffer"
+        );
+    }
+
+    #[test]
+    fn editing_a_uniform_section_copies_instead_of_corrupting_its_neighbours() {
+        let mut first = Chunk::from_parts(
+            blocks_arc(vec![BlockId::Stone; Chunk::BLOCK_COUNT]),
+            block_data_arc(vec![0; Chunk::BLOCK_COUNT]),
+            Arc::new(vec![0; Chunk::BLOCK_COUNT]),
+            0,
+        );
+        let second = Chunk::from_parts(
+            blocks_arc(vec![BlockId::Stone; Chunk::BLOCK_COUNT]),
+            block_data_arc(vec![0; Chunk::BLOCK_COUNT]),
+            Arc::new(vec![0; Chunk::BLOCK_COUNT]),
+            0,
+        );
+        assert!(Arc::ptr_eq(&first.blocks, &second.blocks));
+
+        first.set(4, 5, 6, BlockId::Air);
+
+        assert_eq!(first.get(4, 5, 6), BlockId::Air);
+        assert_eq!(
+            second.get(4, 5, 6),
+            BlockId::Stone,
+            "the shared uniform buffer must survive an edit in another section"
+        );
+        // Cached voxel counts are per chunk, so they must not follow the sharing.
+        assert_eq!(first.solid_voxel_count, Chunk::BLOCK_COUNT as u16 - 1);
+        assert_eq!(second.solid_voxel_count, Chunk::BLOCK_COUNT as u16);
     }
 
     #[test]
@@ -476,26 +555,27 @@ mod memory_report {
 
         // Resident-memory projection. Sections are only stored when non-empty,
         // so scale by the measured non-empty rate rather than world height.
-        // `block_data_arc` collapses all-zero data onto one shared buffer, so
-        // only the sections that really carry data still pay for the array.
+        // `block_data_arc` and `blocks_arc` collapse all-zero data and
+        // single-block sections onto shared buffers, so only sections that are
+        // actually varied still pay for a private array.
         let non_zero_rate = 1.0 - all.zero_data_sections as f64 / secs as f64;
+        let varied_rate = 1.0 - all.uniform_sections as f64 / secs as f64;
         println!("\nresident block storage (light excluded):");
         for (label, view) in [("Normal", 8i32), ("Far", 12), ("Extreme", 16), ("Insane", 32)] {
             let columns = ((view * 2 + 1) * (view * 2 + 1)) as f64;
             let sections = (columns * sections_per_column) as usize;
             let before = sections * cur_pair;
-            let shared_data = sections * cur_blocks
-                + (sections as f64 * non_zero_rate) as usize * cur_blocks
-                + cur_blocks;
+            let shipped = (sections as f64 * varied_rate) as usize * cur_blocks
+                + (sections as f64 * non_zero_rate) as usize * cur_blocks;
             let merged = sections * merged_state;
             let packed = sections * packed_states;
             println!(
-                "  {:<8} view {:>2} -> {:>6} sections | before {:>7.1} MiB | shared zero data {:>7.1} MiB | merged u16 {:>7.1} MiB | palette states {:>7.1} MiB",
+                "  {:<8} view {:>2} -> {:>6} sections | before {:>7.1} MiB | shared buffers {:>7.1} MiB | merged u16 {:>7.1} MiB | palette states {:>7.1} MiB",
                 label,
                 view,
                 sections,
                 mib(before),
-                mib(shared_data),
+                mib(shipped),
                 mib(merged),
                 mib(packed),
             );
