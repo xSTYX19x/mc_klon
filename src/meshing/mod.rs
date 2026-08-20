@@ -15,7 +15,7 @@ mod pool_regression_test;
 
 #[cfg(test)]
 pub(crate) use greedy::build_chunk_mesh_greedy;
-pub(crate) use greedy::face_shade;
+pub(crate) use greedy::{face_corner_ao_shades, face_from_normal, face_shade};
 #[cfg(test)]
 pub(crate) use liquids::{
     LIQUID_EPS, LIQUID_SOURCE_HEIGHT, effective_cell_height, fluid_surface_height,

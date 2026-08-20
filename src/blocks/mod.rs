@@ -460,6 +460,26 @@ enum BlockModelSpec {
     },
 }
 
+/// How a block relates to skylight.
+///
+/// The default derives from the occlusion shape, so lighting and meshing cannot
+/// drift apart the way the old per-block bool let them: `grass_block` was a full
+/// opaque cube that let skylight straight through, and `stone_slab` the same.
+/// The two named exceptions below are the cases where the shape genuinely
+/// cannot express the answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SkylightSpec {
+    /// Anything that fully covers its own `Down` boundary stops skylight.
+    FromShape,
+    /// Stops skylight without occluding faces — leaves shade what grows under
+    /// them, but you can see through the gaps.
+    Blocks,
+    /// Passes skylight even if the shape says otherwise. Glass is
+    /// `Decorative`-shaped today, so this is currently belt-and-braces: it keeps
+    /// glass transparent to light if it ever becomes face-occluding for culling.
+    Transmits,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FaceTintSpec {
     None,
@@ -497,7 +517,7 @@ struct BlockSpec {
     cull_group: CullGroupSpec,
     face_occluding: bool,
     solid: bool,
-    blocks_skylight: bool,
+    skylight: SkylightSpec,
     breakable: bool,
     emitted_light: u8,
     particle_color: [f32; 3],
@@ -533,6 +553,18 @@ impl BlockSpec {
     /// matches on `BlockModelSpec` exhaustively, so adding a non-cube model
     /// (stairs, panes, fences, torches, rails) fails to compile until its shape
     /// is stated here rather than silently inheriting `FullCube`.
+    /// Whether this block stops skylight from reaching what is below it.
+    const fn blocks_skylight(self) -> bool {
+        match self.skylight {
+            SkylightSpec::Blocks => true,
+            SkylightSpec::Transmits => false,
+            SkylightSpec::FromShape => matches!(
+                self.occlusion_shape().boundary_coverage(Face::Down),
+                FaceCoverage::Full
+            ),
+        }
+    }
+
     const fn raycast_shape(self) -> CollisionShape {
         match self.model {
             BlockModelSpec::None => CollisionShape::Empty,
@@ -689,7 +721,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::None,
         face_occluding: false,
         solid: false,
-        blocks_skylight: false,
+        skylight: SkylightSpec::FromShape,
         breakable: false,
         emitted_light: 0,
         particle_color: [0.0, 0.0, 0.0],
@@ -712,7 +744,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: false,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.35, 0.75, 0.25],
@@ -735,7 +767,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.55, 0.55, 0.58],
@@ -754,7 +786,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.49, 0.34, 0.20],
@@ -775,7 +807,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::None,
         face_occluding: false,
         solid: false,
-        blocks_skylight: false,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.28, 0.88, 0.36],
@@ -796,7 +828,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.68, 0.56, 0.34],
@@ -815,7 +847,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: false,
         emitted_light: 0,
         particle_color: [0.32, 0.32, 0.34],
@@ -839,7 +871,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::Water,
         face_occluding: false,
         solid: false,
-        blocks_skylight: false,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.26, 0.48, 0.95],
@@ -863,7 +895,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::Water,
         face_occluding: false,
         solid: false,
-        blocks_skylight: false,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.26, 0.48, 0.95],
@@ -887,7 +919,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::Lava,
         face_occluding: false,
         solid: false,
-        blocks_skylight: false,
+        skylight: SkylightSpec::FromShape,
         breakable: false,
         emitted_light: 15,
         particle_color: [0.94, 0.44, 0.10],
@@ -911,7 +943,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::Lava,
         face_occluding: false,
         solid: false,
-        blocks_skylight: false,
+        skylight: SkylightSpec::FromShape,
         breakable: false,
         emitted_light: 15,
         particle_color: [0.94, 0.44, 0.10],
@@ -932,7 +964,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.48, 0.48, 0.50],
@@ -951,7 +983,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.16, 0.10, 0.22],
@@ -970,7 +1002,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.85, 0.80, 0.55],
@@ -989,7 +1021,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.66, 0.31, 0.25],
@@ -1012,7 +1044,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.55, 0.42, 0.26],
@@ -1033,7 +1065,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: false,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::Blocks,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.24, 0.56, 0.22],
@@ -1052,7 +1084,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: false,
         solid: true,
-        blocks_skylight: false,
+        skylight: SkylightSpec::Transmits,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.82, 0.90, 0.92],
@@ -1075,7 +1107,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: false,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.70, 0.70, 0.70],
@@ -1096,7 +1128,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.41, 0.47, 0.35],
@@ -1115,7 +1147,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.55, 0.54, 0.52],
@@ -1134,7 +1166,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.86, 0.80, 0.27],
@@ -1155,7 +1187,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::None,
         face_occluding: false,
         solid: false,
-        blocks_skylight: false,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.97, 0.84, 0.12],
@@ -1174,7 +1206,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::None,
         face_occluding: false,
         solid: false,
-        blocks_skylight: false,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.82, 0.18, 0.19],
@@ -1195,7 +1227,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::None,
         face_occluding: false,
         solid: false,
-        blocks_skylight: false,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.52, 0.36, 0.25],
@@ -1216,7 +1248,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::None,
         face_occluding: false,
         solid: false,
-        blocks_skylight: false,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.80, 0.23, 0.21],
@@ -1235,7 +1267,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.43, 0.43, 0.43],
@@ -1254,7 +1286,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.73, 0.62, 0.52],
@@ -1273,7 +1305,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.82, 0.71, 0.32],
@@ -1294,7 +1326,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.88, 0.88, 0.90],
@@ -1315,7 +1347,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.96, 0.84, 0.27],
@@ -1338,7 +1370,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.61, 0.43, 0.28],
@@ -1361,7 +1393,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.83, 0.28, 0.24],
@@ -1382,7 +1414,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.93, 0.93, 0.93],
@@ -1403,7 +1435,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.86, 0.50, 0.20],
@@ -1424,7 +1456,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.75, 0.35, 0.73],
@@ -1445,7 +1477,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.45, 0.62, 0.86],
@@ -1466,7 +1498,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.90, 0.84, 0.25],
@@ -1485,7 +1517,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.50, 0.78, 0.28],
@@ -1504,7 +1536,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.94, 0.60, 0.70],
@@ -1523,7 +1555,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.33, 0.36, 0.38],
@@ -1544,7 +1576,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.61, 0.61, 0.61],
@@ -1563,7 +1595,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.27, 0.56, 0.61],
@@ -1584,7 +1616,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.50, 0.31, 0.70],
@@ -1603,7 +1635,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.26, 0.33, 0.69],
@@ -1624,7 +1656,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.46, 0.33, 0.22],
@@ -1645,7 +1677,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.37, 0.52, 0.19],
@@ -1664,7 +1696,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.67, 0.23, 0.23],
@@ -1685,7 +1717,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: true,
         solid: true,
-        blocks_skylight: true,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.13, 0.13, 0.13],
@@ -1704,7 +1736,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: false,
         solid: true,
-        blocks_skylight: false,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.74, 0.86, 0.96],
@@ -1728,7 +1760,7 @@ const BLOCK_SPECS: [BlockSpec; 51] = [
         cull_group: CullGroupSpec::SelfBlock,
         face_occluding: false,
         solid: true,
-        blocks_skylight: false,
+        skylight: SkylightSpec::FromShape,
         breakable: true,
         emitted_light: 0,
         particle_color: [0.96, 0.97, 1.0],
@@ -2367,7 +2399,7 @@ impl BlockId {
 
     #[inline]
     pub(crate) fn blocks_skylight(self) -> bool {
-        block_spec_for(self).blocks_skylight
+        block_spec_for(self).blocks_skylight()
     }
 
     pub(crate) fn emitted_light(self) -> u8 {
@@ -2848,16 +2880,72 @@ pub(crate) fn debug_assert_block_blueprint_integrity(block_registry: &BlockRegis
 mod tests {
     use glam::IVec3;
 
-    use super::{BlockId, OcclusionShape, grass_random_tick};
+    use super::{BlockId, Face, FaceCoverage, OcclusionShape, block_spec_for, grass_random_tick};
     use crate::world::World;
 
     #[test]
-    fn stone_slab_keeps_partial_occlusion_without_blocking_skylight() {
+    fn stone_slab_occludes_partially_and_stops_skylight() {
+        // A lower slab covers the whole bottom of its cell, so a vertical sky
+        // ray is stopped even though the sides are only half covered. This used
+        // to assert the opposite, which is what let light leak under slabs.
         assert_eq!(
             BlockId::StoneSlab.occlusion_shape(),
             OcclusionShape::SlabLower
         );
-        assert!(!BlockId::StoneSlab.blocks_skylight());
+        assert_eq!(
+            BlockId::StoneSlab
+                .occlusion_shape()
+                .boundary_coverage(Face::Down),
+            FaceCoverage::Full
+        );
+        assert!(BlockId::StoneSlab.blocks_skylight());
+    }
+
+    /// The guard `docs/TODO.md` asked for: lighting and meshing must agree
+    /// about every block, and every disagreement must be a named exception.
+    #[test]
+    fn skylight_agrees_with_the_occlusion_shape_except_for_named_blocks() {
+        // Leaves shade without occluding; glass occludes nothing and passes
+        // light. Anything else disagreeing means the two models drifted apart.
+        let allowed_exceptions = ["minecraft:oak_leaves"];
+
+        for raw in 0u16..=255 {
+            let Ok(block) = BlockId::from_u8(raw as u8) else {
+                continue;
+            };
+            let spec = block_spec_for(block);
+            let derived_from_shape = spec.occlusion_shape().boundary_coverage(Face::Down)
+                == FaceCoverage::Full;
+            if block.blocks_skylight() == derived_from_shape {
+                continue;
+            }
+            assert!(
+                allowed_exceptions.contains(&spec.key),
+                "{} disagrees with its occlusion shape (skylight={}, shape says {}) without being a named exception",
+                spec.key,
+                block.blocks_skylight(),
+                derived_from_shape
+            );
+        }
+    }
+
+    #[test]
+    fn full_opaque_cubes_all_stop_skylight() {
+        // The `grass_block` regression in one assertion: a block that occludes
+        // every face cannot let a sky ray through.
+        for raw in 0u16..=255 {
+            let Ok(block) = BlockId::from_u8(raw as u8) else {
+                continue;
+            };
+            if block.occlusion_shape() != OcclusionShape::FullCube {
+                continue;
+            }
+            assert!(
+                block.blocks_skylight(),
+                "{:?} is a full occluding cube but passes skylight",
+                block
+            );
+        }
     }
 
     #[test]

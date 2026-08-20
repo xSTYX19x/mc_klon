@@ -13,6 +13,12 @@ pub(crate) struct MeshingPool {
 
     /// Greedy meshing scratch buffers
     pub(crate) greedy_mask: Vec<Option<super::greedy::MaskCell>>,
+    /// Per-mask-cell AO/light fingerprint, parallel to `greedy_mask`. Pooled so
+    /// the AO-aware merge check costs no allocation per chunk.
+    pub(crate) greedy_mask_ao: Vec<u64>,
+    /// Stop greedy merging at AO/light discontinuities. Off by default — see
+    /// `greedy::greedy_ao_aware_merge_enabled` for the measured trade.
+    pub(crate) ao_aware_merge: bool,
 
     /// Liquid meshing corner caches (already implemented in LiquidMeshingPool)
     pub(crate) liquid_pool: super::liquids::LiquidMeshingPool,
@@ -40,6 +46,8 @@ impl MeshingPool {
             vertices: Vec::with_capacity(8192),
             indices: Vec::with_capacity(12288),
             greedy_mask: Vec::with_capacity(256), // CHUNK_SIZE * CHUNK_SIZE
+            greedy_mask_ao: Vec::with_capacity(256),
+            ao_aware_merge: false,
             liquid_pool: super::liquids::LiquidMeshingPool::with_capacity(128),
             temp_positions: Vec::with_capacity(256),
             temp_uvs: Vec::with_capacity(256),

@@ -439,3 +439,50 @@ fn fs_main() -> @location(0) vec4<f32> {
     return vec4<f32>(0.95, 0.97, 1.0, 0.76);
 }
 "#;
+
+/// Separable gaussian blur over a fullscreen triangle.
+///
+/// Used only for the frozen pause-menu backdrop, so it runs twice on entering
+/// the pause menu and never again — a wider kernel is cheaper here than the
+/// extra passes a tighter one would need.
+pub(crate) const BLUR_SHADER_WGSL: &str = r#"
+struct BlurParams {
+    // Texel step to walk along: (1/width, 0) horizontally, (0, 1/height) vertically.
+    direction: vec2<f32>,
+    _pad: vec2<f32>,
+};
+
+@group(0) @binding(0) var src_tex: texture_2d<f32>;
+@group(0) @binding(1) var src_sampler: sampler;
+@group(0) @binding(2) var<uniform> params: BlurParams;
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    // Oversized triangle covering the viewport; avoids a vertex buffer.
+    var out: VertexOutput;
+    let x = f32(i32(vertex_index) / 2) * 4.0 - 1.0;
+    let y = f32(i32(vertex_index) & 1) * 4.0 - 1.0;
+    out.clip_position = vec4<f32>(x, y, 0.0, 1.0);
+    out.uv = vec2<f32>(x * 0.5 + 0.5, 0.5 - y * 0.5);
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // 9-tap gaussian, sigma ~= 4 texels per pass. Two passes at this width read
+    // as a soft frosted-glass blur at 1080p.
+    let weights = array<f32, 5>(0.227027, 0.194594, 0.121621, 0.054054, 0.016216);
+    var color = textureSample(src_tex, src_sampler, in.uv).rgb * weights[0];
+    for (var i = 1; i < 5; i = i + 1) {
+        let offset = params.direction * f32(i) * 2.0;
+        color = color + textureSample(src_tex, src_sampler, in.uv + offset).rgb * weights[i];
+        color = color + textureSample(src_tex, src_sampler, in.uv - offset).rgb * weights[i];
+    }
+    return vec4<f32>(color, 1.0);
+}
+"#;

@@ -65,10 +65,12 @@ use crate::config::render::{
 };
 use crate::config::sim::RANDOM_TICK_SPEED_DEFAULT;
 use crate::meshing::{
-    CpuMeshData, FULLBRIGHT_LIGHT_PACKED, MeshLayerMask, Vertex, WorldVertex, face_shade,
+    CpuMeshData, FULLBRIGHT_LIGHT_PACKED, MeshLayerMask, Vertex, WorldVertex,
+    face_corner_ao_shades, face_from_normal, face_shade,
 };
 use crate::perf::trace as perf_trace;
 use crate::player::PlayerMode;
+use crate::render::pause_backdrop::PauseBackdrop;
 use crate::render::player_model::{self, PlayerModelView};
 use crate::render::screenshot;
 use crate::sim::{ActiveSimColumns, ColumnCoord, SimSystem};
@@ -1314,6 +1316,17 @@ const MENU_PANORAMA_INDEX_COUNT: u32 = (MENU_PANORAMA_FACE_COUNT * 6) as u32;
 const MENU_PANORAMA_CUBE_SIZE: f32 = 80.0;
 const MENU_PANORAMA_PITCH_RAD: f32 = -12.0_f32.to_radians();
 const MENU_PANORAMA_YAW_SPEED_RAD_PER_SEC: f32 = 0.06;
+
+/// Yaw first, then pitch around the eye's own right axis.
+///
+/// The order matters: `Ry * Rx` pitches before the yaw, so the tilt axis turns
+/// with the rotation and the horizon visibly rolls. Pitching last keeps the
+/// panorama's up vector in the camera's up/forward plane for every yaw, which
+/// is what `menu_panorama_tests` asserts.
+fn menu_panorama_rotation(elapsed_seconds: f32) -> Mat3 {
+    Mat3::from_rotation_x(MENU_PANORAMA_PITCH_RAD)
+        * Mat3::from_rotation_y(elapsed_seconds * MENU_PANORAMA_YAW_SPEED_RAD_PER_SEC)
+}
 const SKY_TEXTURE_MODE_DEFAULT: u32 = 0;
 const BOUNDARY_OCEAN_OUTER_PADDING_BLOCKS: f32 = 512.0;
 const BOUNDARY_OCEAN_UV_TILE_PER_BLOCK: f32 = 1.0 / 16.0;
@@ -2187,6 +2200,48 @@ fn relative_asset_path_from_key(texture_key: &str) -> &str {
     without_namespace
         .strip_prefix('/')
         .unwrap_or(without_namespace)
+}
+
+#[cfg(test)]
+mod menu_panorama_tests {
+    use super::{MENU_PANORAMA_PITCH_RAD, menu_panorama_rotation};
+    use glam::Vec3;
+
+    /// The panorama's local axes map to the camera's right / up / forward, so a
+    /// level horizon means the rotated up vector never leans along local X.
+    #[test]
+    fn the_horizon_stays_level_through_a_full_rotation() {
+        for step in 0..64 {
+            let seconds = step as f32 * 2.0;
+            let up = menu_panorama_rotation(seconds) * Vec3::Y;
+            assert!(
+                up.x.abs() < 1e-5,
+                "horizon rolled by {} at t={seconds}s",
+                up.x
+            );
+        }
+    }
+
+    #[test]
+    fn the_pitch_stays_constant_while_yawing() {
+        let expected = MENU_PANORAMA_PITCH_RAD.sin().abs();
+        for step in 0..64 {
+            let up = menu_panorama_rotation(step as f32 * 2.0) * Vec3::Y;
+            assert!(
+                (up.z.abs() - expected).abs() < 1e-5,
+                "pitch drifted to {} at step {step}",
+                up.z
+            );
+        }
+    }
+
+    #[test]
+    fn the_panorama_actually_yaws() {
+        // Guards against "fixing" the tilt by dropping the rotation entirely.
+        let start = menu_panorama_rotation(0.0) * Vec3::Z;
+        let later = menu_panorama_rotation(20.0) * Vec3::Z;
+        assert!(start.distance(later) > 0.1, "panorama stopped rotating");
+    }
 }
 
 #[cfg(test)]
@@ -3073,6 +3128,18 @@ pub(crate) fn build_fullscreen_overlay_mesh(
     (vertices, indices)
 }
 
+/// One texture tile per 16 blocks, i.e. **one texel per block**.
+///
+/// That is 16x coarser than a normal block face, so the ring is magnified for
+/// most of its visible depth and only tips into minification far out. Worked
+/// through while chasing a suspected moire artifact (`docs/TODO.md`): at the
+/// ring's inner edge (`boundary_radius_chunks * 16`, 2048 blocks by default) a
+/// block projects to well under a pixel, so minification is real — but the
+/// boundary fog is clamped to end at `inner + 512 * 0.55`, which fades the ring
+/// out over the same span. The one case where it could still show is a camera
+/// sitting almost exactly at sea level, where the plane is viewed edge-on and
+/// compresses without bound along the depth axis. Never reproduced; toggle the
+/// ring off with F12 while an artifact is on screen to settle it.
 fn push_ocean_quad(
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<u32>,
@@ -5498,6 +5565,11 @@ pub(crate) struct State {
     /// frame and dropped it again at frame end.
     frame_mesh_slots: HashMap<&'static str, ChunkMesh>,
     preview_mesh_cache: HashMap<BlockId, ChunkMesh>,
+    /// Cache hit/miss counters, purely for the F3 overlay. The cache is never
+    /// evicted, so `misses` also counts the buffers currently resident.
+    preview_cache_hits: u64,
+    preview_cache_misses: u64,
+    preview_cache_bytes: u64,
     hotbar_overlay_mesh: Option<ChunkMesh>,
     hotbar_overlay_cache: Option<HotbarOverlayCacheKey>,
     chat_overlay_mesh: Option<ChunkMesh>,
@@ -5519,6 +5591,15 @@ pub(crate) struct State {
     _worldgen_ui_texture_array: TextureArray,
     water_overlay_mesh: ChunkMesh,
     boundary_ocean_mesh: Option<ChunkMesh>,
+    /// Debug-only kill switch for the boundary ocean ring, so a suspected
+    /// aliasing artifact can be attributed without rebuilding.
+    debug_hide_boundary_ocean: bool,
+    last_render_ms: f32,
+    last_world_drawcalls: usize,
+    last_lod_drawcalls: usize,
+    last_visible_chunks: usize,
+    last_visible_lod_columns: usize,
+    pause_backdrop: PauseBackdrop,
     sky_object_vertex_buffer: wgpu::Buffer,
     sky_object_index_buffer: wgpu::Buffer,
     menu_panorama_vertex_buffer: wgpu::Buffer,
@@ -8561,6 +8642,27 @@ impl State {
         }
     }
 
+    /// Freezes the next rendered frame as the pause menu's backdrop.
+    pub(crate) fn request_pause_backdrop(&mut self) {
+        self.pause_backdrop.request_capture();
+    }
+
+    pub(crate) fn clear_pause_backdrop(&mut self) {
+        self.pause_backdrop.clear();
+    }
+
+    pub(crate) fn toggle_debug_hide_boundary_ocean(&mut self) {
+        self.debug_hide_boundary_ocean = !self.debug_hide_boundary_ocean;
+        crate::console_info!(
+            "[debug] boundary ocean ring {}",
+            if self.debug_hide_boundary_ocean {
+                "hidden"
+            } else {
+                "visible"
+            }
+        );
+    }
+
     pub(crate) fn toggle_far_lod_enabled(&mut self) {
         self.far_lod_enabled = !self.far_lod_enabled;
         if !self.far_lod_enabled {
@@ -10303,6 +10405,8 @@ impl State {
             startup_total_start.elapsed().as_secs_f64() * 1000.0
         );
 
+        let pause_backdrop = PauseBackdrop::new(&device, &config, surface_copy_src);
+
         let mut state = Self {
             surface,
             device,
@@ -10357,6 +10461,9 @@ impl State {
             crosshair_mesh,
             frame_mesh_slots: HashMap::new(),
             preview_mesh_cache: HashMap::new(),
+            preview_cache_hits: 0,
+            preview_cache_misses: 0,
+            preview_cache_bytes: 0,
             hotbar_overlay_mesh: None,
             hotbar_overlay_cache: None,
             chat_overlay_mesh: None,
@@ -10373,6 +10480,14 @@ impl State {
             _worldgen_ui_texture_array: worldgen_ui_texture_array,
             water_overlay_mesh,
             boundary_ocean_mesh: None,
+            debug_hide_boundary_ocean: false,
+            last_render_ms: 0.0,
+            last_world_drawcalls: 0,
+            last_lod_drawcalls: 0,
+            last_visible_chunks: 0,
+            last_visible_lod_columns: 0,
+            pause_backdrop,
+
             sky_object_vertex_buffer,
             sky_object_index_buffer,
             menu_panorama_vertex_buffer,
@@ -10618,6 +10733,7 @@ impl State {
 
         // Depth muss die gleiche Größe wie der Framebuffer haben
         self.depth = DepthTexture::create(&self.device, &self.config);
+        self.pause_backdrop.resize(&self.device, &self.config);
         self.rebuild_crosshair_mesh();
     }
 
@@ -10714,8 +10830,10 @@ impl State {
 
     fn ensure_preview_mesh_cached(&mut self, block: BlockId) {
         if self.preview_mesh_cache.contains_key(&block) {
+            self.preview_cache_hits = self.preview_cache_hits.saturating_add(1);
             return;
         }
+        self.preview_cache_misses = self.preview_cache_misses.saturating_add(1);
         let (vertices, indices) = build_block_preview_mesh_3d(block, &self.block_texture_lookup);
         let vertex_buffer = self
             .device
@@ -10731,16 +10849,95 @@ impl State {
                 contents: bytemuck::cast_slice(&indices),
                 usage: wgpu::BufferUsages::INDEX,
             });
+        let vertex_bytes = std::mem::size_of_val(vertices.as_slice()) as u64;
+        let index_bytes = std::mem::size_of_val(indices.as_slice()) as u64;
+        self.preview_cache_bytes = self
+            .preview_cache_bytes
+            .saturating_add(vertex_bytes + index_bytes);
         self.preview_mesh_cache.insert(
             block,
             ChunkMesh {
                 vertex_buffer,
                 index_buffer,
                 index_count: indices.len() as u32,
-                vertex_capacity_bytes: std::mem::size_of_val(vertices.as_slice()) as u64,
-                index_capacity_bytes: std::mem::size_of_val(indices.as_slice()) as u64,
+                vertex_capacity_bytes: vertex_bytes,
+                index_capacity_bytes: index_bytes,
             },
         );
+    }
+
+    /// F3 line for the preview cache. It never evicts, so the interesting
+    /// numbers are how far it has grown and whether it is still missing.
+    pub(crate) fn preview_cache_debug_line(&self) -> String {
+        let lookups = self.preview_cache_hits + self.preview_cache_misses;
+        let hit_rate = if lookups == 0 {
+            0.0
+        } else {
+            self.preview_cache_hits as f64 * 100.0 / lookups as f64
+        };
+        format!(
+            "Preview cache: {} meshes, {:.1} KiB, {:.0}% hit ({} miss)",
+            self.preview_mesh_cache.len(),
+            self.preview_cache_bytes as f64 / 1024.0,
+            hit_rate,
+            self.preview_cache_misses,
+        )
+    }
+
+    /// F3 lines for the block under the crosshair: the shapes that drive face
+    /// culling, AO and selection, plus the AO actually baked into the face the
+    /// ray hit. These three used to disagree silently; showing them together is
+    /// the cheapest way to spot it.
+    pub(crate) fn targeted_block_shape_debug_lines(&self, camera: &Camera) -> Vec<String> {
+        let Some(hit) = raycast_world(
+            &self.world,
+            camera.position,
+            camera.forward(),
+            RAYCAST_MAX_DISTANCE,
+        ) else {
+            return vec!["Target: none".to_string()];
+        };
+        let block = self.world.get_block(hit.hit_block_pos);
+        let shape = block.occlusion_shape();
+        let coverage = |face: Face| match shape.boundary_coverage(face) {
+            FaceCoverage::None => "-",
+            FaceCoverage::LowerHalf => "lo",
+            FaceCoverage::UpperHalf => "up",
+            FaceCoverage::Full => "full",
+        };
+        let mut lines = vec![
+            format!(
+                "Target: {} at {} {} {}",
+                block.display_name(),
+                hit.hit_block_pos.x,
+                hit.hit_block_pos.y,
+                hit.hit_block_pos.z
+            ),
+            format!(
+                "  occlusion {:?}, skylight {}, coverage U:{} D:{} N:{} S:{} E:{} W:{}",
+                shape,
+                if block.blocks_skylight() { "stop" } else { "pass" },
+                coverage(Face::Up),
+                coverage(Face::Down),
+                coverage(Face::North),
+                coverage(Face::South),
+                coverage(Face::East),
+                coverage(Face::West),
+            ),
+        ];
+        let face = face_from_normal(hit.hit_normal);
+        lines.push(format!(
+            "  selection {:.2}..{:.2} y, hit face {:?}",
+            hit.hit_bounds_min.y - hit.hit_block_pos.y as f32,
+            hit.hit_bounds_max.y - hit.hit_block_pos.y as f32,
+            face,
+        ));
+        let shades = face_corner_ao_shades(&self.world, hit.hit_block_pos, face);
+        lines.push(format!(
+            "  baked AO corners {:.2} {:.2} {:.2} {:.2}",
+            shades[0], shades[1], shades[2], shades[3]
+        ));
+        lines
     }
 
     fn preview_pipeline_for_block(&self, block: BlockId) -> &wgpu::RenderPipeline {
@@ -19362,8 +19559,7 @@ impl State {
 
     fn write_menu_panorama_vertices(&mut self, camera: &Camera) {
         let t = self.menu_panorama_started_at.elapsed().as_secs_f32();
-        let panorama_rot = Mat3::from_rotation_y(t * MENU_PANORAMA_YAW_SPEED_RAD_PER_SEC)
-            * Mat3::from_rotation_x(MENU_PANORAMA_PITCH_RAD);
+        let panorama_rot = menu_panorama_rotation(t);
         let base_right = camera.right_flat();
         let base_forward = camera.forward_flat();
         let base_up = Vec3::Y;
@@ -19795,6 +19991,14 @@ impl State {
         }
         // Captured before the overlay is consumed below; this used to be derived
         // from whether the (now persistent) menu mesh had just been built.
+        // On the capture frame the menu is held back for one frame so the
+        // frozen backdrop shows the world, not the menu sitting on top of it.
+        let capturing_pause_backdrop = self.pause_backdrop.is_capturing();
+        let menu_overlay = if capturing_pause_backdrop {
+            None
+        } else {
+            menu_overlay
+        };
         let showing_pause_menu = menu_overlay.is_some();
         if let Some(overlay) = menu_overlay {
             let (vertices, indices) = build_menu_overlay_mesh(
@@ -19803,7 +20007,9 @@ impl State {
                 self.worldgen_dirt_layer,
                 &self.worldgen_font,
                 &self.menu_button_atlas,
-                overlay.show_panorama,
+                // The frozen backdrop already covers the screen, so the opaque
+                // dirt tiling would only hide it.
+                overlay.show_panorama || self.pause_backdrop.ready_bind_group().is_some(),
                 overlay.title,
                 overlay.selected,
                 overlay.pressed,
@@ -19940,7 +20146,9 @@ impl State {
             self.chat_overlay_mesh = None;
             self.chat_overlay_cache = None;
         }
-        let show_boundary_ocean = allow_gameplay_ui && self.world.config().boundary_ocean();
+        let show_boundary_ocean = allow_gameplay_ui
+            && !self.debug_hide_boundary_ocean
+            && self.world.config().boundary_ocean();
         let show_hotbar = allow_gameplay_ui;
         if show_hotbar {
             let cache_key = HotbarOverlayCacheKey {
@@ -20372,6 +20580,11 @@ impl State {
             world_drawcalls += 1;
         }
 
+        // Between the passes on purpose: the world is on the swapchain image by
+        // now, and the UI has not been drawn over it yet.
+        self.pause_backdrop
+            .capture_and_blur(&self.queue, &mut encoder, &frame.texture);
+
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("UI Render Pass"),
@@ -20396,6 +20609,19 @@ impl State {
                 timestamp_writes: None,
                 multiview_mask: None,
             });
+
+            // The frozen, blurred frame goes down first so the menu draws on
+            // top of it. It replaces the opaque dirt tiling, which is why
+            // `build_menu_overlay_mesh` is told to skip that quad below.
+            if showing_pause_menu
+                && let Some(bind_group) = self.pause_backdrop.ready_bind_group()
+            {
+                rpass.set_pipeline(self.pause_backdrop.present_pipeline());
+                rpass.set_bind_group(0, bind_group, &[]);
+                rpass.draw(0..3, 0..1);
+                rpass.set_pipeline(&self.ui_pipeline);
+                rpass.set_bind_group(1, &self.camera_bind_group, &[]);
+            }
 
             // 2D-UI in NDC: Crosshair bleibt stabil in der Screen-Mitte.
             rpass.set_pipeline(&self.ui_pipeline);
@@ -20506,6 +20732,12 @@ impl State {
         self.maybe_log_perf_summary();
         let render_ms = render_started.elapsed().as_secs_f32() * 1000.0;
         self.frame_perf.far_lod_drawcalls = lod_drawcalls;
+        // Kept for the F3 overlay; `gpu.csv` records the same numbers per frame.
+        self.last_render_ms = render_ms;
+        self.last_world_drawcalls = world_drawcalls;
+        self.last_lod_drawcalls = lod_drawcalls;
+        self.last_visible_chunks = visible_chunks.len();
+        self.last_visible_lod_columns = visible_lod_columns.len();
         perf_trace::record_duration_ms(
             "state.render.total",
             render_ms,
@@ -20547,6 +20779,22 @@ impl State {
             ),
         );
         Ok(())
+    }
+
+    /// F3 line for the submission cost, so the "is this draw-call bound?"
+    /// question in `docs/TODO.md` can be answered from a running session
+    /// instead of guessed. `gpu.csv` carries the same numbers per frame
+    /// alongside `cpu_render_ms`; if render time does not track draw calls,
+    /// indirect submission would buy nothing.
+    pub(crate) fn draw_call_debug_line(&self) -> String {
+        format!(
+            "Draw calls: {} terrain + {} LOD ({} chunks, {} LOD columns visible), CPU render {:.2} ms",
+            self.last_world_drawcalls,
+            self.last_lod_drawcalls,
+            self.last_visible_chunks,
+            self.last_visible_lod_columns,
+            self.last_render_ms,
+        )
     }
 
     pub(crate) fn frustum_culling_stats(&self) -> (u64, u64) {

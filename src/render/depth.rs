@@ -4,9 +4,12 @@ pub(crate) struct DepthTexture {
 }
 
 impl DepthTexture {
+    /// Every pipeline drawing into a pass that carries the depth attachment has
+    /// to declare this format, so it lives here rather than being repeated.
+    pub(crate) const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
+
     pub(crate) fn create(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> Self {
-        // Typisches Depth Format
-        let format = wgpu::TextureFormat::Depth24Plus;
+        let format = Self::FORMAT;
 
         let desc = wgpu::TextureDescriptor {
             label: Some("Depth Texture"),

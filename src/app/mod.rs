@@ -1132,6 +1132,11 @@ impl App {
         self.nav_stack.clear();
         self.game_state = GameState::MainMenu { selected: 0 };
         self.clear_action_state();
+        if let Some(state) = self.state.as_mut() {
+            // Leaving the world without going through `leave_pause` would keep
+            // the frozen game frame behind the main menu.
+            state.clear_pause_backdrop();
+        }
         if let Some(window) = self.window.as_ref() {
             self.controller.set_mouse_capture(window, false);
         }
@@ -1145,6 +1150,8 @@ impl App {
         self.clear_action_state();
         if let Some(state) = self.state.as_mut() {
             state.set_world_session_paused(true, "pause_menu_opened");
+            // Freezes the next frame as the menu's blurred backdrop.
+            state.request_pause_backdrop();
         }
         if let Some(window) = self.window.as_ref() {
             self.controller.set_mouse_capture(window, false);
@@ -1158,6 +1165,7 @@ impl App {
         self.clear_action_state();
         if let Some(state) = self.state.as_mut() {
             state.set_world_session_paused(false, "pause_menu_closed");
+            state.clear_pause_backdrop();
         }
         if let Some(window) = self.window.as_ref() {
             self.controller.set_mouse_capture(window, true);
@@ -1448,6 +1456,11 @@ impl App {
             stats: WorldLoadStageStats::default(),
         };
         self.clear_action_state();
+        if let Some(state) = self.state.as_mut() {
+            // Generating or loading from the pause menu replaces the world the
+            // frozen frame came from.
+            state.clear_pause_backdrop();
+        }
         if let Some(window) = self.window.as_ref() {
             self.controller.set_mouse_capture(window, false);
         }
@@ -2328,6 +2341,9 @@ impl App {
                 state.lighting_step_last_ms()
             ));
             lines.push(state.lighting_pending_debug_line());
+            lines.push(state.draw_call_debug_line());
+            lines.push(state.preview_cache_debug_line());
+            lines.extend(state.targeted_block_shape_debug_lines(&self.current_view_camera()));
             if let Some(line) = state.deferred_edit_waiting_debug_line() {
                 lines.push(line);
             }
@@ -3380,6 +3396,12 @@ impl ApplicationHandler for App {
                         if !generating && code == KeyCode::F6 && !event.repeat {
                             if let Some(state) = self.state.as_mut() {
                                 state.toggle_far_lod_enabled();
+                            }
+                        }
+
+                        if !generating && code == KeyCode::F12 && !event.repeat {
+                            if let Some(state) = self.state.as_mut() {
+                                state.toggle_debug_hide_boundary_ocean();
                             }
                         }
 

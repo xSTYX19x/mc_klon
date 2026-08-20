@@ -70,6 +70,159 @@ mod tests {
     use glam::IVec3;
     use std::time::{Duration, Instant};
 
+    /// Highest world Y in this column that stops skylight, or `None` for an
+    /// open column.
+    fn highest_skylight_blocker(world: &World, wx: i32, wz: i32) -> Option<i32> {
+        (world.min_y()..=world.max_y())
+            .rev()
+            .find(|&y| world.get_block(IVec3::new(wx, y, wz)).blocks_skylight())
+    }
+
+    /// The dark-chunk regression, at the level where it actually happened.
+    ///
+    /// Two separate causes produced fully unlit chunks next to lit ones:
+    /// provisional light seeded to sky=0, and a lighting-only remesh parked
+    /// until `Finalized`. The remesh half is covered by
+    /// `render::state::lighting_readiness_tests`; this covers the light data
+    /// itself, over real generated terrain rather than a synthetic setup.
+    /// Grass and slabs used to pass skylight, so everything under them was lit
+    /// as if it stood in the open. Both now derive the answer from their
+    /// occlusion shape.
+    #[test]
+    fn opaque_surface_blocks_no_longer_leak_skylight_downwards() {
+        const ROOF_Y: i32 = 64;
+        for cover in [BlockId::Grass, BlockId::StoneSlab, BlockId::Stone] {
+            let mut world = World::new();
+            // Unloaded chunks report full skylight, so the probe would read 15
+            // no matter what the roof does. Load the two sections it touches.
+            for cx in -1..=1 {
+                for cz in -1..=1 {
+                    for cy in 3..=4 {
+                        world.chunks.insert(
+                            ChunkCoord {
+                                x: cx,
+                                y: cy,
+                                z: cz,
+                            },
+                            Chunk::new_empty(),
+                        );
+                    }
+                }
+            }
+            // 3x3 chunks of roof: skylight also spreads sideways, so the probe
+            // has to sit far enough from the open edge for a leak to be the only
+            // explanation.
+            for lx in -CHUNK_SIZE..(2 * CHUNK_SIZE) {
+                for lz in -CHUNK_SIZE..(2 * CHUNK_SIZE) {
+                    world.set_block(IVec3::new(lx, ROOF_Y, lz), cover).unwrap();
+                }
+            }
+            let coords: Vec<ChunkCoord> = world.chunks.keys().copied().collect();
+            world.lighting_on_chunks_added(&coords);
+
+            assert_eq!(
+                world.get_light(IVec3::new(8, ROOF_Y + 1, 8)).sky,
+                15,
+                "{cover:?} must not darken the open air above it"
+            );
+            assert_eq!(
+                world.get_light(IVec3::new(8, ROOF_Y - 1, 8)).sky,
+                0,
+                "{cover:?} must stop skylight from reaching the space below it"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_terrain_leaves_no_dark_chunk_beside_lit_neighbours() {
+        let mut world = World::new();
+        for cx in -1..=1 {
+            for cz in -1..=1 {
+                world.ensure_column_generated(cx * CHUNK_SIZE, cz * CHUNK_SIZE);
+            }
+        }
+        let coords: Vec<ChunkCoord> = world.chunks.keys().copied().collect();
+        assert!(
+            coords.len() > 3,
+            "expected a generated 3x3 area, got {} chunks",
+            coords.len()
+        );
+        world.lighting_on_chunks_added(&coords);
+
+        // Every voxel with open sky above it must carry full skylight. This is
+        // the invariant the sky=0 seeding broke.
+        let mut checked_open_columns = 0usize;
+        for cx in -1..=1 {
+            for cz in -1..=1 {
+                for lx in 0..CHUNK_SIZE {
+                    for lz in 0..CHUNK_SIZE {
+                        let wx = cx * CHUNK_SIZE + lx;
+                        let wz = cz * CHUNK_SIZE + lz;
+                        let top = highest_skylight_blocker(&world, wx, wz);
+                        let first_open = match top {
+                            Some(y) if y >= world.max_y() => continue,
+                            Some(y) => y + 1,
+                            None => world.min_y(),
+                        };
+                        checked_open_columns += 1;
+                        let pos = IVec3::new(wx, first_open, wz);
+                        assert_eq!(
+                            world.get_light(pos).sky,
+                            15,
+                            "voxel {pos:?} sees open sky but is unlit"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(checked_open_columns > 0, "no open columns to verify");
+
+        // And no chunk may sit fully dark while a face neighbour is lit and the
+        // two are joined by air.
+        for &coord in &coords {
+            let chunk = world.get_chunk(coord).expect("chunk vanished");
+            if chunk.light.iter().any(|&packed| packed != 0) {
+                continue;
+            }
+            for (dx, dy, dz) in [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
+            {
+                let neighbor = ChunkCoord {
+                    x: coord.x + dx,
+                    y: coord.y + dy,
+                    z: coord.z + dz,
+                };
+                let Some(lit_neighbor) = world.get_chunk(neighbor) else {
+                    continue;
+                };
+                if !lit_neighbor.light.iter().any(|&packed| packed != 0) {
+                    continue;
+                }
+                for lx in 0..CHUNK_SIZE {
+                    for ly in 0..CHUNK_SIZE {
+                        for lz in 0..CHUNK_SIZE {
+                            let here = IVec3::new(
+                                coord.x * CHUNK_SIZE + lx,
+                                coord.y * CHUNK_SIZE + ly,
+                                coord.z * CHUNK_SIZE + lz,
+                            );
+                            let there = here + IVec3::new(dx, dy, dz);
+                            if !World::in_bounds(there) {
+                                continue;
+                            }
+                            let joined_by_air = !world.get_block(here).blocks_skylight()
+                                && !world.get_block(there).blocks_skylight();
+                            let neighbor_lit = world.get_light_packed(there) != 0;
+                            assert!(
+                                !(joined_by_air && neighbor_lit),
+                                "chunk {coord:?} is fully dark but {there:?} next to {here:?} is lit"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn incremental_chunk_add_matches_full_rebuild_across_chunk_edge() {
         let mut incremental = World::new();

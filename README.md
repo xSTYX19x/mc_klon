@@ -59,6 +59,9 @@ Gameplay and content are still introduced in a roughly historical order, but ren
 - `F9`: fluid debug line under the crosshair
 - `F10`: perf summary toggle
 - `F11`: precipitation toggle
+- `F12`: boundary-ocean ring on/off (to attribute distant rendering artifacts)
+
+The `F3` overlay also reports draw calls, preview-cache growth, and the occlusion shape, face coverage and baked AO of the block under the crosshair.
 - `Ctrl+T`: create a ticking area at the current chunk position
 - `Ctrl+Shift+T`: remove the nearest ticking area
 

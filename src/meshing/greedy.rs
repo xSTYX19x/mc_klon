@@ -534,6 +534,38 @@ fn averaged_vertex_light_from_samples(raw_lights: [u8; 4], occluded: [bool; 4]) 
     pack_vertex_light(((sky_sum + 2) / 4) as u8, ((blk_sum + 2) / 4) as u8)
 }
 
+/// The face a raycast normal points along.
+pub(crate) fn face_from_normal(normal: IVec3) -> Face {
+    match (normal.x, normal.y, normal.z) {
+        (1, _, _) => Face::East,
+        (-1, _, _) => Face::West,
+        (_, 1, _) => Face::Up,
+        (_, -1, _) => Face::Down,
+        (_, _, 1) => Face::South,
+        _ => Face::North,
+    }
+}
+
+/// Baked AO shade at a cube face's four corners, sampled the same way the
+/// mesher does. Debug-overlay only — the mesher uses the padded fast path.
+pub(crate) fn face_corner_ao_shades(
+    world: &impl BlockAccess,
+    block_pos: IVec3,
+    face: Face,
+) -> [f32; 4] {
+    let corners: [[f32; 3]; 4] = match face {
+        Face::Up => [[0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [1.0, 1.0, 1.0], [0.0, 1.0, 1.0]],
+        Face::Down => [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 1.0], [0.0, 0.0, 1.0]],
+        Face::East => [[1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 1.0, 1.0], [1.0, 0.0, 1.0]],
+        Face::West => [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 1.0], [0.0, 0.0, 1.0]],
+        Face::South => [[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [1.0, 1.0, 1.0], [0.0, 1.0, 1.0]],
+        Face::North => [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+    };
+    corners.map(|vertex_local| {
+        face_vertex_shade_and_light(world, block_pos, face, RenderBounds::UNIT_CUBE, vertex_local).0
+    })
+}
+
 fn face_vertex_shade_and_light(
     world: &impl BlockAccess,
     block_pos: IVec3,
@@ -790,7 +822,66 @@ fn should_emit_cube_face_local_fast(
     )
 }
 
+/// Packed shade+light of a single face's four corners.
+///
+/// Greedy merging compares only block id and facing, so a run merges straight
+/// across an AO or light discontinuity. The four corner samples are then taken
+/// at the *merged* quad's corners, and anything shading the middle of the run is
+/// interpolated away into a linear ramp. Folding this fingerprint into the merge
+/// test stops a run at the discontinuity instead.
+///
+/// Measured trade (`cargo test --release meshing::greedy::greedy_ao_merge_report
+/// -- --nocapture`): stopping merges at these edges costs **+36 % quads and
+/// +34 % meshing time** on hilly terrain. Meshing is already the largest slice
+/// of a streaming frame, so `MeshingPool::ao_aware_merge` stays off by default;
+/// flip it to compare the shading. Leaving it off costs nothing measurable —
+/// the fingerprint is only computed when the flag is set.
+#[allow(clippy::too_many_arguments)]
 #[inline]
+fn greedy_mask_cell_ao_signature(
+    neighborhood: &MeshingNeighborhood<'_>,
+    texture_lookup: &BlockTextureLookup,
+    plane_origin: [i32; 3],
+    d: usize,
+    u: usize,
+    v: usize,
+    face: Face,
+    normal_positive: bool,
+) -> u64 {
+    let mut signature = 0u64;
+    for (corner_index, (du, dv)) in [(0, 0), (1, 0), (1, 1), (0, 1)].into_iter().enumerate() {
+        let mut corner = plane_origin;
+        corner[u] += du;
+        corner[v] += dv;
+        let block_local = greedy_vertex_owning_block_pos(
+            IVec3::new(corner[0], corner[1], corner[2]),
+            plane_origin,
+            d,
+            u,
+            v,
+            1,
+            1,
+            normal_positive,
+        );
+        let block_index = MeshingNeighborhood::local_padded_index(
+            block_local.x,
+            block_local.y,
+            block_local.z,
+        );
+        let (shade, light) = cube_face_vertex_shade_and_light_local_fast(
+            neighborhood,
+            texture_lookup,
+            [block_local.x, block_local.y, block_local.z],
+            block_index,
+            face,
+            corner,
+        );
+        let packed = u64::from(pack_shade(shade)) | (u64::from(light as u8) << 8);
+        signature |= packed << (corner_index * 16);
+    }
+    signature
+}
+
 fn greedy_vertex_owning_block_pos(
     corner_world_i: IVec3,
     origin_plane: [i32; 3],
@@ -1023,9 +1114,19 @@ fn build_chunk_mesh_greedy_layered_dense_internal(
     let chunk_offset = chunk_offset(coord);
     let chunk_origin = chunk_world_origin(coord);
 
-    let mask = &mut pool.greedy_mask;
+    // Disjoint field borrows: the merge loop needs the mask and its AO
+    // fingerprints at the same time.
+    let super::pool::MeshingPool {
+        greedy_mask: mask,
+        greedy_mask_ao: mask_ao,
+        ao_aware_merge: split_merges_at_ao_edges,
+        ..
+    } = pool;
+    let split_merges_at_ao_edges = *split_merges_at_ao_edges;
     mask.clear();
     mask.resize((CHUNK_SIZE * CHUNK_SIZE) as usize, None);
+    mask_ao.clear();
+    mask_ao.resize((CHUNK_SIZE * CHUNK_SIZE) as usize, 0);
     let mut x = [0_i32; 3];
     for d in 0..3 {
         let u = (d + 1) % 3;
@@ -1121,6 +1222,27 @@ fn build_chunk_mesh_greedy_layered_dense_internal(
                     } else {
                         None
                     };
+                    mask_ao[n] = match mask[n] {
+                        Some(cell) if split_merges_at_ao_edges => {
+                            let mut plane_origin = x;
+                            plane_origin[d] = slice + 1;
+                            greedy_mask_cell_ao_signature(
+                                neighborhood,
+                                texture_lookup,
+                                plane_origin,
+                                d,
+                                u,
+                                v,
+                                if cell.normal_positive {
+                                    face_positive
+                                } else {
+                                    face_negative
+                                },
+                                cell.normal_positive,
+                            )
+                        }
+                        _ => 0,
+                    };
                     n += 1;
                 }
             }
@@ -1137,9 +1259,11 @@ fn build_chunk_mesh_greedy_layered_dense_internal(
                         continue;
                     };
 
+                    let cell_ao = mask_ao[idx];
                     let mut w = 1_i32;
                     while i + w < CHUNK_SIZE {
-                        if mask[(j * CHUNK_SIZE + (i + w)) as usize] != Some(cell) {
+                        let next = (j * CHUNK_SIZE + (i + w)) as usize;
+                        if mask[next] != Some(cell) || mask_ao[next] != cell_ao {
                             break;
                         }
                         w += 1;
@@ -1148,7 +1272,8 @@ fn build_chunk_mesh_greedy_layered_dense_internal(
                     let mut h = 1_i32;
                     'height: while j + h < CHUNK_SIZE {
                         for k in 0..w {
-                            if mask[((j + h) * CHUNK_SIZE + (i + k)) as usize] != Some(cell) {
+                            let next = ((j + h) * CHUNK_SIZE + (i + k)) as usize;
+                            if mask[next] != Some(cell) || mask_ao[next] != cell_ao {
                                 break 'height;
                             }
                         }
@@ -2412,6 +2537,186 @@ mod simd_uv_tests {
                 Face::East,
             ),
             "a lower slab beside a full cube must not be treated like a full side-face blocker"
+        );
+    }
+}
+
+/// Measures what stopping greedy merges at AO/light edges costs.
+///
+/// `docs/TODO.md` asked for numbers before committing to this: the merge is
+/// more correct but emits more quads, and quad count drives both meshing time
+/// and GPU memory. Run with
+/// `cargo test --release meshing::greedy::greedy_ao_merge_report -- --nocapture --test-threads=1`.
+#[cfg(test)]
+mod face_debug_tests {
+    use super::{face_corner_ao_shades, face_from_normal};
+    use crate::blocks::{BlockId, Face};
+    use crate::world::World;
+    use glam::IVec3;
+
+    #[test]
+    fn normals_map_to_the_face_they_point_along() {
+        for (normal, face) in [
+            (IVec3::X, Face::East),
+            (IVec3::NEG_X, Face::West),
+            (IVec3::Y, Face::Up),
+            (IVec3::NEG_Y, Face::Down),
+            (IVec3::Z, Face::South),
+            (IVec3::NEG_Z, Face::North),
+        ] {
+            assert_eq!(face_from_normal(normal), face, "normal {normal:?}");
+        }
+    }
+
+    #[test]
+    fn an_occluder_darkens_only_the_corners_it_touches() {
+        let mut world = World::new();
+        let block = IVec3::new(8, 64, 8);
+        world.set_block(block, BlockId::Stone).unwrap();
+
+        let open = face_corner_ao_shades(&world, block, Face::Up);
+        assert!(
+            open.iter().all(|&shade| (shade - open[0]).abs() < 1e-6),
+            "an unobstructed face must be evenly lit, got {open:?}"
+        );
+
+        // One neighbour diagonally above touches exactly one corner of the top
+        // face, so the AO must become uneven rather than dropping as a whole.
+        world
+            .set_block(block + IVec3::new(1, 1, 1), BlockId::Stone)
+            .unwrap();
+        let shaded = face_corner_ao_shades(&world, block, Face::Up);
+        assert!(
+            shaded.iter().any(|&shade| shade < open[0] - 1e-6),
+            "the occluder darkened nothing: {shaded:?}"
+        );
+        assert!(
+            shaded.iter().any(|&shade| (shade - open[0]).abs() < 1e-6),
+            "the occluder darkened every corner: {shaded:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod greedy_ao_merge_report {
+    use super::*;
+    use crate::blocks::{BlockRegistry, BlockTextureLookup};
+    use crate::meshing::pool::MeshingPool;
+    use crate::meshing::{ChunkSnapshot, MeshingNeighborhoodScratch, NeighborhoodSnapshot};
+    use crate::world::{CHUNK_SIZE, World, WorldConfig};
+    use crate::worldgen::WorldgenPreset;
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    fn test_texture_lookup() -> BlockTextureLookup {
+        let registry = BlockRegistry::new();
+        let key_to_layer: HashMap<String, u32> = registry
+            .collect_texture_keys()
+            .into_iter()
+            .enumerate()
+            .map(|(i, key)| (key, i as u32 + 1))
+            .collect();
+        BlockTextureLookup::new(&registry, &key_to_layer, 0)
+    }
+
+    fn snapshot_for(world: &World, coord: ChunkCoord) -> NeighborhoodSnapshot {
+        let center = world.get_chunk(coord).expect("missing center chunk");
+        let center_snapshot = ChunkSnapshot {
+            blocks: center.blocks.clone(),
+            block_data: center.block_data.clone(),
+            light: center.light.clone(),
+        };
+        let neighbors = [
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ]
+        .map(|(dx, dy, dz)| {
+            world
+                .get_chunk(ChunkCoord {
+                    x: coord.x + dx,
+                    y: coord.y + dy,
+                    z: coord.z + dz,
+                })
+                .map(|chunk| ChunkSnapshot {
+                    blocks: chunk.blocks.clone(),
+                    block_data: chunk.block_data.clone(),
+                    light: chunk.light.clone(),
+                })
+        });
+        NeighborhoodSnapshot {
+            center: center_snapshot,
+            neighbors,
+        }
+    }
+
+    /// Meshes the 3x3 area once per merge rule and reports both.
+    fn mesh_all(
+        world: &World,
+        coords: &[ChunkCoord],
+        texture_lookup: &BlockTextureLookup,
+        ao_aware_merge: bool,
+        rounds: u32,
+    ) -> (u64, f64) {
+        let mut pool = MeshingPool::new();
+        pool.ao_aware_merge = ao_aware_merge;
+        let mut quads = 0u64;
+        let mut best_nanos = u128::MAX;
+        for _ in 0..rounds {
+            let mut round_quads = 0u64;
+            let start = Instant::now();
+            for &coord in coords {
+                let mut scratch = MeshingNeighborhoodScratch::new();
+                let (neighborhood, _) = scratch.build(coord, snapshot_for(world, coord));
+                let (_, stats) = build_chunk_mesh_greedy_layered_dense_pooled(
+                    &neighborhood,
+                    coord,
+                    texture_lookup,
+                    &mut pool,
+                    MeshLayerMask::ALL,
+                );
+                round_quads += u64::from(stats.quads_emitted);
+            }
+            best_nanos = best_nanos.min(start.elapsed().as_nanos());
+            quads = round_quads;
+        }
+        (quads, best_nanos as f64 / 1_000_000.0)
+    }
+
+    #[test]
+    fn greedy_ao_merge_report() {
+        let mut world = World::new();
+        world.configure_world_config(WorldConfig::default(), WorldgenPreset::Hilly);
+        for cx in -1..=1 {
+            for cz in -1..=1 {
+                world.ensure_column_generated(cx * CHUNK_SIZE, cz * CHUNK_SIZE);
+            }
+        }
+        let coords: Vec<ChunkCoord> = world.chunks.keys().copied().collect();
+        world.lighting_on_chunks_added(&coords);
+
+        let texture_lookup = test_texture_lookup();
+        let rounds = if cfg!(debug_assertions) { 1 } else { 20 };
+        let (base_quads, base_ms) = mesh_all(&world, &coords, &texture_lookup, false, rounds);
+        let (ao_quads, ao_ms) = mesh_all(&world, &coords, &texture_lookup, true, rounds);
+
+        println!(
+            "\n{} chunks of hilly terrain\n  block-id merge (default): {base_quads} quads, {base_ms:.2} ms\n  ao-aware merge:           {ao_quads} quads (+{:.0} %), {ao_ms:.2} ms (+{:.0} %)\n",
+            coords.len(),
+            (ao_quads as f64 - base_quads as f64) * 100.0 / base_quads as f64,
+            (ao_ms - base_ms) * 100.0 / base_ms,
+        );
+
+        assert!(base_quads > 0, "the report meshed nothing");
+        // The whole point of the AO-aware rule is that it splits runs; if it
+        // ever stops doing so, the fingerprint has gone constant and the merge
+        // is silently back to the block-id rule.
+        assert!(
+            ao_quads > base_quads,
+            "ao-aware merging emitted no extra quads ({ao_quads} vs {base_quads})"
         );
     }
 }
