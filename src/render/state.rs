@@ -7894,11 +7894,13 @@ impl State {
             // Sample around chest height so standing in a lit room does not pick
             // up the dark block the feet are embedded in.
             let sample = view.feet + Vec3::new(0.0, 1.0, 0.0);
-            view.light_packed = u32::from(self.world.get_light_packed(IVec3::new(
+            let light_packed = self.world.get_light_packed(IVec3::new(
                 sample.x.floor() as i32,
                 sample.y.floor() as i32,
                 sample.z.floor() as i32,
-            )));
+            ));
+            view.brightness =
+                player_model::brightness_from_light(light_packed, self.world_time.sky_brightness);
             view
         });
     }

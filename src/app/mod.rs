@@ -539,7 +539,7 @@ impl App {
             stride_intensity,
             sneaking: sneak_held && !matches!(player.mode, MoveMode::Flight),
             // Filled in by the renderer, which owns the world light data.
-            light_packed: 0,
+            brightness: 1.0,
             skin_layer,
         })
     }

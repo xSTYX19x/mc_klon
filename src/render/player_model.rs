@@ -10,7 +10,7 @@
 
 use glam::Vec3;
 
-use crate::blocks::TINT_NONE;
+use crate::config::render::UI_MODE_TEXTURED;
 use crate::meshing::Vertex;
 
 /// Skin texture is a square 64x64 sheet.
@@ -54,8 +54,9 @@ pub(crate) struct PlayerModelView {
     pub stride_intensity: f32,
     /// Whether the player is sneaking (upper body drops).
     pub sneaking: bool,
-    /// Packed block+sky light sampled at the player's position.
-    pub light_packed: u32,
+    /// Per-vertex brightness baked from the world light at the player's
+    /// position; the overlay shader has no lighting of its own.
+    pub brightness: f32,
     pub skin_layer: u32,
 }
 
@@ -187,7 +188,7 @@ pub(crate) fn build_player_model_mesh(view: PlayerModelView) -> (Vec<Vertex>, Ve
                 origin: [0.0, 0.0],
                 size: [HEAD_SIZE, HEAD_SIZE, HEAD_SIZE],
             },
-            pitch: -head_pitch,
+            pitch: head_pitch,
             yaw: head_yaw,
         },
         ModelBox {
@@ -259,6 +260,23 @@ pub(crate) fn build_player_model_mesh(view: PlayerModelView) -> (Vec<Vertex>, Ve
     (vertices, indices)
 }
 
+/// Darkest the model gets in an unlit cave; matches the terrain's floor closely
+/// enough that the player never turns fully black.
+const MIN_BRIGHTNESS: f32 = 0.2;
+
+/// Folds a packed light value (high nibble sky, low nibble block) and the
+/// current sky brightness into a single vertex shade.
+///
+/// The overlay pipeline the model shares with the first-person arm has no
+/// lighting stage, so this is baked on the CPU instead. It approximates the
+/// terrain shader rather than reproducing it: no fog, no per-face shading.
+pub(crate) fn brightness_from_light(light_packed: u8, sky_brightness: f32) -> f32 {
+    let sky = f32::from((light_packed >> 4) & 0xF) / 15.0;
+    let block = f32::from(light_packed & 0xF) / 15.0;
+    let lit = (sky * sky_brightness.clamp(0.0, 1.0)).max(block);
+    MIN_BRIGHTNESS + (1.0 - MIN_BRIGHTNESS) * lit.clamp(0.0, 1.0)
+}
+
 /// Limb swing angle for this frame. Scales with how hard the player is walking,
 /// so a standing player is perfectly still.
 fn limb_swing(view: PlayerModelView) -> f32 {
@@ -281,6 +299,7 @@ fn append_box(
 ) {
     let uvs = model_box.uv.faces();
     let (min, max) = (model_box.min, model_box.max);
+    let shade = view.brightness.clamp(0.0, 1.0);
 
     let corner = |x: f32, y: f32, z: f32| {
         let local = rotate_local(Vec3::new(x, y, z), model_box.pitch, model_box.yaw);
@@ -360,9 +379,11 @@ fn append_box(
                 position: corners[i],
                 uv: quad[i],
                 tex_layer: view.skin_layer,
-                tint_kind: TINT_NONE,
-                color: [1.0, 1.0, 1.0],
-                light_packed: view.light_packed,
+                // The 3D overlay shader reuses this field as its draw mode;
+                // anything but `UI_MODE_TEXTURED` renders flat white.
+                tint_kind: UI_MODE_TEXTURED,
+                color: [shade, shade, shade],
+                light_packed: 0,
             });
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -402,7 +423,7 @@ mod tests {
             stride_phase: 0.0,
             stride_intensity: 0.0,
             sneaking: false,
-            light_packed: 0xff,
+            brightness: 1.0,
             skin_layer: 2,
         }
     }
@@ -518,6 +539,49 @@ mod tests {
         assert!((upright_min - crouched_min).abs() < 1e-4, "feet moved");
         assert!(crouched_max < upright_max, "head did not drop");
         assert!((upright_max - crouched_max - SNEAK_DROP_PX * PX).abs() < 1e-4);
+    }
+
+    /// Regression: the model rendered flat white because `tint_kind` doubles as
+    /// the overlay shader's draw mode and `UI_MODE_SOLID` (0) ignores the texture.
+    #[test]
+    fn vertices_select_the_textured_overlay_mode() {
+        let (vertices, _) = build_player_model_mesh(view());
+        assert!(vertices.iter().all(|v| v.tint_kind == UI_MODE_TEXTURED));
+    }
+
+    #[test]
+    fn brightness_tracks_the_world_light() {
+        // Unlit cave: floored, never fully black.
+        let dark = brightness_from_light(0x00, 1.0);
+        assert!((dark - MIN_BRIGHTNESS).abs() < 1e-6);
+        // Full sky light at noon.
+        assert!((brightness_from_light(0xF0, 1.0) - 1.0).abs() < 1e-6);
+        // The same spot at night is dim, because sky light is scaled...
+        assert!(brightness_from_light(0xF0, 0.0) < dark + 1e-6);
+        // ...but a torch (block light) stays bright regardless of time of day.
+        assert!((brightness_from_light(0x0F, 0.0) - 1.0).abs() < 1e-6);
+    }
+
+    /// Regression: the head pitched against the mouse. Looking up (positive
+    /// camera pitch) has to raise the front of the head, not lower it.
+    #[test]
+    fn head_pitches_with_the_look_direction() {
+        let front_height = |look_pitch: f32| {
+            let mut view = view();
+            view.look_pitch = look_pitch;
+            let (vertices, _) = build_player_model_mesh(view);
+            // The head is the first box; its front face is the first quad.
+            vertices[..4]
+                .iter()
+                .map(|v| v.position[1])
+                .fold(f32::MIN, f32::max)
+        };
+
+        let level = front_height(0.0);
+        let looking_up = front_height(0.6);
+        let looking_down = front_height(-0.6);
+        assert!(looking_up > level, "looking up did not raise the face");
+        assert!(looking_down < level, "looking down did not lower the face");
     }
 
     #[test]
