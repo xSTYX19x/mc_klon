@@ -19,7 +19,7 @@ use crate::camera::{Camera, ViewBobbing};
 use crate::commands::{self, Command};
 use crate::config::app::DOUBLE_SPACE_WINDOW;
 use crate::config::player::PLAYER_TUNING_MINECRAFT;
-use crate::config::render::{HIGHLIGHT_BLINK_MS, RenderDistance, SimulationDistance};
+use crate::config::render::{GuiScale, HIGHLIGHT_BLINK_MS, RenderDistance, SimulationDistance};
 use crate::input::CameraController;
 use crate::perf::trace as perf_trace;
 use crate::perf::{PerfCat, PerfStats};
@@ -178,7 +178,7 @@ impl OptionsScreen {
         match self {
             Self::Root => OPTIONS_ROOT_ITEMS.len(),
             Self::Gameplay => 1,
-            Self::Graphics => 3,
+            Self::Graphics => 4,
             Self::Controls => InputAction::ALL.len(),
         }
     }
@@ -802,6 +802,7 @@ impl App {
             state.set_render_distance(self.settings.graphics.render_distance, &self.camera);
             state.set_vsync_enabled(self.settings.graphics.vsync);
             state.set_backface_culling_enabled(self.settings.graphics.backface_culling);
+            state.set_gui_scale(self.settings.graphics.gui_scale);
         }
     }
 
@@ -1222,6 +1223,7 @@ impl App {
             self.menu_item_count(),
             self.cursor_pos.0,
             self.cursor_pos.1,
+            self.settings.graphics.gui_scale.factor(),
         )
     }
 
@@ -1273,6 +1275,20 @@ impl App {
                         }
                     ));
                     changed = true;
+                }
+                OptionsScreen::Graphics if options.selected == 3 => {
+                    let all = GuiScale::ALL;
+                    let current = self.settings.graphics.gui_scale;
+                    if let Some(index) = all.iter().position(|candidate| *candidate == current) {
+                        let next = (index as i32 + delta).rem_euclid(all.len() as i32) as usize;
+                        self.settings.graphics.gui_scale = all[next];
+                        options.status_line = Some(format!(
+                            "GUI scale: {} ({:.0}%)",
+                            all[next].label(),
+                            all[next].factor() * 100.0
+                        ));
+                        changed = true;
+                    }
                 }
                 OptionsScreen::Graphics if options.selected == 2 => {
                     self.settings.graphics.vsync = !self.settings.graphics.vsync;
@@ -2105,6 +2121,11 @@ impl App {
                                     "Off"
                                 }
                             ),
+                            format!(
+                                "GUI scale: {} ({:.0}%)",
+                                self.settings.graphics.gui_scale.label(),
+                                self.settings.graphics.gui_scale.factor() * 100.0
+                            ),
                         ],
                     ),
                     OptionsScreen::Controls => {
@@ -2594,6 +2615,7 @@ impl ApplicationHandler for App {
         state.set_render_distance(self.settings.graphics.render_distance, &self.camera);
         state.set_vsync_enabled(self.settings.graphics.vsync);
         state.set_backface_culling_enabled(self.settings.graphics.backface_culling);
+        state.set_gui_scale(self.settings.graphics.gui_scale);
 
         self.window = Some(window);
         self.state = Some(state);

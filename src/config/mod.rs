@@ -155,6 +155,49 @@ pub(crate) mod render {
         Insane,
     }
 
+    /// Multiplier applied on top of the per-element UI scales (hotbar, inventory,
+    /// menu buttons, text). `Normal` is 1.0, i.e. the scales the code already had.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub(crate) enum GuiScale {
+        Tiny,
+        Small,
+        #[default]
+        Normal,
+        Large,
+        Huge,
+    }
+
+    impl GuiScale {
+        pub(crate) const ALL: [Self; 5] = [
+            Self::Tiny,
+            Self::Small,
+            Self::Normal,
+            Self::Large,
+            Self::Huge,
+        ];
+
+        pub(crate) fn label(self) -> &'static str {
+            match self {
+                Self::Tiny => "Tiny",
+                Self::Small => "Small",
+                Self::Normal => "Normal",
+                Self::Large => "Large",
+                Self::Huge => "Huge",
+            }
+        }
+
+        pub(crate) fn factor(self) -> f32 {
+            match self {
+                Self::Tiny => 0.5,
+                Self::Small => 0.75,
+                Self::Normal => 1.0,
+                Self::Large => 1.35,
+                Self::Huge => 1.75,
+            }
+        }
+    }
+
     impl Default for RenderDistance {
         fn default() -> Self {
             Self::Normal

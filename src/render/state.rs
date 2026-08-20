@@ -52,8 +52,8 @@ use crate::config::assets::ASSET_ROOT;
 use crate::config::player::{PLAYER_HEIGHT, PLAYER_RADIUS};
 use crate::config::render::{
     CROSSHAIR_HALF_LEN_PX, CROSSHAIR_THICKNESS_PX, FOG_RENDERDIST_END_MARGIN_BLOCKS,
-    FOG_RENDERDIST_START_RATIO, MINECRAFT_TICK_SECONDS, NEAR_MESH_RADIUS_CHUNKS, PARTICLE_GRAVITY,
-    PARTICLE_LIFE_MAX, PARTICLE_LIFE_MIN, PARTICLE_MAX_COUNT, PARTICLE_QUAD_SIZE,
+    FOG_RENDERDIST_START_RATIO, GuiScale, MINECRAFT_TICK_SECONDS, NEAR_MESH_RADIUS_CHUNKS,
+    PARTICLE_GRAVITY, PARTICLE_LIFE_MAX, PARTICLE_LIFE_MIN, PARTICLE_MAX_COUNT, PARTICLE_QUAD_SIZE,
     PARTICLE_SPAWN_COUNT, PARTICLE_SPEED_MAX, PARTICLE_SPEED_MIN, RenderDistance,
     STREAM_BURST_CHUNKGEN_APPLY_BUDGET_MS, STREAM_BURST_DISPATCH_BUDGET_MS,
     STREAM_BURST_MAX_TOTAL_BUDGET_MS, STREAM_BURST_MESH_UPLOAD_BUDGET_MS,
@@ -2938,14 +2938,20 @@ fn build_boundary_ocean_ring_mesh(
     (vertices, indices)
 }
 
-fn build_crosshair_mesh(view_width: u32, view_height: u32) -> (Vec<Vertex>, Vec<u32>) {
+fn build_crosshair_mesh(
+    view_width: u32,
+    view_height: u32,
+    gui_scale: f32,
+) -> (Vec<Vertex>, Vec<u32>) {
     let px_to_ndc_x = 2.0 / (view_width.max(1) as f32);
     let px_to_ndc_y = 2.0 / (view_height.max(1) as f32);
 
-    let half_len_x = CROSSHAIR_HALF_LEN_PX * px_to_ndc_x;
-    let half_len_y = CROSSHAIR_HALF_LEN_PX * px_to_ndc_y;
-    let half_thick_x = (CROSSHAIR_THICKNESS_PX * 0.5) * px_to_ndc_x;
-    let half_thick_y = (CROSSHAIR_THICKNESS_PX * 0.5) * px_to_ndc_y;
+    let half_len = CROSSHAIR_HALF_LEN_PX * gui_scale;
+    let half_thick = CROSSHAIR_THICKNESS_PX * gui_scale * 0.5;
+    let half_len_x = half_len * px_to_ndc_x;
+    let half_len_y = half_len * px_to_ndc_y;
+    let half_thick_x = half_thick * px_to_ndc_x;
+    let half_thick_y = half_thick * px_to_ndc_y;
 
     let white = [1.0, 1.0, 1.0];
 
@@ -4063,6 +4069,7 @@ fn pause_menu_button_rect_px(
     view_height: u32,
     item_count: usize,
     index: usize,
+    gui_scale: f32,
 ) -> Option<(f32, f32, f32, f32)> {
     if item_count == 0 || index >= item_count {
         return None;
@@ -4071,17 +4078,29 @@ fn pause_menu_button_rect_px(
     let cx = view_width as f32 * 0.5;
     let cy = view_height as f32 * 0.5;
     let count = item_count as f32;
-    let total_h =
-        count * PAUSE_MENU_BUTTON_HEIGHT_PX + (count - 1.0).max(0.0) * PAUSE_MENU_BUTTON_SPACING_PX;
-    let button_x = cx - PAUSE_MENU_BUTTON_WIDTH_PX * 0.5;
+    // Clamp so a large gui scale with many rows still fits on screen.
+    let gui_scale = clamp_gui_scale_for_rows(view_height, item_count, gui_scale);
+    let button_w = (PAUSE_MENU_BUTTON_WIDTH_PX * gui_scale).min(view_width as f32 - 8.0);
+    let button_h = PAUSE_MENU_BUTTON_HEIGHT_PX * gui_scale;
+    let spacing = PAUSE_MENU_BUTTON_SPACING_PX * gui_scale;
+    let total_h = count * button_h + (count - 1.0).max(0.0) * spacing;
+    let button_x = cx - button_w * 0.5;
     let start_y = cy - total_h * 0.5 - 2.0;
-    let y = start_y + index as f32 * (PAUSE_MENU_BUTTON_HEIGHT_PX + PAUSE_MENU_BUTTON_SPACING_PX);
-    Some((
-        button_x,
-        y,
-        PAUSE_MENU_BUTTON_WIDTH_PX,
-        PAUSE_MENU_BUTTON_HEIGHT_PX,
-    ))
+    let y = start_y + index as f32 * (button_h + spacing);
+    Some((button_x, y, button_w, button_h))
+}
+
+/// Shrinks the requested scale until `item_count` rows fit into the viewport.
+/// Long screens (controls, world lists) stay usable at any gui scale.
+fn clamp_gui_scale_for_rows(view_height: u32, item_count: usize, gui_scale: f32) -> f32 {
+    let count = item_count.max(1) as f32;
+    let unit = count * PAUSE_MENU_BUTTON_HEIGHT_PX + (count - 1.0) * PAUSE_MENU_BUTTON_SPACING_PX;
+    if unit <= 0.0 {
+        return gui_scale;
+    }
+    // Leave room for the title above and the footer below.
+    let budget = (view_height as f32 - 128.0).max(64.0);
+    gui_scale.min(budget / unit).max(0.35)
 }
 
 pub(crate) fn pause_menu_item_at_pos_px(
@@ -4090,10 +4109,11 @@ pub(crate) fn pause_menu_item_at_pos_px(
     item_count: usize,
     x: f32,
     y: f32,
+    gui_scale: f32,
 ) -> Option<usize> {
     for index in 0..item_count {
         let Some((bx, by, bw, bh)) =
-            pause_menu_button_rect_px(view_width, view_height, item_count, index)
+            pause_menu_button_rect_px(view_width, view_height, item_count, index, gui_scale)
         else {
             continue;
         };
@@ -4140,6 +4160,7 @@ fn inventory_layout_px(
     view_width: u32,
     view_height: u32,
     atlas: &InventoryAtlas,
+    gui_scale: f32,
 ) -> Option<InventoryLayoutPx> {
     if atlas.background_size_px[0] <= 0.0 || atlas.background_size_px[1] <= 0.0 {
         return None;
@@ -4149,7 +4170,7 @@ fn inventory_layout_px(
     let max_scale_y = (view_height as f32 / atlas.background_size_px[1]).floor();
     let max_scale = max_scale_x.min(max_scale_y);
     let scale = if max_scale >= 1.0 {
-        INVENTORY_GUI_SCALE.min(max_scale).max(1.0)
+        (INVENTORY_GUI_SCALE * gui_scale).min(max_scale).max(1.0)
     } else {
         (view_width as f32 / atlas.background_size_px[0])
             .min(view_height as f32 / atlas.background_size_px[1])
@@ -4188,8 +4209,9 @@ fn inventory_hotbar_slot_at_pos_px_internal(
     atlas: &InventoryAtlas,
     x: f32,
     y: f32,
+    gui_scale: f32,
 ) -> Option<usize> {
-    let layout = inventory_layout_px(view_width, view_height, atlas)?;
+    let layout = inventory_layout_px(view_width, view_height, atlas, gui_scale)?;
     for slot in 0..INVENTORY_SLOT_COUNT {
         let slot_x = layout.hotbar_row_x + slot as f32 * layout.slot_stride;
         let slot_y = layout.hotbar_row_y;
@@ -4212,11 +4234,12 @@ fn inventory_palette_item_at_pos_px_internal(
     page: usize,
     x: f32,
     y: f32,
+    gui_scale: f32,
 ) -> Option<usize> {
     if item_count == 0 {
         return None;
     }
-    let layout = inventory_layout_px(view_width, view_height, atlas)?;
+    let layout = inventory_layout_px(view_width, view_height, atlas, gui_scale)?;
     let page_size = inventory_page_size(atlas).max(1);
     let page_count = inventory_page_count(item_count, atlas);
     let page = page.min(page_count.saturating_sub(1));
@@ -4245,8 +4268,9 @@ fn inventory_preview_viewport_rect_px(
     view_width: u32,
     view_height: u32,
     atlas: &InventoryAtlas,
+    gui_scale: f32,
 ) -> Option<(u32, u32, u32, u32)> {
-    let layout = inventory_layout_px(view_width, view_height, atlas)?;
+    let layout = inventory_layout_px(view_width, view_height, atlas, gui_scale)?;
     let x = layout.preview_x.max(0.0).round() as u32;
     let y = layout.preview_y.max(0.0).round() as u32;
     let w = layout
@@ -4267,9 +4291,10 @@ fn collect_hotbar_item_preview_draws(
     view_height: u32,
     hud_atlas: &HudAtlas,
     hotbar: &[Option<BlockId>; HUD_HOTBAR_SLOT_COUNT],
+    gui_scale: f32,
 ) -> Vec<ItemPreviewDraw> {
     let mut draws = Vec::with_capacity(HUD_HOTBAR_SLOT_COUNT);
-    let scale = HUD_HOTBAR_UI_SCALE.max(1.0);
+    let scale = (HUD_HOTBAR_UI_SCALE * gui_scale).max(0.5);
     let hotbar_w = hud_atlas.hotbar_size_px[0] * scale;
     let hotbar_h = hud_atlas.hotbar_size_px[1] * scale;
     let hotbar_x = ((view_width as f32 - hotbar_w) * 0.5).round();
@@ -4308,11 +4333,12 @@ fn build_hotbar_overlay_mesh(
     view_height: u32,
     hud_atlas: &HudAtlas,
     selected_slot: usize,
+    gui_scale: f32,
 ) -> (Vec<Vertex>, Vec<u32>) {
     let mut vertices = Vec::with_capacity(2048);
     let mut indices = Vec::with_capacity(3072);
 
-    let scale = HUD_HOTBAR_UI_SCALE.max(1.0);
+    let scale = (HUD_HOTBAR_UI_SCALE * gui_scale).max(0.5);
     let hotbar_w = hud_atlas.hotbar_size_px[0] * scale;
     let hotbar_h = hud_atlas.hotbar_size_px[1] * scale;
     let hotbar_x = ((view_width as f32 - hotbar_w) * 0.5).round();
@@ -4365,11 +4391,13 @@ fn build_inventory_overlay_mesh(
     hud_atlas: &HudAtlas,
     inventory_atlas: &InventoryAtlas,
     overlay: InventoryOverlay<'_>,
+    gui_scale: f32,
 ) -> (Vec<Vertex>, Vec<u32>) {
     let mut vertices = Vec::with_capacity(8192);
     let mut indices = Vec::with_capacity(12288);
 
-    let Some(layout) = inventory_layout_px(view_width, view_height, inventory_atlas) else {
+    let Some(layout) = inventory_layout_px(view_width, view_height, inventory_atlas, gui_scale)
+    else {
         return (vertices, indices);
     };
 
@@ -4468,8 +4496,10 @@ fn collect_inventory_item_preview_draws(
     inventory_atlas: &InventoryAtlas,
     overlay: InventoryOverlay<'_>,
     hotbar: &[Option<BlockId>; INVENTORY_SLOT_COUNT],
+    gui_scale: f32,
 ) -> Vec<ItemPreviewDraw> {
-    let Some(layout) = inventory_layout_px(view_width, view_height, inventory_atlas) else {
+    let Some(layout) = inventory_layout_px(view_width, view_height, inventory_atlas, gui_scale)
+    else {
         return Vec::new();
     };
     let mut draws =
@@ -4650,6 +4680,7 @@ fn build_menu_overlay_mesh(
     items: &[&str],
     enabled: Option<&[bool]>,
     footer: Option<&str>,
+    gui_scale: f32,
 ) -> (Vec<Vertex>, Vec<u32>) {
     let mut vertices = Vec::with_capacity(4096);
     let mut indices = Vec::with_capacity(6144);
@@ -4673,10 +4704,11 @@ fn build_menu_overlay_mesh(
     let cx = view_width as f32 * 0.5;
     let cy = view_height as f32 * 0.5;
 
-    let text_scale = WORLDGEN_FONT_SCALE;
+    let row_scale = clamp_gui_scale_for_rows(view_height, items.len(), gui_scale);
+    let text_scale = WORLDGEN_FONT_SCALE * row_scale;
     let glyph_h = font.glyph_h as f32 * text_scale;
-    let title_x = cx - bitmap_text_width_px(font, title, WORLDGEN_FONT_SCALE) * 0.5;
-    let title_y = pause_menu_button_rect_px(view_width, view_height, items.len(), 0)
+    let title_x = cx - bitmap_text_width_px(font, title, text_scale) * 0.5;
+    let title_y = pause_menu_button_rect_px(view_width, view_height, items.len(), 0, gui_scale)
         .map(|(_, button_y, _, _)| button_y - glyph_h - 18.0)
         .unwrap_or(cy - 64.0);
     append_bitmap_text_with_shadow(
@@ -4688,7 +4720,7 @@ fn build_menu_overlay_mesh(
         title,
         title_x,
         title_y,
-        WORLDGEN_FONT_SCALE,
+        text_scale,
     );
 
     if items.is_empty() {
@@ -4699,7 +4731,7 @@ fn build_menu_overlay_mesh(
 
     for (index, label) in items.iter().enumerate() {
         let Some((button_x, y, button_w, button_h)) =
-            pause_menu_button_rect_px(view_width, view_height, items.len(), index)
+            pause_menu_button_rect_px(view_width, view_height, items.len(), index, gui_scale)
         else {
             continue;
         };
@@ -4725,13 +4757,14 @@ fn build_menu_overlay_mesh(
     }
 
     if let Some(footer) = footer.filter(|text| !text.trim().is_empty()) {
-        let footer_scale = 1.0;
+        let footer_scale = row_scale;
         let footer_x = cx - bitmap_text_width_px(font, footer, footer_scale) * 0.5;
         let footer_y = pause_menu_button_rect_px(
             view_width,
             view_height,
             items.len(),
             items.len().saturating_sub(1),
+            gui_scale,
         )
         .map(|(_, button_y, _, button_h)| button_y + button_h + 18.0)
         .unwrap_or(cy + 64.0);
@@ -4879,10 +4912,11 @@ fn build_chat_overlay_mesh(
     view_height: u32,
     font: &BitmapFont,
     overlay: ChatOverlay<'_>,
+    gui_scale: f32,
 ) -> (Vec<Vertex>, Vec<u32>) {
     let mut vertices = Vec::with_capacity(4096);
     let mut indices = Vec::with_capacity(6144);
-    let scale = CHAT_OVERLAY_TEXT_SCALE;
+    let scale = (CHAT_OVERLAY_TEXT_SCALE * gui_scale).max(0.5);
     let line_h = font.glyph_h as f32 * scale + CHAT_OVERLAY_LINE_GAP;
     let mut y = view_height as f32 - CHAT_OVERLAY_PAD_BOTTOM - font.glyph_h as f32 * scale;
 
@@ -5050,6 +5084,8 @@ pub(crate) struct State {
     chat_overlay_cache: Option<ChatOverlayCacheKey>,
     inventory_overlay_mesh: Option<ChunkMesh>,
     inventory_overlay_cache: Option<InventoryOverlayCacheKey>,
+    /// User GUI-scale multiplier, applied on top of the per-element UI scales.
+    gui_scale: f32,
     _texture_registry: TextureRegistry,
     _world_texture_array: TextureArray,
     _sky_texture_array: TextureArray,
@@ -7684,6 +7720,23 @@ impl State {
         }
     }
 
+    pub(crate) fn set_gui_scale(&mut self, gui_scale: GuiScale) {
+        let factor = gui_scale.factor();
+        if (self.gui_scale - factor).abs() < f32::EPSILON {
+            return;
+        }
+        self.gui_scale = factor;
+        // Every cached overlay mesh was built for the old scale.
+        // (The menu overlay is rebuilt every frame, so it needs no invalidation.)
+        self.hotbar_overlay_mesh = None;
+        self.hotbar_overlay_cache = None;
+        self.inventory_overlay_mesh = None;
+        self.inventory_overlay_cache = None;
+        self.chat_overlay_mesh = None;
+        self.chat_overlay_cache = None;
+        self.rebuild_crosshair_mesh();
+    }
+
     pub(crate) fn set_backface_culling_enabled(&mut self, enabled: bool) {
         self.backface_culling_enabled = enabled;
     }
@@ -9312,7 +9365,7 @@ impl State {
         );
 
         let (crosshair_vertices, crosshair_indices) =
-            build_crosshair_mesh(config.width, config.height);
+            build_crosshair_mesh(config.width, config.height, GuiScale::default().factor());
         let crosshair_vertex_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Crosshair Vertex Buffer"),
@@ -9610,6 +9663,7 @@ impl State {
             chat_overlay_cache: None,
             inventory_overlay_mesh: None,
             inventory_overlay_cache: None,
+            gui_scale: GuiScale::default().factor(),
             _texture_registry: texture_registry,
             _world_texture_array: world_texture_array,
             _sky_texture_array: sky_texture_array,
@@ -9861,7 +9915,8 @@ impl State {
     }
 
     pub(crate) fn rebuild_crosshair_mesh(&mut self) {
-        let (vertices, indices) = build_crosshair_mesh(self.config.width, self.config.height);
+        let (vertices, indices) =
+            build_crosshair_mesh(self.config.width, self.config.height, self.gui_scale);
         let vertex_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -10051,6 +10106,7 @@ impl State {
             page,
             x,
             y,
+            self.gui_scale,
         )
     }
 
@@ -10061,6 +10117,7 @@ impl State {
             &self.inventory_atlas,
             x,
             y,
+            self.gui_scale,
         )
     }
 
@@ -18980,6 +19037,7 @@ impl State {
                 overlay.items,
                 overlay.enabled,
                 overlay.footer,
+                self.gui_scale,
             );
             self.upload_frame_mesh(FRAME_MESH_MENU_OVERLAY, vertices, indices);
         } else {
@@ -19005,6 +19063,7 @@ impl State {
                     &self.hud_atlas,
                     &self.inventory_atlas,
                     overlay,
+                    self.gui_scale,
                 );
                 let vertex_buffer =
                     self.device
@@ -19068,6 +19127,7 @@ impl State {
                             self.config.height,
                             &self.worldgen_font,
                             overlay,
+                            self.gui_scale,
                         );
                         let vertex_buffer =
                             self.device
@@ -19119,6 +19179,7 @@ impl State {
                     self.config.height,
                     &self.hud_atlas,
                     selected_hotbar_slot,
+                    self.gui_scale,
                 );
                 let vertex_buffer =
                     self.device
@@ -19184,6 +19245,7 @@ impl State {
                 &self.inventory_atlas,
                 overlay,
                 hotbar,
+                self.gui_scale,
             )
         } else if show_hotbar {
             collect_hotbar_item_preview_draws(
@@ -19191,6 +19253,7 @@ impl State {
                 self.config.height,
                 &self.hud_atlas,
                 hotbar,
+                self.gui_scale,
             )
         } else {
             Vec::new()
@@ -19211,6 +19274,7 @@ impl State {
                         self.config.width,
                         self.config.height,
                         &self.inventory_atlas,
+                        self.gui_scale,
                     )
                     .map(|(viewport_x, viewport_y, viewport_w, viewport_h)| {
                         ItemPreviewDraw {

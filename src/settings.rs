@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use winit::keyboard::KeyCode;
 
-use crate::config::render::RenderDistance;
+use crate::config::render::{GuiScale, RenderDistance};
 
 const SETTINGS_DIR: &str = "save";
 const SETTINGS_FILE_NAME: &str = "settings.json";
@@ -35,6 +35,7 @@ pub(crate) struct GraphicsSettings {
     pub(crate) render_distance: RenderDistance,
     pub(crate) vsync: bool,
     pub(crate) backface_culling: bool,
+    pub(crate) gui_scale: GuiScale,
 }
 
 impl Default for GraphicsSettings {
@@ -43,6 +44,7 @@ impl Default for GraphicsSettings {
             render_distance: RenderDistance::default(),
             vsync: true,
             backface_culling: true,
+            gui_scale: GuiScale::default(),
         }
     }
 }
