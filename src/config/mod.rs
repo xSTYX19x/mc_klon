@@ -155,6 +155,14 @@ pub(crate) mod render {
         Insane,
     }
 
+    /// User-selectable resting field of view, in degrees. The dynamic sprint /
+    /// flight kick multiplies off this value, so it stays the anchor the camera
+    /// eases back to when standing still.
+    pub(crate) const BASE_FOV_MIN_DEG: u32 = 30;
+    pub(crate) const BASE_FOV_MAX_DEG: u32 = 110;
+    pub(crate) const BASE_FOV_STEP_DEG: u32 = 5;
+    pub(crate) const BASE_FOV_DEFAULT_DEG: u32 = 70;
+
     /// Multiplier applied on top of the per-element UI scales (hotbar, inventory,
     /// menu buttons, text). `Normal` is 1.0, i.e. the scales the code already had.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

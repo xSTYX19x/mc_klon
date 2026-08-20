@@ -19,7 +19,10 @@ use crate::camera::{Camera, ViewBobbing};
 use crate::commands::{self, Command};
 use crate::config::app::DOUBLE_SPACE_WINDOW;
 use crate::config::player::PLAYER_TUNING_MINECRAFT;
-use crate::config::render::{GuiScale, HIGHLIGHT_BLINK_MS, RenderDistance, SimulationDistance};
+use crate::config::render::{
+    BASE_FOV_MAX_DEG, BASE_FOV_MIN_DEG, BASE_FOV_STEP_DEG, GuiScale, HIGHLIGHT_BLINK_MS,
+    RenderDistance, SimulationDistance,
+};
 use crate::input::CameraController;
 use crate::perf::trace as perf_trace;
 use crate::perf::{PerfCat, PerfStats};
@@ -177,7 +180,7 @@ impl OptionsScreen {
     const fn value_row_count(self) -> usize {
         match self {
             Self::Root => OPTIONS_ROOT_ITEMS.len(),
-            Self::Gameplay => 1,
+            Self::Gameplay => 2,
             Self::Graphics => 4,
             Self::Controls => InputAction::ALL.len(),
         }
@@ -331,8 +334,10 @@ impl Default for App {
             crate::console_error!("failed to load settings: {err}");
             AppSettings::default()
         });
-        let camera = Camera::default();
-        let base_fov_y_radians = camera.fov_y_radians;
+        let mut camera = Camera::default();
+        // The setting is the resting FOV the sprint/flight easing multiplies from.
+        let base_fov_y_radians = settings.gameplay.base_fov_radians();
+        camera.fov_y_radians = base_fov_y_radians;
         let player = Player::from_eye_position(camera.position);
         Self {
             window: None,
@@ -798,6 +803,9 @@ impl App {
     }
 
     fn apply_settings_to_state(&mut self) {
+        // Resting FOV the sprint/flight easing multiplies from; kept here so the
+        // options rows and the "reset to defaults" flow both pick it up.
+        self.base_fov_y_radians = self.settings.gameplay.base_fov_radians();
         if let Some(state) = self.state.as_mut() {
             state.set_render_distance(self.settings.graphics.render_distance, &self.camera);
             state.set_vsync_enabled(self.settings.graphics.vsync);
@@ -1246,6 +1254,18 @@ impl App {
                     ));
                     changed = true;
                 }
+                OptionsScreen::Gameplay if options.selected == 1 => {
+                    let current = self.settings.gameplay.base_fov_deg;
+                    let step = BASE_FOV_STEP_DEG as i32 * delta;
+                    let next = (current as i32 + step)
+                        .clamp(BASE_FOV_MIN_DEG as i32, BASE_FOV_MAX_DEG as i32)
+                        as u32;
+                    if next != current {
+                        self.settings.gameplay.base_fov_deg = next;
+                        options.status_line = Some(format!("Field of view: {next}°"));
+                        changed = true;
+                    }
+                }
                 OptionsScreen::Graphics if options.selected == 0 => {
                     let all = RenderDistance::ALL;
                     let current = self.settings.graphics.render_distance;
@@ -1309,6 +1329,7 @@ impl App {
             if !self.settings.gameplay.view_bobbing {
                 self.reset_view_bobbing();
             }
+
             if matches!(self.game_state, GameState::Options(_)) {
                 let save_error = self.persist_settings();
                 self.apply_settings_to_state();
@@ -2085,14 +2106,17 @@ impl App {
                     ),
                     OptionsScreen::Gameplay => (
                         "General / Gameplay".to_string(),
-                        vec![format!(
-                            "View bobbing: {}",
-                            if self.settings.gameplay.view_bobbing {
-                                "On"
-                            } else {
-                                "Off"
-                            }
-                        )],
+                        vec![
+                            format!(
+                                "View bobbing: {}",
+                                if self.settings.gameplay.view_bobbing {
+                                    "On"
+                                } else {
+                                    "Off"
+                                }
+                            ),
+                            format!("Field of view: {}°", self.settings.gameplay.base_fov_deg),
+                        ],
                     ),
                     OptionsScreen::Graphics => (
                         "Video / Graphics".to_string(),

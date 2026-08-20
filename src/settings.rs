@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use winit::keyboard::KeyCode;
 
-use crate::config::render::{GuiScale, RenderDistance};
+use crate::config::render::{
+    BASE_FOV_DEFAULT_DEG, BASE_FOV_MAX_DEG, BASE_FOV_MIN_DEG, GuiScale, RenderDistance,
+};
 
 const SETTINGS_DIR: &str = "save";
 const SETTINGS_FILE_NAME: &str = "settings.json";
@@ -21,11 +23,28 @@ pub(crate) struct AppSettings {
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct GameplaySettings {
     pub(crate) view_bobbing: bool,
+    /// Resting field of view in degrees; the sprint/flight kick multiplies off it.
+    pub(crate) base_fov_deg: u32,
 }
 
 impl Default for GameplaySettings {
     fn default() -> Self {
-        Self { view_bobbing: true }
+        Self {
+            view_bobbing: true,
+            base_fov_deg: BASE_FOV_DEFAULT_DEG,
+        }
+    }
+}
+
+impl GameplaySettings {
+    pub(crate) fn base_fov_radians(self) -> f32 {
+        (self.base_fov_deg as f32).to_radians()
+    }
+
+    /// Clamps values that came from a hand-edited settings file.
+    fn normalized(mut self) -> Self {
+        self.base_fov_deg = self.base_fov_deg.clamp(BASE_FOV_MIN_DEG, BASE_FOV_MAX_DEG);
+        self
     }
 }
 
@@ -323,7 +342,7 @@ impl AppSettings {
                     )
                 })?;
                 Ok(Self {
-                    gameplay: file.gameplay,
+                    gameplay: file.gameplay.normalized(),
                     graphics: file.graphics,
                     controls: file.controls.into_runtime(),
                 })
@@ -548,4 +567,52 @@ fn parse_keycode_name(raw: &str) -> Option<KeyCode> {
         "F12" => KeyCode::F12,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GameplaySettings, InputAction, InputBindings};
+    use crate::config::render::{BASE_FOV_MAX_DEG, BASE_FOV_MIN_DEG};
+
+    #[test]
+    fn clamps_hand_edited_base_fov() {
+        let too_low = GameplaySettings {
+            base_fov_deg: 1,
+            ..GameplaySettings::default()
+        }
+        .normalized();
+        assert_eq!(too_low.base_fov_deg, BASE_FOV_MIN_DEG);
+
+        let too_high = GameplaySettings {
+            base_fov_deg: 9000,
+            ..GameplaySettings::default()
+        }
+        .normalized();
+        assert_eq!(too_high.base_fov_deg, BASE_FOV_MAX_DEG);
+
+        let in_range = GameplaySettings {
+            base_fov_deg: 72,
+            ..GameplaySettings::default()
+        }
+        .normalized();
+        assert_eq!(in_range.base_fov_deg, 72);
+    }
+
+    #[test]
+    fn default_base_fov_matches_camera_default() {
+        let radians = GameplaySettings::default().base_fov_radians();
+        assert!((radians - crate::camera::Camera::default().fov_y_radians).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rebinding_swaps_the_conflicting_action() {
+        let mut bindings = InputBindings::default();
+        let jump_key = bindings.key_for(InputAction::Jump);
+        let sneak_key = bindings.key_for(InputAction::Sneak);
+
+        let conflict = bindings.set_key_swapping(InputAction::Jump, sneak_key);
+        assert_eq!(conflict, Some(InputAction::Sneak));
+        assert_eq!(bindings.key_for(InputAction::Jump), sneak_key);
+        assert_eq!(bindings.key_for(InputAction::Sneak), jump_key);
+    }
 }
