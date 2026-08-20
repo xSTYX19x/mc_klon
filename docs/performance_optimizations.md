@@ -1,6 +1,13 @@
 # Performance Optimizations
 
-Status: 2026-03-07
+Status: 2026-08-20
+
+## Reference Measurement
+
+Chunk streaming (moving through ungenerated terrain): **~50 FPS**, up from 10-20 FPS before the
+2026-08-20 round of fixes (measured in-game by the maintainer, same scene and settings).
+Treat this as the regression baseline for streaming work; details and what caused the jump are in
+`docs/07_performance_rendering_audit.md` → "Nachtrag 2026-08-20".
 
 ## Already Implemented
 
@@ -15,6 +22,10 @@ Status: 2026-03-07
 - Runtime trace output to `logs/run_<ts>_<ms>.*`
 - Startup loading flow now uses the same warmup/overlay path as `Generate new level`
 - Hotbar/inventory 3D block previews use cached preview meshes instead of rebuilding slot content every frame
+- All incremental lighting stages share one per-frame budget (`src/render/lighting_budget.rs`) in priority order (block edit → chunk add → chunk remove), each with a cap, a reserve for the stages behind it and a starvation floor
+- Incremental lighting is resumable on **all** paths (chunk add, chunk remove, block edit): each runs in bounded voxel/wall-clock steps and continues across frames
+- Stage-budget watchdog (`src/perf/stage_budget.rs`): reports per frame when a single item consumed a whole stage budget, into the trace ring, the stall report and (rate-limited) the console
+- Stall ring buffer evicts by retention time with a byte budget (`MC_KLON_TRACE_RING_MB`), so a stall report actually covers its intended 10 s window
 
 ## Priorities
 

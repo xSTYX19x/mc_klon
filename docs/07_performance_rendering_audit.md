@@ -5,6 +5,7 @@
 
 > **Umsetzungsstand.** Der Report wurde read-only erstellt; Fixes kamen danach. Erledigt sind §1.1,
 > §1.2 (Commit `188fdb8`) sowie §2.1, §2.3, §2.4 und die Durchsatz-Anpassung aus §2.2.
+> **Ergebnis von Symptom 1 siehe [Nachtrag 2026-08-20](#nachtrag-2026-08-20--streaming-lag-gemessenes-ergebnis): ~50 FPS beim Chunk-Laden statt vorher 10-20.**
 > Details in [Umsetzungsstand](#umsetzungsstand). Die Messwerte im Report stammen durchweg aus
 > Läufen **vor** diesen Fixes und sind entsprechend zu lesen.
 
@@ -29,7 +30,8 @@ Jeder Befund ist markiert als **CONFIRMED** (Code- **und** Log-Evidenz) oder **S
 5. [Allgemeine Schwachstellen](#5-allgemeine-schwachstellen)
 6. [Nächste Messungen](#6-nächste-messungen)
 7. [Umsetzungsstand](#umsetzungsstand)
-8. [Anhang A — Rohdaten aus den Stall-Reports](#anhang-a--rohdaten-aus-den-stall-reports)
+8. [Nachtrag 2026-08-20 — Streaming-Lag: gemessenes Ergebnis](#nachtrag-2026-08-20--streaming-lag-gemessenes-ergebnis)
+9. [Anhang A — Rohdaten aus den Stall-Reports](#anhang-a--rohdaten-aus-den-stall-reports)
 9. [Anhang B — Was explizit geprüft und ausgeschlossen wurde](#anhang-b--was-explizit-geprüft-und-ausgeschlossen-wurde)
 10. [Anhang C — Relevante Konstanten](#anhang-c--relevante-konstanten)
 
@@ -686,13 +688,14 @@ Der Report oben ist die Analyse auf `8f7634d`. Diese Tabelle hält nach, was dav
 | §2.5 | `blocks_skylight` vs. `OcclusionShape` | offen (bewusst) | |
 | §5 (Rest) | Chunk-Mesh-Suballocation statt Buffer pro Layer | offen (bewusst) | |
 | §2.2 (Rest) | Lighting auf den Worker-Pool | offen (bewusst) | |
-| §D.3 (Rest) | Removal-Lighting stufen | offen (bewusst) | |
+| §D.3 (Rest) | Removal-Lighting stufen | ✅ behoben | working tree (2026-08-20) |
 | §D.1 | `pump_removed_lighting_batches` bricht nach einem Batch ab | ✅ behoben | working tree |
 | §D.2 | Lint-Befehl aus `CLAUDE.md` schlägt fehl | 🟡 Clippy-Errors weg, Warning-Schulden offen | working tree |
 | §D.3 | Chunk-Entladung repariert Lighting synchron (188 ms) | ✅ behoben | working tree |
 | §D.4 | `tops`-Kategorienliste ohne Unload-Bucket | ✅ behoben | working tree |
+| §D.5 | Ring-Buffer deckt statt 10 s nur ~900 ms ab | ✅ behoben | working tree (2026-08-20) |
 | §1.6 | Trace-`format!` läuft auch ohne Arbeit | ✅ behoben | working tree |
-| §1.7 | Einzelnes Item kann das Stage-Budget sprengen | 🟡 grober Fall (§D.3) weg, Muster bleibt | working tree |
+| §1.7 | Einzelnes Item kann das Stage-Budget sprengen | 🟡 Watchdog meldet es jetzt; Splitten bleibt pro Stage | working tree (2026-08-20) |
 | §3.3 | `f32::clamp`-Panic in der Precipitation | ✅ behoben | working tree |
 | §3.1 | Boundary-Ocean-Aliasing | offen — SUSPECTED, nie bestätigt | |
 | §3.2 | Greedy-AO über gemergte Spans | offen (bewusst) | |
@@ -777,6 +780,71 @@ Diese Punkte sind nicht vergessen, sondern zurückgestellt — jeder aus einem k
 ### Testlage
 
 `cargo test`: 116 passed, 1 failed. Der Fehlschlag ist `world::config::tests::sea_level_comes_from_world_config_for_lakes_and_lava_constraints` und **vorbestehend** — gegen `8f7634d` mit identischer Meldung gegengeprüft (`water_y=84, sea_level=80`). Er ist unabhängig von allen hier beschriebenen Änderungen und noch offen.
+
+---
+
+## NACHTRAG 2026-08-20 — Streaming-Lag: gemessenes Ergebnis
+
+**Ergebnis (vom Nutzer im laufenden Spiel gemessen):** beim Chunk-Laden **~50 FPS statt vorher 10-20 FPS**.
+Das ist der Zielfall aus Symptom 1 (»unspielbar laggy, sobald neue Chunks generiert werden«) und damit
+die erste belastbare Bestätigung, dass der Streaming-Lag praktisch weg ist. Kein Mikrobenchmark:
+gleiche Szene, gleiche Settings, subjektiv identische Bewegung, FPS-Anzeige im Spiel.
+
+Diese Zahl steht bewusst hier und nicht in `docs/TODO.md` — TODO-Einträge verschwinden beim Abhaken,
+diese Messung ist der Referenzwert, gegen den künftige Regressionen laufen.
+
+### Was in dieser Runde landete
+
+**§D.5 — Ring-Buffer-Fenster (`src/perf/trace.rs`).** Die Eviction lief über einen festen Zähler
+(`RING_MAX_EVENTS = 8192`). Bei den gemessenen ~9.1 k Events/s deckte der Stall-Report damit ~900 ms
+statt der beabsichtigten 10 s ab: die Ursache eines Stalls war rausgeworfen, bevor der Report
+geschrieben wurde. Jetzt entscheidet die Retention-Zeit, das Byte-Budget (16 MB, `MC_KLON_TRACE_RING_MB`)
+ist nur noch Backstop. Nebenbei: Thread-Label als `Arc<str>` (eine Allokation pro Thread statt eines
+`String`-Clones pro Event) und ein Uhr-Lesen pro Event weniger. Der Report-Header nennt jetzt die
+**tatsächlich** abgedeckte Spanne plus `dropped_by_budget` — ein abgeschnittenes Fenster sah vorher
+aus wie ein vollständiges.
+
+**§D.3 (Rest) — Removal-Lighting gestuft (`src/render/state.rs`, `src/world/mod.rs`).**
+`pump_removed_lighting_batches` rief das One-Shot-`lighting_on_chunks_removed`, das pro entferntem
+Chunk 8-19 ms am Stück lief. Ein Batch wird jetzt zu einem `RemovedLightingJob` mit
+`IncrementalLightingTask` (`World::begin_incremental_chunk_removed_lighting_task`) und läuft unter
+denselben Voxel-/Wall-Clock-Limits wie der Add-Pfad, über Frames hinweg fortsetzbar. Die
+Nachbar-Region-Bestimmung teilen sich beide Pfade (`for_each_chunk_removed_lighting_region_coord`),
+damit sie nicht auseinanderlaufen. Verifiziert durch einen Test, der Schritt-Ergebnis und One-Shot-
+Ergebnis auf identische Lightmaps prüft.
+
+**§1.7 — Stage-Budget-Watchdog (`src/perf/stage_budget.rs`).** Jede budgetierte Stage prüft
+`if items > 0 && elapsed >= budget`. Das garantiert Fortschritt, deckelt aber **ein** Item nicht:
+ein 40-ms-Item passiert eine Prüfung, die die Stage auf 3 ms halten soll. Der Watchdog sammelt pro
+Frame, welche Einzelitems ein ganzes Stage-Budget gekostet haben (Anzahl, schlimmstes Item mit Label,
+summierter Overrun), meldet worst-first in den Trace-Ring, maximal alle 5 s auf die Konsole und
+hängt `stage_budget_overruns[…]` an den Stall-Report. Angeschlossen an die drei Lighting-Step-Loops
+und den Chunk-Mesh-Upload — bewusst nur dort, wo die Item-Dauer ohnehin gemessen wird, also keine
+neuen `Instant::now()` auf Hot Paths. Das Splitten eines auffälligen Items bleibt ein Fix pro Stage;
+der Watchdog macht den Fall nur sichtbar.
+
+**Neu — geteiltes Lighting-Frame-Budget (`src/render/lighting_budget.rs`).** Direkte Fortsetzung
+des Tunings an derselben Stelle. Die drei Lighting-Pumps liefen in `rebuild_world_lighting_if_dirty`
+hintereinander, jede mit eigenem Frame-Budget: 1.5 + 6.0 + 3.0 = **10.5 ms** eines 16.6-ms-Frames
+konnten allein in Lighting gehen, und keine Stage sah, was die anderen schon verbraucht hatten.
+Jetzt zieht jede aus **einem** Budget (`LIGHTING_FRAME_BUDGET_MS = 7.0`), in Prioritätsreihenfolge
+Block-Edit → Chunk-Add → Chunk-Remove: Spieleraktion zuerst, dann frisch gestreamte Chunks, zuletzt
+die Nachbarn gerade entladener Chunks (die niemand sieht). Jede Stage behält ihren alten Wert als
+**Cap**, hält eine Reserve für die Stages hinter sich zurück und hat einen Floor von 0.25 ms, damit
+keine verhungert. Zwei Effekte auf einmal: der gestapelte Worst Case sinkt von 10.5 ms auf 7 ms
+(plus höchstens ein begrenzter Step pro Stage), und beim reinen Streaming — dem gemessenen Fall —
+darf der Chunk-Add-Pump bis zu 6 ms statt seiner alten privaten 6 ms nutzen, sobald die anderen
+beiden nichts zu tun haben, statt an einer starren Aufteilung zu hängen. Die Budget-Arithmetik ist
+als reine Funktion herausgezogen und mit 7 Tests belegt, inklusive »kein Stage-Stack über dem
+alten Worst Case« und »keine Stage wird ausgehungert«.
+
+### Warum das zusammen so viel bringt
+
+Die drei Posten greifen an derselben Stelle ineinander: Chunk-Eviction während des Streamings
+erzeugte Removal-Lighting, das synchron durchlief und den Frame killte (§D.3). Sichtbar wurde das nie
+sauber, weil der Ring-Buffer die Ursache längst evakuiert hatte (§D.5) und die `tops`-Liste die
+Kosten dem falschen Subsystem zuschrieb (§D.4). Der Watchdog (§1.7) schließt die Lücke für den
+nächsten Fall dieser Art.
 
 ---
 
