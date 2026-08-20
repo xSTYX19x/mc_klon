@@ -61,8 +61,7 @@ When an item ships, delete it from here instead of marking it done.
 ## UI / UX
 
 - keep expanding the options UI without reintroducing scattered hard-coded runtime settings
-- [x] add reset/default flows and validation feedback to options UX *(umgesetzt, wartet auf Verifikation)*
-- move remaining legacy block-selection/icon paths onto the 3D preview renderer
+- [x] move remaining legacy block-selection/icon paths onto the 3D preview renderer *(umgesetzt, wartet auf Verifikation)*
 - add a real in-game ticking-area editor (radius/flags UI) instead of the `Ctrl+T`/`Ctrl+Shift+T` shortcut-only workflow
 - options "back" button always jumps to the main/pause menu instead of one level up: `MenuOrigin` (`src/app/mod.rs:125`) is only a two-way `MainMenu`/`PauseMenu` tag, and `close_options_menu` (`app/mod.rs:793`) always exits straight to that origin; sub-screen back already special-cases `OptionsScreen::Root` (`app/mod.rs:1187`) but nothing generalizes it — replace `MenuOrigin` with a real `Vec<Screen>` navigation stack (push on every "enter screen", pop on back) shared by options and any future nested menus
 - add world management (rename/delete) to the load-level menu: `SavedWorldMenuEntry` (`app/mod.rs:82`) and `enter_load_level_menu` (`app/mod.rs:801`) only list worlds today; `src/storage/world_meta.rs` has no rename/delete helpers (only atomic save via `fs::rename` at `world_meta.rs:121`) — add `WorldMeta::delete(dir)` (`fs::remove_dir_all` with a confirmation prompt in the UI) and a rename path that renames the world folder and rewrites the display name in its meta file, then wire per-entry buttons/keybinds into the load-level list

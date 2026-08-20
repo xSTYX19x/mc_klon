@@ -285,12 +285,6 @@ pub(crate) mod render {
     pub(crate) const HIGHLIGHT_BLINK_MS: u128 = 250;
     pub(crate) const CROSSHAIR_THICKNESS_PX: f32 = 4.0;
     pub(crate) const CROSSHAIR_HALF_LEN_PX: f32 = 14.0;
-    pub(crate) const PREVIEW_SIZE_PX: f32 = 44.0;
-    pub(crate) const PREVIEW_MARGIN_TOP_PX: f32 = 20.0;
-    pub(crate) const PREVIEW_MARGIN_RIGHT_PX: f32 = 20.0;
-    pub(crate) const PREVIEW_ACCENT_STRIPE_PX: f32 = 10.0;
-    pub(crate) const PREVIEW_FLIP_HORIZONTAL: bool = true;
-    pub(crate) const PREVIEW_FLIP_VERTICAL: bool = false;
 
     pub(crate) const FOG_START_DISTANCE: f32 = 40.0;
     pub(crate) const FOG_END_DISTANCE: f32 = 180.0;

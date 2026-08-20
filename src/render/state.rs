@@ -54,8 +54,7 @@ use crate::config::render::{
     CROSSHAIR_HALF_LEN_PX, CROSSHAIR_THICKNESS_PX, FOG_RENDERDIST_END_MARGIN_BLOCKS,
     FOG_RENDERDIST_START_RATIO, MINECRAFT_TICK_SECONDS, NEAR_MESH_RADIUS_CHUNKS, PARTICLE_GRAVITY,
     PARTICLE_LIFE_MAX, PARTICLE_LIFE_MIN, PARTICLE_MAX_COUNT, PARTICLE_QUAD_SIZE,
-    PARTICLE_SPAWN_COUNT, PARTICLE_SPEED_MAX, PARTICLE_SPEED_MIN, PREVIEW_ACCENT_STRIPE_PX,
-    PREVIEW_MARGIN_RIGHT_PX, PREVIEW_MARGIN_TOP_PX, PREVIEW_SIZE_PX, RenderDistance,
+    PARTICLE_SPAWN_COUNT, PARTICLE_SPEED_MAX, PARTICLE_SPEED_MIN, RenderDistance,
     STREAM_BURST_CHUNKGEN_APPLY_BUDGET_MS, STREAM_BURST_DISPATCH_BUDGET_MS,
     STREAM_BURST_MAX_TOTAL_BUDGET_MS, STREAM_BURST_MESH_UPLOAD_BUDGET_MS,
     STREAM_BURST_MISSING_MESHES_THRESHOLD, STREAM_BURST_NEAR_RADIUS_CHUNKS,
@@ -1090,15 +1089,6 @@ const FIRST_PERSON_HELD_ITEM_GRIP_TO_CENTER_UP: f32 = 0.3;
 const FIRST_PERSON_HELD_ITEM_GRIP_TO_CENTER_FORWARD: f32 = 1.5;
 const FIRST_PERSON_HELD_ITEM_YAW_RAD: f32 = -35.0_f32.to_radians();
 const FIRST_PERSON_HELD_ITEM_PITCH_RAD: f32 = 0.0_f32.to_radians();
-pub(crate) const BLOCK_SELECT_COLUMNS: usize = 9;
-const BLOCK_SELECT_CELL_SIZE_PX: f32 = 44.0;
-const BLOCK_SELECT_CELL_GAP_PX: f32 = 8.0;
-const BLOCK_SELECT_PANEL_PAD_PX: f32 = 14.0;
-const BLOCK_SELECT_PANEL_BORDER: [f32; 3] = [0.12, 0.12, 0.12];
-const BLOCK_SELECT_PANEL_BG: [f32; 3] = [0.20, 0.20, 0.20];
-const BLOCK_SELECT_CELL_BORDER: [f32; 3] = [0.10, 0.10, 0.10];
-const BLOCK_SELECT_CELL_BG: [f32; 3] = [0.27, 0.27, 0.27];
-const BLOCK_SELECT_CELL_SELECTED: [f32; 3] = [0.55, 0.55, 0.55];
 const COORDS_TEXT_SCALE: f32 = 1.5;
 const DEBUG_OVERLAY_TEXT_SCALE: f32 = 2.5;
 const CHAT_OVERLAY_TEXT_SCALE: f32 = 2.35;
@@ -2542,12 +2532,6 @@ enum MenuButtonVisualState {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct BlockSelectOverlay<'a> {
-    pub selected: usize,
-    pub blocks: &'a [BlockId],
-}
-
-#[derive(Clone, Copy, Debug)]
 pub(crate) struct InventoryOverlay<'a> {
     pub palette_blocks: &'a [BlockId],
     pub selected_palette: usize,
@@ -2612,15 +2596,6 @@ impl Default for FirstPersonArmTweak {
             model_rot_z_rad: FIRST_PERSON_ARM_MODEL_ROT_Z_RAD,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct BlockSelectOverlayCacheKey {
-    view_width: u32,
-    view_height: u32,
-    selected: usize,
-    block_count: usize,
-    block_ptr: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3054,125 +3029,6 @@ fn build_crosshair_mesh(view_width: u32, view_height: u32) -> (Vec<Vertex>, Vec<
     let indices = vec![
         0, 1, 2, 0, 2, 3, // horizontal
         4, 5, 6, 4, 6, 7, // vertical
-    ];
-
-    (vertices, indices)
-}
-
-#[allow(dead_code)]
-fn build_block_preview_mesh(
-    view_width: u32,
-    view_height: u32,
-    texture_layer: u32,
-    flipped_horizontal: bool,
-    flipped_vertical: bool,
-) -> (Vec<Vertex>, Vec<u32>) {
-    let px_to_ndc_x = 2.0 / (view_width.max(1) as f32);
-    let px_to_ndc_y = 2.0 / (view_height.max(1) as f32);
-
-    let half_w = (PREVIEW_SIZE_PX * 0.5) * px_to_ndc_x;
-    let half_h = (PREVIEW_SIZE_PX * 0.5) * px_to_ndc_y;
-    let stripe_w = PREVIEW_ACCENT_STRIPE_PX * px_to_ndc_x;
-
-    let center_x = 1.0 - (PREVIEW_MARGIN_RIGHT_PX * px_to_ndc_x) - half_w;
-    let center_y = 1.0 - (PREVIEW_MARGIN_TOP_PX * px_to_ndc_y) - half_h;
-
-    let mut local = vec![
-        [-half_w, -half_h, 0.0],
-        [half_w, -half_h, 0.0],
-        [half_w, half_h, 0.0],
-        [-half_w, half_h, 0.0],
-        [-half_w, -half_h, 0.0],
-        [-half_w + stripe_w, -half_h, 0.0],
-        [-half_w + stripe_w, half_h, 0.0],
-        [-half_w, half_h, 0.0],
-    ];
-
-    for p in &mut local {
-        p[0] += center_x;
-        p[1] += center_y;
-    }
-
-    let stripe_uv_span = (PREVIEW_ACCENT_STRIPE_PX / PREVIEW_SIZE_PX).clamp(0.0, 1.0);
-    let uv = |u: f32, v: f32| -> [f32; 2] {
-        let u_flipped = if flipped_horizontal { 1.0 - u } else { u };
-        let v_flipped = if flipped_vertical { 1.0 - v } else { v };
-        [u_flipped, v_flipped]
-    };
-
-    let base = [1.0, 1.0, 1.0];
-    let accent = [0.72, 0.72, 0.72];
-
-    let vertices = vec![
-        Vertex {
-            position: local[0],
-            uv: uv(0.0, 0.0),
-            tex_layer: texture_layer,
-            tint_kind: UI_MODE_TEXTURED,
-            light_packed: FULLBRIGHT_LIGHT_PACKED,
-            color: base,
-        },
-        Vertex {
-            position: local[1],
-            uv: uv(1.0, 0.0),
-            tex_layer: texture_layer,
-            tint_kind: UI_MODE_TEXTURED,
-            light_packed: FULLBRIGHT_LIGHT_PACKED,
-            color: base,
-        },
-        Vertex {
-            position: local[2],
-            uv: uv(1.0, 1.0),
-            tex_layer: texture_layer,
-            tint_kind: UI_MODE_TEXTURED,
-            light_packed: FULLBRIGHT_LIGHT_PACKED,
-            color: base,
-        },
-        Vertex {
-            position: local[3],
-            uv: uv(0.0, 1.0),
-            tex_layer: texture_layer,
-            tint_kind: UI_MODE_TEXTURED,
-            light_packed: FULLBRIGHT_LIGHT_PACKED,
-            color: base,
-        },
-        Vertex {
-            position: local[4],
-            uv: uv(0.0, 0.0),
-            tex_layer: texture_layer,
-            tint_kind: UI_MODE_TEXTURED,
-            light_packed: FULLBRIGHT_LIGHT_PACKED,
-            color: accent,
-        },
-        Vertex {
-            position: local[5],
-            uv: uv(stripe_uv_span, 0.0),
-            tex_layer: texture_layer,
-            tint_kind: UI_MODE_TEXTURED,
-            light_packed: FULLBRIGHT_LIGHT_PACKED,
-            color: accent,
-        },
-        Vertex {
-            position: local[6],
-            uv: uv(stripe_uv_span, 1.0),
-            tex_layer: texture_layer,
-            tint_kind: UI_MODE_TEXTURED,
-            light_packed: FULLBRIGHT_LIGHT_PACKED,
-            color: accent,
-        },
-        Vertex {
-            position: local[7],
-            uv: uv(0.0, 1.0),
-            tex_layer: texture_layer,
-            tint_kind: UI_MODE_TEXTURED,
-            light_packed: FULLBRIGHT_LIGHT_PACKED,
-            color: accent,
-        },
-    ];
-
-    let indices = vec![
-        0, 1, 2, 0, 2, 3, // main quad
-        4, 5, 6, 4, 6, 7, // accent stripe
     ];
 
     (vertices, indices)
@@ -4406,181 +4262,6 @@ fn inventory_preview_viewport_rect_px(
     Some((x, y, w.max(1), h.max(1)))
 }
 
-#[derive(Clone, Copy, Debug)]
-struct BlockSelectLayout {
-    panel_x: f32,
-    panel_y: f32,
-    panel_w: f32,
-    panel_h: f32,
-    grid_x: f32,
-    grid_y: f32,
-}
-
-fn block_select_layout_px(
-    view_width: u32,
-    view_height: u32,
-    item_count: usize,
-) -> Option<BlockSelectLayout> {
-    if item_count == 0 {
-        return None;
-    }
-    let columns = BLOCK_SELECT_COLUMNS.max(1);
-    let rows = item_count.div_ceil(columns);
-    let grid_w = columns as f32 * BLOCK_SELECT_CELL_SIZE_PX
-        + (columns.saturating_sub(1)) as f32 * BLOCK_SELECT_CELL_GAP_PX;
-    let grid_h = rows as f32 * BLOCK_SELECT_CELL_SIZE_PX
-        + (rows.saturating_sub(1)) as f32 * BLOCK_SELECT_CELL_GAP_PX;
-    let panel_w = grid_w + BLOCK_SELECT_PANEL_PAD_PX * 2.0;
-    let panel_h = grid_h + BLOCK_SELECT_PANEL_PAD_PX * 2.0;
-    let panel_x = view_width as f32 * 0.5 - panel_w * 0.5;
-    let panel_y = view_height as f32 * 0.5 - panel_h * 0.5;
-
-    Some(BlockSelectLayout {
-        panel_x,
-        panel_y,
-        panel_w,
-        panel_h,
-        grid_x: panel_x + BLOCK_SELECT_PANEL_PAD_PX,
-        grid_y: panel_y + BLOCK_SELECT_PANEL_PAD_PX,
-    })
-}
-
-fn block_select_cell_rect_px(
-    view_width: u32,
-    view_height: u32,
-    item_count: usize,
-    index: usize,
-) -> Option<(f32, f32, f32, f32)> {
-    if item_count == 0 || index >= item_count {
-        return None;
-    }
-    let layout = block_select_layout_px(view_width, view_height, item_count)?;
-    let columns = BLOCK_SELECT_COLUMNS.max(1);
-    let row = index / columns;
-    let col = index % columns;
-    let x = layout.grid_x + col as f32 * (BLOCK_SELECT_CELL_SIZE_PX + BLOCK_SELECT_CELL_GAP_PX);
-    let y = layout.grid_y + row as f32 * (BLOCK_SELECT_CELL_SIZE_PX + BLOCK_SELECT_CELL_GAP_PX);
-    Some((x, y, BLOCK_SELECT_CELL_SIZE_PX, BLOCK_SELECT_CELL_SIZE_PX))
-}
-
-pub(crate) fn block_select_item_at_pos_px(
-    view_width: u32,
-    view_height: u32,
-    item_count: usize,
-    x: f32,
-    y: f32,
-) -> Option<usize> {
-    for index in 0..item_count {
-        let Some((bx, by, bw, bh)) =
-            block_select_cell_rect_px(view_width, view_height, item_count, index)
-        else {
-            continue;
-        };
-        if x >= bx && x <= bx + bw && y >= by && y <= by + bh {
-            return Some(index);
-        }
-    }
-    None
-}
-
-fn build_block_select_overlay_mesh(
-    view_width: u32,
-    view_height: u32,
-    texture_lookup: &BlockTextureLookup,
-    selected: usize,
-    blocks: &[BlockId],
-) -> (Vec<Vertex>, Vec<u32>) {
-    let mut vertices = Vec::with_capacity(8192);
-    let mut indices = Vec::with_capacity(12288);
-
-    let Some(layout) = block_select_layout_px(view_width, view_height, blocks.len()) else {
-        return (vertices, indices);
-    };
-
-    append_ui_solid_quad_px(
-        &mut vertices,
-        &mut indices,
-        view_width,
-        view_height,
-        layout.panel_x - 1.0,
-        layout.panel_y - 1.0,
-        layout.panel_w + 2.0,
-        layout.panel_h + 2.0,
-        BLOCK_SELECT_PANEL_BORDER,
-    );
-    append_ui_solid_quad_px(
-        &mut vertices,
-        &mut indices,
-        view_width,
-        view_height,
-        layout.panel_x,
-        layout.panel_y,
-        layout.panel_w,
-        layout.panel_h,
-        BLOCK_SELECT_PANEL_BG,
-    );
-
-    let selected_index = selected.min(blocks.len().saturating_sub(1));
-    for (index, block) in blocks.iter().copied().enumerate() {
-        let Some((x, y, w, h)) =
-            block_select_cell_rect_px(view_width, view_height, blocks.len(), index)
-        else {
-            continue;
-        };
-        append_ui_solid_quad_px(
-            &mut vertices,
-            &mut indices,
-            view_width,
-            view_height,
-            x,
-            y,
-            w,
-            h,
-            BLOCK_SELECT_CELL_BORDER,
-        );
-        append_ui_solid_quad_px(
-            &mut vertices,
-            &mut indices,
-            view_width,
-            view_height,
-            x + 1.0,
-            y + 1.0,
-            w - 2.0,
-            h - 2.0,
-            if index == selected_index {
-                BLOCK_SELECT_CELL_SELECTED
-            } else {
-                BLOCK_SELECT_CELL_BG
-            },
-        );
-
-        let icon_pad = 5.0;
-        let icon_size = (w - icon_pad * 2.0).max(1.0);
-        let icon_face = if matches!(texture_lookup.model_for(block), BlockModel::CrossPlant) {
-            Face::North
-        } else {
-            Face::Up
-        };
-        let icon_layer = texture_lookup.layer_for(block, icon_face);
-        append_ui_textured_quad_px(
-            &mut vertices,
-            &mut indices,
-            view_width,
-            view_height,
-            x + icon_pad,
-            y + icon_pad,
-            icon_size,
-            icon_size,
-            [0.0, 0.0],
-            [1.0, 1.0],
-            icon_layer,
-            [1.0, 1.0, 1.0],
-        );
-    }
-
-    (vertices, indices)
-}
-
 fn collect_hotbar_item_preview_draws(
     view_width: u32,
     view_height: u32,
@@ -5369,8 +5050,6 @@ pub(crate) struct State {
     chat_overlay_cache: Option<ChatOverlayCacheKey>,
     inventory_overlay_mesh: Option<ChunkMesh>,
     inventory_overlay_cache: Option<InventoryOverlayCacheKey>,
-    block_select_overlay_mesh: Option<ChunkMesh>,
-    block_select_overlay_cache: Option<BlockSelectOverlayCacheKey>,
     _texture_registry: TextureRegistry,
     _world_texture_array: TextureArray,
     _sky_texture_array: TextureArray,
@@ -9872,8 +9551,6 @@ impl State {
             chat_overlay_cache: None,
             inventory_overlay_mesh: None,
             inventory_overlay_cache: None,
-            block_select_overlay_mesh: None,
-            block_select_overlay_cache: None,
             _texture_registry: texture_registry,
             _world_texture_array: world_texture_array,
             _sky_texture_array: sky_texture_array,
@@ -19214,8 +18891,6 @@ impl State {
         } else {
             self.clear_frame_mesh(FRAME_MESH_MENU_OVERLAY);
         }
-        self.block_select_overlay_mesh = None;
-        self.block_select_overlay_cache = None;
         let showing_inventory = if let Some(overlay) = inventory_overlay {
             let cache_key = InventoryOverlayCacheKey {
                 view_width: self.config.width,
