@@ -349,8 +349,10 @@ fn append_bottom_slabs_in_chunk(
     }
 }
 
+/// Baked face darkening, shared with the inventory/hotbar item previews so both
+/// use the same shading model.
 #[inline(always)]
-fn face_shade(face: Face) -> f32 {
+pub(crate) fn face_shade(face: Face) -> f32 {
     match face {
         Face::Up => 1.0,
         Face::North | Face::South => 0.8,

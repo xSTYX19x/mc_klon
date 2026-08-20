@@ -56,6 +56,9 @@ const THIRD_PERSON_PROBE_RADIUS: f32 = 0.12;
 const FOV_MAX_DEG: f32 = 150.0;
 const HOTBAR_SLOT_COUNT: usize = 9;
 const SPAWN_SEARCH_RADIUS_BLOCKS: i32 = 8;
+/// Total wall-clock budget for waiting on worldgen during spawn placement.
+/// Runs once, on the loading-screen → in-game transition.
+const SPAWN_COLUMN_WAIT_BUDGET: Duration = Duration::from_millis(750);
 const MOUSE_WHEEL_PIXEL_STEP: f32 = 40.0;
 const CHAT_MAX_LINES: usize = 64;
 const CHAT_VISIBLE_LINES: usize = 16;
@@ -116,6 +119,68 @@ fn capitalize(text: &str) -> String {
     }
 }
 
+/// What a click in the open inventory landed on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InventorySlotRef {
+    Palette(usize),
+    Hotbar(usize),
+    Outside,
+}
+
+/// Everything one inventory click changes. Returned instead of applied so the
+/// carry/place/swap rules can be unit tested without the event loop.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct InventoryClickOutcome {
+    /// Item in hand afterwards.
+    carried: Option<BlockId>,
+    /// Hotbar slot to overwrite, with its new contents.
+    hotbar_write: Option<(usize, Option<BlockId>)>,
+    select_hotbar: Option<usize>,
+    select_palette: Option<usize>,
+}
+
+/// Minecraft-style click handling: pick up, place, swap, discard.
+///
+/// `hotbar_block` is the target slot's current content, `palette_block` the
+/// creative entry under the cursor. The creative palette is an infinite source,
+/// so taking from it leaves the entry in place.
+fn apply_inventory_click(
+    target: InventorySlotRef,
+    carried: Option<BlockId>,
+    hotbar_block: Option<BlockId>,
+    palette_block: Option<BlockId>,
+) -> InventoryClickOutcome {
+    match target {
+        InventorySlotRef::Palette(index) => InventoryClickOutcome {
+            // Dropping onto the palette destroys the carried item.
+            carried: if carried.is_some() {
+                None
+            } else {
+                palette_block
+            },
+            select_palette: Some(index),
+            ..InventoryClickOutcome::default()
+        },
+        InventorySlotRef::Hotbar(slot) => match carried {
+            // Place into an empty slot, or swap with whatever is in there.
+            Some(block) => InventoryClickOutcome {
+                carried: hotbar_block,
+                hotbar_write: Some((slot, Some(block))),
+                select_hotbar: Some(slot),
+                ..InventoryClickOutcome::default()
+            },
+            // Empty hand: lift the item out, or just move the selection.
+            None => InventoryClickOutcome {
+                carried: hotbar_block,
+                hotbar_write: hotbar_block.map(|_| (slot, None)),
+                select_hotbar: Some(slot),
+                ..InventoryClickOutcome::default()
+            },
+        },
+        InventorySlotRef::Outside => InventoryClickOutcome::default(),
+    }
+}
+
 struct MenuScreenContent {
     title: String,
     items: Vec<String>,
@@ -159,7 +224,11 @@ enum GameState {
         selected_palette: usize,
         selected_hotbar_slot: usize,
         scroll: i32,
-        dragged_block: Option<BlockId>,
+        /// Item "in hand", following the cursor until it is placed or discarded.
+        carried_block: Option<BlockId>,
+        /// Slot the current left-press started on, so a drag can be told apart
+        /// from a click that leaves the item carried.
+        press_origin: Option<InventorySlotRef>,
     },
 }
 
@@ -1104,7 +1173,8 @@ impl App {
             selected_palette,
             selected_hotbar_slot: self.selected_slot.min(HOTBAR_SLOT_COUNT.saturating_sub(1)),
             scroll: 0,
-            dragged_block: None,
+            carried_block: None,
+            press_origin: None,
         };
         self.clear_action_state();
         if let Some(window) = self.window.as_ref() {
@@ -1114,6 +1184,14 @@ impl App {
 
     fn leave_inventory(&mut self) {
         self.clear_menu_press();
+        // A carried item would otherwise vanish with the inventory state; put it
+        // back so closing mid-drag cannot lose a hotbar item.
+        if let GameState::Inventory { carried_block, .. } = &mut self.game_state
+            && let Some(block) = carried_block.take()
+            && let Some(free) = self.hotbar.iter().position(|slot| slot.is_none())
+        {
+            self.hotbar[free] = Some(block);
+        }
         self.nav_stack.clear();
         self.game_state = GameState::InGame;
         self.clear_action_state();
@@ -2617,6 +2695,9 @@ impl App {
         center_z: i32,
     ) -> (Vec3, bool) {
         let mut fallback: Option<(Vec3, bool)> = None;
+        // One budget for the whole search, not per column: this probes up to
+        // (2*8+1)^2 = 289 columns, and a per-column wait multiplies out.
+        let deadline = Instant::now() + SPAWN_COLUMN_WAIT_BUDGET;
 
         for radius in 0..=SPAWN_SEARCH_RADIUS_BLOCKS {
             for dz in -radius..=radius {
@@ -2626,7 +2707,7 @@ impl App {
                     }
                     let world_x = center_x + dx;
                     let world_z = center_z + dz;
-                    state.ensure_column_loaded_or_generated(world_x, world_z);
+                    state.ensure_column_loaded_or_generated(world_x, world_z, deadline);
 
                     if let Some(candidate) =
                         Self::try_surface_spawn_in_column(&state.world, world_x, world_z)
@@ -3452,40 +3533,84 @@ impl ApplicationHandler for App {
                         self.cursor_pos.1,
                     );
                     let page_count = state.inventory_palette_page_count(CLASSIC_PALETTE.len());
+                    // Hotbar wins over the palette when both report a hit.
+                    let target = match (hotbar_hit, palette_hit) {
+                        (Some(slot), _) => InventorySlotRef::Hotbar(slot),
+                        (None, Some(index)) => InventorySlotRef::Palette(index),
+                        (None, None) => InventorySlotRef::Outside,
+                    };
+                    let hotbar_block = match target {
+                        InventorySlotRef::Hotbar(slot) => self.hotbar.get(slot).copied().flatten(),
+                        _ => None,
+                    };
+                    let palette_block = match target {
+                        InventorySlotRef::Palette(index) => CLASSIC_PALETTE.get(index).copied(),
+                        _ => None,
+                    };
+
+                    let mut outcome = None;
                     if let GameState::Inventory {
-                        selected_palette,
-                        selected_hotbar_slot,
                         scroll,
-                        dragged_block,
+                        carried_block,
+                        press_origin,
+                        ..
                     } = &mut self.game_state
                     {
                         *scroll = (*scroll).clamp(0, page_count.saturating_sub(1) as i32);
                         match (button, button_state) {
                             (MouseButton::Left, ElementState::Pressed) => {
-                                if let Some(slot) = hotbar_hit {
-                                    *selected_hotbar_slot = slot;
-                                    self.selected_slot = slot;
-                                }
-                                if let Some(index) = palette_hit {
-                                    *selected_palette = index;
-                                    *dragged_block = CLASSIC_PALETTE.get(index).copied();
-                                }
+                                *press_origin = Some(target);
+                                outcome = Some(apply_inventory_click(
+                                    target,
+                                    *carried_block,
+                                    hotbar_block,
+                                    palette_block,
+                                ));
                             }
                             (MouseButton::Left, ElementState::Released) => {
-                                if let Some(block) = dragged_block.take()
-                                    && let Some(slot) = hotbar_hit
-                                {
-                                    self.hotbar[slot] = Some(block);
-                                    *selected_hotbar_slot = slot;
-                                    self.selected_slot = slot;
+                                // Releasing on the slot the press started on keeps
+                                // the item in hand (click-to-carry); releasing
+                                // somewhere else completes a drag.
+                                let origin = press_origin.take();
+                                if origin != Some(target) {
+                                    outcome = Some(apply_inventory_click(
+                                        target,
+                                        *carried_block,
+                                        hotbar_block,
+                                        palette_block,
+                                    ));
                                 }
                             }
                             (MouseButton::Right, ElementState::Pressed) => {
-                                if let Some(slot) = hotbar_hit {
+                                if let InventorySlotRef::Hotbar(slot) = target {
                                     self.hotbar[slot] = None;
                                 }
                             }
                             _ => {}
+                        }
+                    }
+
+                    if let Some(outcome) = outcome {
+                        if let Some((slot, contents)) = outcome.hotbar_write {
+                            self.hotbar[slot] = contents;
+                        }
+                        if let Some(slot) = outcome.select_hotbar {
+                            self.selected_slot = slot;
+                        }
+                        if let GameState::Inventory {
+                            selected_palette,
+                            selected_hotbar_slot,
+                            carried_block,
+                            ..
+                        } = &mut self.game_state
+                        {
+                            *carried_block = outcome.carried;
+                            if let Some(slot) = outcome.select_hotbar {
+                                *selected_hotbar_slot = slot;
+                            }
+                            if let Some(index) = outcome.select_palette {
+                                *selected_palette = index;
+                            }
                         }
                     }
                     return;
@@ -4009,7 +4134,8 @@ impl ApplicationHandler for App {
                             selected_palette,
                             selected_hotbar_slot,
                             scroll,
-                            dragged_block,
+                            carried_block,
+                            ..
                         } => {
                             let page =
                                 state.inventory_clamp_palette_page(*scroll, CLASSIC_PALETTE.len());
@@ -4029,7 +4155,7 @@ impl ApplicationHandler for App {
                                 page,
                                 hovered_palette,
                                 hovered_hotbar,
-                                *dragged_block,
+                                *carried_block,
                             ))
                         }
                         _ => None,
@@ -4041,7 +4167,7 @@ impl ApplicationHandler for App {
                             page,
                             hovered_palette,
                             hovered_hotbar,
-                            dragged_block,
+                            carried_block,
                         )| {
                             InventoryOverlay {
                                 palette_blocks: CLASSIC_PALETTE,
@@ -4052,7 +4178,7 @@ impl ApplicationHandler for App {
                                 page: *page,
                                 hovered_palette: *hovered_palette,
                                 hovered_hotbar_slot: *hovered_hotbar,
-                                dragged_block: *dragged_block,
+                                carried_block: *carried_block,
                                 cursor_px: [self.cursor_pos.0, self.cursor_pos.1],
                             }
                         },
@@ -4180,6 +4306,103 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod inventory_click {
+        use super::*;
+
+        const STONE: BlockId = CLASSIC_PALETTE[0];
+        const OTHER: BlockId = CLASSIC_PALETTE[1];
+
+        #[test]
+        fn clicking_a_palette_entry_picks_up_a_copy() {
+            let out = apply_inventory_click(InventorySlotRef::Palette(3), None, None, Some(STONE));
+            assert_eq!(out.carried, Some(STONE));
+            assert_eq!(out.select_palette, Some(3));
+            // The creative source is infinite, so nothing is written back.
+            assert_eq!(out.hotbar_write, None);
+        }
+
+        #[test]
+        fn placing_into_an_empty_slot_empties_the_hand() {
+            let out = apply_inventory_click(InventorySlotRef::Hotbar(2), Some(STONE), None, None);
+            assert_eq!(out.carried, None);
+            assert_eq!(out.hotbar_write, Some((2, Some(STONE))));
+            assert_eq!(out.select_hotbar, Some(2));
+        }
+
+        #[test]
+        fn clicking_an_occupied_slot_while_carrying_swaps() {
+            let out =
+                apply_inventory_click(InventorySlotRef::Hotbar(5), Some(STONE), Some(OTHER), None);
+            assert_eq!(
+                out.carried,
+                Some(OTHER),
+                "previous slot item is now in hand"
+            );
+            assert_eq!(out.hotbar_write, Some((5, Some(STONE))));
+        }
+
+        #[test]
+        fn clicking_an_occupied_slot_with_an_empty_hand_lifts_the_item_out() {
+            let out = apply_inventory_click(InventorySlotRef::Hotbar(1), None, Some(OTHER), None);
+            assert_eq!(out.carried, Some(OTHER));
+            assert_eq!(out.hotbar_write, Some((1, None)), "slot becomes empty");
+        }
+
+        #[test]
+        fn clicking_an_empty_slot_with_an_empty_hand_only_moves_the_selection() {
+            let out = apply_inventory_click(InventorySlotRef::Hotbar(7), None, None, None);
+            assert_eq!(out.carried, None);
+            assert_eq!(out.hotbar_write, None);
+            assert_eq!(out.select_hotbar, Some(7));
+        }
+
+        #[test]
+        fn dropping_on_the_palette_or_outside_discards_the_carried_item() {
+            let on_palette =
+                apply_inventory_click(InventorySlotRef::Palette(0), Some(STONE), None, Some(OTHER));
+            assert_eq!(on_palette.carried, None, "carried item is destroyed");
+            assert_eq!(on_palette.hotbar_write, None);
+
+            let outside = apply_inventory_click(InventorySlotRef::Outside, Some(STONE), None, None);
+            assert_eq!(outside.carried, None);
+            assert_eq!(outside.hotbar_write, None);
+        }
+
+        #[test]
+        fn clicking_outside_with_an_empty_hand_changes_nothing() {
+            let out = apply_inventory_click(InventorySlotRef::Outside, None, None, None);
+            assert_eq!(out, InventoryClickOutcome::default());
+        }
+
+        /// Press on a slot then release on the same slot must not undo the press,
+        /// or a placed item would be picked straight back up.
+        #[test]
+        fn press_and_release_on_one_slot_applies_the_click_once() {
+            let press = apply_inventory_click(InventorySlotRef::Hotbar(4), Some(STONE), None, None);
+            assert_eq!(press.carried, None);
+            // The release path skips the second call when the target is unchanged;
+            // applying it again would lift the item back out.
+            let wrongly_repeated = apply_inventory_click(
+                InventorySlotRef::Hotbar(4),
+                press.carried,
+                Some(STONE),
+                None,
+            );
+            assert_eq!(wrongly_repeated.carried, Some(STONE));
+        }
+
+        /// Press-drag-release across two slots is just two clicks on two targets.
+        #[test]
+        fn dragging_from_palette_to_hotbar_places_in_one_gesture() {
+            let press =
+                apply_inventory_click(InventorySlotRef::Palette(2), None, None, Some(STONE));
+            let release =
+                apply_inventory_click(InventorySlotRef::Hotbar(6), press.carried, None, None);
+            assert_eq!(release.hotbar_write, Some((6, Some(STONE))));
+            assert_eq!(release.carried, None);
+        }
+    }
 
     fn open_test_chat() -> App {
         let mut app = App::default();

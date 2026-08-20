@@ -42,9 +42,9 @@ use super::texture_anim::{
 use crate::assets::AssetSource;
 use crate::blocks::{
     BlockId, BlockModel, BlockRegistry, BlockTextureLookup, CullGroup, Face, FaceCoverage,
-    REQUIRED_OVERLAY_TEXTURE_KEYS, RenderLayer, TEX_BEDROCK, TEX_DIRT, TEX_GRASS_SIDE,
-    TEX_GRASS_TOP, TEX_OAK_PLANKS, TEX_SAPLING, TEX_STONE, TEX_WATER_OVERLAY,
-    TEXTURE_SELF_TEST_KEYS, TINT_NONE, debug_assert_block_blueprint_integrity,
+    REQUIRED_OVERLAY_TEXTURE_KEYS, TEX_BEDROCK, TEX_DIRT, TEX_GRASS_SIDE, TEX_GRASS_TOP,
+    TEX_OAK_PLANKS, TEX_SAPLING, TEX_STONE, TEX_WATER_OVERLAY, TEXTURE_SELF_TEST_KEYS,
+    TINT_GRASS_TOP, TINT_NONE, TINT_WATER, debug_assert_block_blueprint_integrity,
 };
 use crate::camera::{
     Camera, CameraMode, CameraUniform, Frustum, build_view_proj_wgpu, chunk_in_frustum,
@@ -64,7 +64,9 @@ use crate::config::render::{
     UI_MODE_WATER_OVERLAY, USE_GREEDY_MESHING, WATER_OVERLAY_TINT, WATER_OVERLAY_UV_TILE,
 };
 use crate::config::sim::RANDOM_TICK_SPEED_DEFAULT;
-use crate::meshing::{CpuMeshData, FULLBRIGHT_LIGHT_PACKED, MeshLayerMask, Vertex, WorldVertex};
+use crate::meshing::{
+    CpuMeshData, FULLBRIGHT_LIGHT_PACKED, MeshLayerMask, Vertex, WorldVertex, face_shade,
+};
 use crate::perf::trace as perf_trace;
 use crate::player::PlayerMode;
 use crate::render::player_model::{self, PlayerModelView};
@@ -1246,8 +1248,8 @@ const FRAME_MESH_DEBUG_OVERLAY: &str = "Debug Overlay";
 const FRAME_MESH_FIRST_PERSON_OVERLAY: &str = "First Person Overlay";
 const FRAME_MESH_PLAYER_MODEL: &str = "Player Model";
 
-/// Wall-clock bound for the blocking spawn-placement column wait.
-const ENSURE_COLUMN_GENERATION_TIMEOUT: Duration = Duration::from_secs(5);
+/// Sleep between polls while waiting on worldgen during spawn placement. The
+/// overall budget lives at the call site (`SPAWN_COLUMN_WAIT_BUDGET`).
 const ENSURE_COLUMN_GENERATION_POLL_INTERVAL: Duration = Duration::from_micros(250);
 
 const MESH_UPLOAD_LOG_THRESHOLD: Duration = Duration::from_millis(4);
@@ -2177,6 +2179,54 @@ fn relative_asset_path_from_key(texture_key: &str) -> &str {
 }
 
 #[cfg(test)]
+mod gui_pack_scale_tests {
+    use super::gui_pack_scale;
+
+    /// Creative tab logical size; the survival sheet uses [176, 166].
+    const LOGICAL: [u32; 2] = [195, 136];
+
+    #[test]
+    fn integer_pack_multiples_are_removed_exactly() {
+        for factor in [1_u32, 2, 4] {
+            let content = [LOGICAL[0] * factor, LOGICAL[1] * factor];
+            let scale = gui_pack_scale(content, LOGICAL);
+            assert!(
+                (scale - factor as f32).abs() < 1e-5,
+                "{factor}x pack produced scale {scale}"
+            );
+            // The whole point: dividing the content by the scale lands back on
+            // the logical size, whatever resolution the pack ships.
+            assert!((content[0] as f32 / scale - LOGICAL[0] as f32).abs() < 0.01);
+            assert!((content[1] as f32 / scale - LOGICAL[1] as f32).abs() < 0.01);
+        }
+    }
+
+    /// The regression: an integer divisor truncated 1.9x to 1 and left the whole
+    /// factor in the on-screen size.
+    #[test]
+    fn non_integer_ratios_are_not_truncated() {
+        let content = [370, 258]; // ~1.897x
+        let scale = gui_pack_scale(content, LOGICAL);
+        assert!(scale > 1.8 && scale < 1.9, "scale {scale}");
+        assert!((content[1] as f32 / scale - LOGICAL[1] as f32).abs() < 0.5);
+    }
+
+    #[test]
+    fn never_scales_a_sheet_up() {
+        // A sheet smaller than logical must not stretch the window.
+        assert!((gui_pack_scale([100, 70], LOGICAL) - 1.0).abs() < 1e-6);
+    }
+
+    /// A sheet whose aspect drifts from the logical one uses the smaller axis, so
+    /// the background can never overflow the layout it has to line up with.
+    #[test]
+    fn mismatched_aspect_uses_the_smaller_axis() {
+        let scale = gui_pack_scale([LOGICAL[0] * 4, LOGICAL[1] * 2], LOGICAL);
+        assert!((scale - 2.0).abs() < 1e-5, "scale {scale}");
+    }
+}
+
+#[cfg(test)]
 mod asset_path_tests {
     use super::relative_asset_path_from_key;
 
@@ -2300,6 +2350,21 @@ fn build_hud_atlas(
     }
 }
 
+/// How many times larger a GUI sheet's artwork is than the logical (vanilla)
+/// size the layout constants are written against.
+///
+/// Deliberately a float: the loader only downscales GUI sheets by an *integer*
+/// factor (that step exists to keep the shared atlas layer size down), so any
+/// non-integer remainder is still baked into the content bounds. Dividing by an
+/// integer here left that remainder in `background_size_px` and blew the window
+/// up — a sheet 1.9x the logical size truncated to 1 and rendered 1.9x too big.
+/// The minimum of both axes matches the HUD path (`hud_modern_sprite_scale`).
+fn gui_pack_scale(content_px: [u32; 2], logical_px: [u32; 2]) -> f32 {
+    let scale_x = content_px[0] as f32 / logical_px[0].max(1) as f32;
+    let scale_y = content_px[1] as f32 / logical_px[1].max(1) as f32;
+    scale_x.min(scale_y).max(1.0)
+}
+
 fn build_inventory_atlas(
     source: InventoryAtlasSource,
     key_to_layer: &HashMap<String, u32>,
@@ -2314,9 +2379,10 @@ fn build_inventory_atlas(
         .unwrap_or_else(|| panic!("inventory atlas key '{}' missing texture layout", key));
 
     let source_size = source.logical_size_px();
-    let scale_x = (texture_layout.content_w / source_size[0]).max(1);
-    let scale_y = (texture_layout.content_h / source_size[1]).max(1);
-    let scale = scale_x.min(scale_y).max(1);
+    let pack_scale = gui_pack_scale(
+        [texture_layout.content_w, texture_layout.content_h],
+        source_size,
+    );
 
     let (background_uv_min, background_uv_max) = hud_uv_for_rect(
         texture_layout,
@@ -2333,8 +2399,8 @@ fn build_inventory_atlas(
         background_uv_min,
         background_uv_max,
         background_size_px: [
-            texture_layout.content_w as f32 / scale as f32,
-            texture_layout.content_h as f32 / scale as f32,
+            texture_layout.content_w as f32 / pack_scale,
+            texture_layout.content_h as f32 / pack_scale,
         ],
         grid_origin_px: source.grid_origin_px(),
         hotbar_origin_px: source.hotbar_origin_px(),
@@ -2554,7 +2620,7 @@ pub(crate) struct InventoryOverlay<'a> {
     pub page: usize,
     pub hovered_palette: Option<usize>,
     pub hovered_hotbar_slot: Option<usize>,
-    pub dragged_block: Option<BlockId>,
+    pub carried_block: Option<BlockId>,
     pub cursor_px: [f32; 2],
 }
 
@@ -2630,6 +2696,8 @@ struct InventoryOverlayCacheKey {
     hovered_hotbar_slot: Option<usize>,
     page: usize,
     palette_count: usize,
+    /// The hovered-slot highlight only shows while an item is carried.
+    carrying: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3055,17 +3123,23 @@ fn build_crosshair_mesh(
     (vertices, indices)
 }
 
+/// Emits one preview quad.
+///
+/// Previews are drawn through the UI 3D pipeline, whose fragment shader reuses
+/// the `tint_kind` slot as a draw mode and applies no lighting. Block tint and
+/// face shading are therefore baked into `color` here, and `tint_kind` always
+/// carries [`UI_MODE_TEXTURED`].
 fn append_preview_textured_quad(
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<u32>,
     corners: [[f32; 3]; 4],
     uvs: [[f32; 2]; 4],
     tex_layer: u32,
-    tint_kind: u32,
+    color: [f32; 3],
     light_packed: u32,
 ) {
     let base = vertices.len() as u32;
-    let color = [1.0, 1.0, 1.0];
+    let tint_kind = UI_MODE_TEXTURED;
     for i in 0..4 {
         vertices.push(Vertex {
             position: corners[i],
@@ -3116,6 +3190,23 @@ fn preview_face_uvs_for_quad(face: Face, corners: [[i32; 3]; 4]) -> [[f32; 2]; 4
     uvs
 }
 
+/// Same tints the world fragment shader applies, as plain RGB factors. Only the
+/// colour is taken from the water tint; its alpha would make icons see-through.
+fn preview_tint_rgb(tint_kind: u32) -> [f32; 3] {
+    match tint_kind {
+        TINT_GRASS_TOP => [90.0 / 255.0, 200.0 / 255.0, 70.0 / 255.0],
+        TINT_WATER => [63.0 / 255.0, 118.0 / 255.0, 228.0 / 255.0],
+        _ => [1.0, 1.0, 1.0],
+    }
+}
+
+/// Block tint × baked face shading, folded into one vertex colour.
+fn preview_face_color(tint_kind: u32, face: Face) -> [f32; 3] {
+    let tint = preview_tint_rgb(tint_kind);
+    let shade = face_shade(face);
+    [tint[0] * shade, tint[1] * shade, tint[2] * shade]
+}
+
 fn build_block_preview_mesh_3d(
     block: BlockId,
     block_texture_lookup: &BlockTextureLookup,
@@ -3138,7 +3229,10 @@ fn build_block_preview_mesh_3d(
                 ],
                 quad_uvs,
                 layer,
-                TINT_NONE,
+                preview_face_color(
+                    block_texture_lookup.tint_kind_for(block, Face::North),
+                    Face::Up,
+                ),
                 FULLBRIGHT_LIGHT_PACKED,
             );
             append_preview_textured_quad(
@@ -3152,7 +3246,10 @@ fn build_block_preview_mesh_3d(
                 ],
                 quad_uvs,
                 layer,
-                TINT_NONE,
+                preview_face_color(
+                    block_texture_lookup.tint_kind_for(block, Face::North),
+                    Face::Up,
+                ),
                 FULLBRIGHT_LIGHT_PACKED,
             );
         }
@@ -3190,7 +3287,7 @@ fn build_block_preview_mesh_3d(
                     corners_f32,
                     quad_uvs,
                     block_texture_lookup.layer_for(block, face),
-                    block_texture_lookup.tint_kind_for(block, face),
+                    preview_face_color(block_texture_lookup.tint_kind_for(block, face), face),
                     FULLBRIGHT_LIGHT_PACKED,
                 );
             }
@@ -3214,7 +3311,7 @@ fn build_block_preview_mesh_3d(
                     corners_f32,
                     quad_uvs,
                     block_texture_lookup.layer_for(block, face),
-                    block_texture_lookup.tint_kind_for(block, face),
+                    preview_face_color(block_texture_lookup.tint_kind_for(block, face), face),
                     FULLBRIGHT_LIGHT_PACKED,
                 );
             }
@@ -3313,7 +3410,7 @@ fn build_first_person_arm_mesh(skin_layer: u32) -> (Vec<Vertex>, Vec<u32>) {
         [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]],
         uv_quad_from_rect(front_uv_min, front_uv_max),
         skin_layer,
-        TINT_NONE,
+        [1.0, 1.0, 1.0],
         FULLBRIGHT_LIGHT_PACKED,
     );
     append_preview_textured_quad(
@@ -3322,7 +3419,7 @@ fn build_first_person_arm_mesh(skin_layer: u32) -> (Vec<Vertex>, Vec<u32>) {
         [[x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0]],
         uv_quad_from_rect(back_uv_min, back_uv_max),
         skin_layer,
-        TINT_NONE,
+        [1.0, 1.0, 1.0],
         FULLBRIGHT_LIGHT_PACKED,
     );
     append_preview_textured_quad(
@@ -3331,7 +3428,7 @@ fn build_first_person_arm_mesh(skin_layer: u32) -> (Vec<Vertex>, Vec<u32>) {
         [[x1, y0, z1], [x1, y0, z0], [x1, y1, z0], [x1, y1, z1]],
         uv_quad_from_rect(right_uv_min, right_uv_max),
         skin_layer,
-        TINT_NONE,
+        [1.0, 1.0, 1.0],
         FULLBRIGHT_LIGHT_PACKED,
     );
     append_preview_textured_quad(
@@ -3340,7 +3437,7 @@ fn build_first_person_arm_mesh(skin_layer: u32) -> (Vec<Vertex>, Vec<u32>) {
         [[x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0]],
         uv_quad_from_rect(left_uv_min, left_uv_max),
         skin_layer,
-        TINT_NONE,
+        [1.0, 1.0, 1.0],
         FULLBRIGHT_LIGHT_PACKED,
     );
     append_preview_textured_quad(
@@ -3349,7 +3446,7 @@ fn build_first_person_arm_mesh(skin_layer: u32) -> (Vec<Vertex>, Vec<u32>) {
         [[x0, y1, z1], [x1, y1, z1], [x1, y1, z0], [x0, y1, z0]],
         uv_quad_from_rect(top_uv_min, top_uv_max),
         skin_layer,
-        TINT_NONE,
+        [1.0, 1.0, 1.0],
         FULLBRIGHT_LIGHT_PACKED,
     );
     append_preview_textured_quad(
@@ -3358,7 +3455,7 @@ fn build_first_person_arm_mesh(skin_layer: u32) -> (Vec<Vertex>, Vec<u32>) {
         [[x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]],
         uv_quad_from_rect(bottom_uv_min, bottom_uv_max),
         skin_layer,
-        TINT_NONE,
+        [1.0, 1.0, 1.0],
         FULLBRIGHT_LIGHT_PACKED,
     );
 
@@ -3413,9 +3510,6 @@ fn build_first_person_overlay_mesh(
             - up * arm_tweak.down_offset;
 
     let (mut arm_vertices, arm_indices) = build_first_person_arm_mesh(skin_layer);
-    for vertex in &mut arm_vertices {
-        vertex.tint_kind = UI_MODE_TEXTURED;
-    }
     // Stable application order: X first, then Y, then Z (Rz * Ry * Rx with column vectors).
     let arm_model_rotation = Mat3::from_rotation_z(arm_tweak.model_rot_z_rad)
         * Mat3::from_rotation_y(arm_tweak.model_rot_y_rad)
@@ -3430,9 +3524,6 @@ fn build_first_person_overlay_mesh(
 
     if let Some(block) = held_block {
         let (mut held_vertices, held_indices) = build_block_preview_mesh_3d(block, texture_lookup);
-        for vertex in &mut held_vertices {
-            vertex.tint_kind = UI_MODE_TEXTURED;
-        }
         // Held item lives in the hand frame and keeps a stable orientation relative to that frame.
         let held_pose = Mat3::from_rotation_y(FIRST_PERSON_HELD_ITEM_YAW_RAD)
             * Mat3::from_rotation_x(FIRST_PERSON_HELD_ITEM_PITCH_RAD);
@@ -4454,7 +4545,7 @@ fn build_inventory_overlay_mesh(
         );
     };
 
-    if overlay.dragged_block.is_some()
+    if overlay.carried_block.is_some()
         && let Some(hovered_slot) = overlay.hovered_hotbar_slot
     {
         draw_hotbar_highlight(hovered_slot, [0.85, 0.85, 0.85]);
@@ -4569,18 +4660,18 @@ fn collect_inventory_item_preview_draws(
         }
     }
 
-    if let Some(dragged_block) = overlay.dragged_block {
-        let drag_center_x = overlay.cursor_px[0] + preview_size * 0.75;
-        let drag_center_y = overlay.cursor_px[1] + preview_size * 0.75;
+    if let Some(carried_block) = overlay.carried_block {
+        // Centred on the cursor: the old 0.75x offset pushed the icon clear of
+        // the pointer, which made it hard to tell which slot it would land in.
         if let Some((x, y, w, h)) = preview_rect_px_from_center(
             view_width,
             view_height,
-            drag_center_x,
-            drag_center_y,
+            overlay.cursor_px[0],
+            overlay.cursor_px[1],
             preview_size,
         ) {
             draws.push(ItemPreviewDraw {
-                block: dragged_block,
+                block: carried_block,
                 viewport_x: x,
                 viewport_y: y,
                 viewport_w: w,
@@ -5190,7 +5281,6 @@ pub(crate) struct State {
     render_pipeline_back_no_depth: wgpu::RenderPipeline,
     render_pipeline_no_cull_no_depth: wgpu::RenderPipeline,
     render_pipeline_transparent: wgpu::RenderPipeline,
-    render_pipeline_transparent_no_depth: wgpu::RenderPipeline,
     render_pipeline_lod: wgpu::RenderPipeline,
     sky_pipeline: wgpu::RenderPipeline,
     rain_pipeline: wgpu::RenderPipeline,
@@ -5199,6 +5289,8 @@ pub(crate) struct State {
     outline_pipeline: wgpu::RenderPipeline,
     ui_pipeline: wgpu::RenderPipeline,
     ui_3d_overlay_pipeline: wgpu::RenderPipeline,
+    item_preview_pipeline: wgpu::RenderPipeline,
+    item_preview_pipeline_no_cull: wgpu::RenderPipeline,
     backface_culling_enabled: bool,
     debug_depth_test: bool,
     pub(crate) world: World,
@@ -5321,6 +5413,12 @@ pub(crate) struct State {
     /// `begin_frame_profiling` (not keyed on `frame_index`, which stops
     /// advancing while the session is still `Generating`).
     warmup_tracking_refreshed_this_frame: bool,
+    /// Whether the dirty-chunk queue was already reprioritized this frame. The
+    /// sort is a pure function of the camera, so repeating it within one frame
+    /// cannot change the result. Reset in `begin_frame_profiling`.
+    dirty_queue_reprioritized_this_frame: bool,
+    /// Reused staging buffer for `reprioritize_dirty_chunk_queue`.
+    dirty_reprioritize_scratch: Vec<(ChunkCoord, u32)>,
     // Frustum culling performance counters
     frustum_culled_chunks_total: u64,
     meshes_skipped_due_to_frustum: u64,
@@ -8269,6 +8367,7 @@ impl State {
     pub(crate) fn begin_frame_profiling(&mut self, frame_dt_ms: f32) {
         self.frame_perf.begin_frame(frame_dt_ms);
         self.warmup_tracking_refreshed_this_frame = false;
+        self.dirty_queue_reprioritized_this_frame = false;
         self.frame_perf.deferred_edits_pending_total = self.deferred_block_edits_total;
         if self.sim_system_last_frame_ms.len() != self.sim_systems.len() {
             self.sim_system_last_frame_ms
@@ -9402,17 +9501,6 @@ impl State {
             wgpu::CompareFunction::LessEqual,
             false,
         );
-        let render_pipeline_transparent_no_depth = Self::create_world_pipeline(
-            &device,
-            &config,
-            &world_shader,
-            &world_pipeline_layout,
-            depth.format,
-            Some(wgpu::Face::Back),
-            Some(wgpu::BlendState::ALPHA_BLENDING),
-            wgpu::CompareFunction::Always,
-            false,
-        );
         let render_pipeline_lod = Self::create_render_pipeline_traced(
             &device,
             &wgpu::RenderPipelineDescriptor {
@@ -9736,6 +9824,55 @@ impl State {
                 cache: None,
             },
         );
+        // Item previews use the fat `Vertex` layout, so they need the UI shader's
+        // pipeline layout — the world pipelines declare `WorldVertex` and would
+        // reinterpret the data. Depth is `Always` + no write, matching the world
+        // preview pipelines these replace, so icons are never occluded by the
+        // scene; the cube silhouette comes from back-face culling instead.
+        let make_item_preview_pipeline = |label: &'static str, cull_mode| {
+            Self::create_render_pipeline_traced(
+                &device,
+                &wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&ui_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &ui_shader,
+                        entry_point: Some("vs_main_3d_overlay"),
+                        compilation_options: Default::default(),
+                        buffers: &[Vertex::layout()],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &ui_shader,
+                        entry_point: Some("fs_main"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: config.format,
+                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        cull_mode,
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: depth.format,
+                        depth_write_enabled: false,
+                        depth_compare: wgpu::CompareFunction::Always,
+                        stencil: Default::default(),
+                        bias: Default::default(),
+                    }),
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                },
+            )
+        };
+        let item_preview_pipeline =
+            make_item_preview_pipeline("Item Preview Pipeline", Some(wgpu::Face::Back));
+        let item_preview_pipeline_no_cull =
+            make_item_preview_pipeline("Item Preview Pipeline (no cull)", None);
         crate::console_info!(
             "[perf][startup] pipeline creation took: {:.2}ms",
             pipeline_creation_start.elapsed().as_secs_f64() * 1000.0
@@ -10002,7 +10139,6 @@ impl State {
             render_pipeline_back_no_depth,
             render_pipeline_no_cull_no_depth,
             render_pipeline_transparent,
-            render_pipeline_transparent_no_depth,
             render_pipeline_lod,
             sky_pipeline,
             rain_pipeline,
@@ -10011,6 +10147,8 @@ impl State {
             outline_pipeline,
             ui_pipeline,
             ui_3d_overlay_pipeline,
+            item_preview_pipeline,
+            item_preview_pipeline_no_cull,
             backface_culling_enabled: true,
             debug_depth_test: true,
             world,
@@ -10115,6 +10253,8 @@ impl State {
             chunk_lighting_progress: HashMap::new(),
             frame_index: 0,
             warmup_tracking_refreshed_this_frame: false,
+            dirty_queue_reprioritized_this_frame: false,
+            dirty_reprioritize_scratch: Vec::new(),
             frustum_culled_chunks_total: 0,
             meshes_skipped_due_to_frustum: 0,
             fluid_mesh_coalesce: HashMap::new(),
@@ -10425,12 +10565,12 @@ impl State {
 
     fn preview_pipeline_for_block(&self, block: BlockId) -> &wgpu::RenderPipeline {
         let info = self.block_texture_lookup.info_for(block);
-        if info.render_layer == RenderLayer::Transparent {
-            &self.render_pipeline_transparent_no_depth
-        } else if matches!(info.model, BlockModel::CrossPlant) {
-            &self.render_pipeline_no_cull_no_depth
+        // Transparent blocks need no separate pipeline any more: the preview
+        // pipelines alpha-blend unconditionally.
+        if matches!(info.model, BlockModel::CrossPlant) {
+            &self.item_preview_pipeline_no_cull
         } else {
-            &self.render_pipeline_back_no_depth
+            &self.item_preview_pipeline
         }
     }
 
@@ -13107,7 +13247,22 @@ impl State {
     /// the worldgen workers could have used. Now it sleeps between polls and is
     /// bounded by wall clock rather than an iteration count, so a stalled column
     /// gives up after a predictable time instead of an unpredictable one.
-    pub(crate) fn ensure_column_loaded_or_generated(&mut self, world_x: i32, world_z: i32) {
+    /// Waits for one column to be generated, giving up at `deadline`.
+    ///
+    /// `deadline` is shared across a whole spawn search rather than being
+    /// per-column: the caller probes up to 289 columns, so a per-column budget
+    /// multiplies into minutes in the worst case.
+    ///
+    /// The loop must re-check the deadline on **every** pass, not only when a
+    /// pump came back empty. An earlier version only checked it in the empty
+    /// branch, so a steady trickle of results for *other* columns kept it
+    /// spinning — one measured frame did 2696 pump passes and blocked ~5 s.
+    pub(crate) fn ensure_column_loaded_or_generated(
+        &mut self,
+        world_x: i32,
+        world_z: i32,
+        deadline: Instant,
+    ) {
         let cx = world_x.div_euclid(CHUNK_SIZE);
         let cz = world_z.div_euclid(CHUNK_SIZE);
         if self.try_load_saved_column_if_present(cx, cz) {
@@ -13116,7 +13271,6 @@ impl State {
 
         let min_chunk_y = self.world.min_chunk_y();
         let max_chunk_y = self.world.max_chunk_y();
-        let started = Instant::now();
         loop {
             let preset = self.worldgen_preset;
             let mut missing = 0usize;
@@ -13130,17 +13284,10 @@ impl State {
                 // and may have rejected an earlier attempt.
                 let _ = self.request_chunk_generation(coord, preset);
             }
-            if missing == 0 {
+            if missing == 0 || Instant::now() >= deadline {
                 break;
             }
             if self.pump_chunkgen_results() == 0 {
-                if started.elapsed() >= ENSURE_COLUMN_GENERATION_TIMEOUT {
-                    crate::console_error!(
-                        "[worldgen] column ({cx}, {cz}) not ready after {:.0}ms, giving up with {missing} section(s) missing",
-                        started.elapsed().as_secs_f32() * 1000.0
-                    );
-                    break;
-                }
                 std::thread::sleep(ENSURE_COLUMN_GENERATION_POLL_INTERVAL);
             }
         }
@@ -13791,29 +13938,41 @@ impl State {
         }
         self.refresh_stream_horizon_map(camera, frustum);
         let forward_xz = Self::camera_forward_xz(camera);
-        let drained: Vec<ChunkCoord> = self.dirty_chunk_queue.drain(..).collect();
-        let mut staged = Vec::with_capacity(drained.len());
-        for (idx, coord) in drained.into_iter().enumerate() {
-            let key = self.stream_priority_key_for_chunk(
-                coord,
-                center_chunk_x,
-                center_chunk_y,
-                center_chunk_z,
-                Some(camera),
-                Some(frustum),
-                forward_xz,
-                idx.min(u32::MAX as usize) as u32,
-            );
-            staged.push((coord, key));
+        // Scratch buffer is kept on `self` so a queue of a few hundred chunks
+        // does not allocate (and free) two `Vec`s on every pass.
+        let mut staged = std::mem::take(&mut self.dirty_reprioritize_scratch);
+        staged.clear();
+        staged.reserve(self.dirty_chunk_queue.len());
+        for (idx, coord) in self.dirty_chunk_queue.drain(..).enumerate() {
+            staged.push((coord, idx.min(u32::MAX as usize) as u32));
         }
-        staged.sort_by(|a, b| {
+        let mut keyed: Vec<(ChunkCoord, StreamPriorityKey)> = staged
+            .iter()
+            .map(|&(coord, idx)| {
+                (
+                    coord,
+                    self.stream_priority_key_for_chunk(
+                        coord,
+                        center_chunk_x,
+                        center_chunk_y,
+                        center_chunk_z,
+                        Some(camera),
+                        Some(frustum),
+                        forward_xz,
+                        idx,
+                    ),
+                )
+            })
+            .collect();
+        keyed.sort_by(|a, b| {
             a.1.cmp_ascending(&b.1)
                 .then_with(|| a.0.x.cmp(&b.0.x))
                 .then_with(|| a.0.y.cmp(&b.0.y))
                 .then_with(|| a.0.z.cmp(&b.0.z))
         });
         self.dirty_chunk_queue
-            .extend(staged.into_iter().map(|(coord, _)| coord));
+            .extend(keyed.into_iter().map(|(coord, _)| coord));
+        self.dirty_reprioritize_scratch = staged;
     }
 
     fn reprioritize_mesh_upload_queue(&mut self, camera: &Camera, frustum: &Frustum) {
@@ -17396,13 +17555,22 @@ impl State {
                 self.radius_offsets_cache.len(),
             );
         }
-        self.reprioritize_dirty_chunk_queue(
-            center_chunk_x,
-            center_chunk_y,
-            center_chunk_z,
-            &frustum,
-            camera,
-        );
+        // Priorities are a function of the camera, which does not move within a
+        // frame — but this pass runs several times per frame (startup burst,
+        // repeated `process_dirty_chunk_meshes`). Measured at ~2.6 passes/frame
+        // costing ~4 ms/frame, and it sat outside every trace scope, so it never
+        // showed up in a stall report. Once per frame is enough.
+        if !self.dirty_queue_reprioritized_this_frame {
+            let _reprioritize_scope = perf_trace::scope("proc.dispatch.reprioritize_dirty");
+            self.dirty_queue_reprioritized_this_frame = true;
+            self.reprioritize_dirty_chunk_queue(
+                center_chunk_x,
+                center_chunk_y,
+                center_chunk_z,
+                &frustum,
+                camera,
+            );
+        }
         let dispatch_budget_ms = budget_override_ms.unwrap_or_else(|| {
             self.stream_budget_for_stage_ms(
                 STREAM_DISPATCH_BUDGET_MS,
@@ -19443,6 +19611,7 @@ impl State {
                 hovered_hotbar_slot: overlay.hovered_hotbar_slot,
                 page: overlay.page,
                 palette_count: overlay.palette_blocks.len(),
+                carrying: overlay.carried_block.is_some(),
             };
             if self.inventory_overlay_cache != Some(cache_key) {
                 let (vertices, indices) = build_inventory_overlay_mesh(
@@ -20133,11 +20302,24 @@ impl State {
             ),
         );
         let _ = perf_trace::append_gpu_csv_line(
-            "frame_index,cpu_render_ms,gpu_timestamps_supported,terrain_drawcalls,lod_drawcalls,visible_chunks,visible_lod,near_mesh_mem_bytes,lod_mesh_mem_bytes",
+            // `frame_dt_ms` and the streaming breakdown matter more than
+            // `cpu_render_ms` alone: the render path is vsync-bound and looks
+            // healthy, while the cost that makes streaming feel bad sits in
+            // `process_dirty_chunk_meshes`. Without these columns a whole-session
+            // frame-time distribution could not be reconstructed at all, and
+            // stall reports only fire above 200 ms — so 30-100 ms frames, the
+            // ones that actually feel laggy, were invisible in every artifact.
+            "frame_index,cpu_render_ms,frame_dt_ms,process_dirty_ms,chunkgen_apply_ms,mesh_pump_ms,lighting_ms,unload_ms,gpu_timestamps_supported,terrain_drawcalls,lod_drawcalls,visible_chunks,visible_lod,near_mesh_mem_bytes,lod_mesh_mem_bytes",
             &format!(
-                "{},{:.3},false,{},{},{},{},{},{}",
+                "{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},false,{},{},{},{},{},{}",
                 self.frame_index,
                 render_ms,
+                self.frame_perf.frame_dt_ms,
+                self.frame_perf.process_dirty_chunk_meshes_ms,
+                self.frame_perf.pump_chunkgen_results_ms,
+                self.frame_perf.pump_mesh_results_ms,
+                self.frame_perf.rebuild_world_lighting_ms,
+                self.frame_perf.proc_unload_chunks_outside_keep_radius_ms,
                 world_drawcalls,
                 lod_drawcalls,
                 visible_chunks.len(),
