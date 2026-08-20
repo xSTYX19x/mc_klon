@@ -149,6 +149,11 @@ impl CameraController {
     }
 }
 
+/// Fixed digit-key mapping for hotbar slots.
+///
+/// These are not [`crate::settings::InputAction`]s on purpose — see the call
+/// site in `app/mod.rs` for why — so this stays the single source of truth for
+/// the mapping.
 pub(crate) fn hotbar_slot_for_key(code: KeyCode) -> Option<usize> {
     match code {
         KeyCode::Digit1 => Some(0),
@@ -161,5 +166,42 @@ pub(crate) fn hotbar_slot_for_key(code: KeyCode) -> Option<usize> {
         KeyCode::Digit8 => Some(7),
         KeyCode::Digit9 => Some(8),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hotbar_slot_for_key;
+    use winit::keyboard::KeyCode;
+
+    #[test]
+    fn digit_keys_map_to_their_slot_index() {
+        let digits = [
+            KeyCode::Digit1,
+            KeyCode::Digit2,
+            KeyCode::Digit3,
+            KeyCode::Digit4,
+            KeyCode::Digit5,
+            KeyCode::Digit6,
+            KeyCode::Digit7,
+            KeyCode::Digit8,
+            KeyCode::Digit9,
+        ];
+        for (expected, key) in digits.into_iter().enumerate() {
+            assert_eq!(hotbar_slot_for_key(key), Some(expected));
+        }
+    }
+
+    #[test]
+    fn other_keys_do_not_select_a_slot() {
+        // Digit0 has no tenth slot to select, and the numpad is left alone.
+        for key in [
+            KeyCode::Digit0,
+            KeyCode::Numpad1,
+            KeyCode::KeyW,
+            KeyCode::Escape,
+        ] {
+            assert_eq!(hotbar_slot_for_key(key), None, "{key:?} must not select");
+        }
     }
 }

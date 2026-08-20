@@ -36,6 +36,7 @@ Gameplay and content are still introduced in a roughly historical order, but ren
 - first mouse click in the window: enable mouse capture
 - `LMB` / `RMB`: break / place block
 - `Mouse Wheel`: hotbar selection
+- `1`-`9`: select hotbar slot directly (fixed, not rebindable)
 - `B`: inventory
 - `T`: chat
 - `Space`: jump / move upward (depending on mode)

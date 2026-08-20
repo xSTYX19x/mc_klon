@@ -80,7 +80,7 @@ use crate::storage::format::{
     SAVE_ROOT_DIR, SECTION_BLOCK_COUNT, TICKING_AREAS_FILE_NAME, WORLD_MANIFEST_FILE_NAME,
     WORLD_META_FILE_NAME,
 };
-use crate::storage::world_meta::{self, WorldMeta};
+use crate::storage::world_meta::{self, PlayerSpawn, WorldMeta};
 use crate::storage::{
     RegionStorage, StorageColumnLoadStatus, StorageColumnSaveResult, StorageLoadWorker,
     StorageWorker, WorldStorage,
@@ -1087,6 +1087,17 @@ const FIRST_PERSON_ARM_SCALE: f32 = 0.73;
 const FIRST_PERSON_ARM_MODEL_ROT_X_RAD: f32 = -137.0_f32.to_radians();
 const FIRST_PERSON_ARM_MODEL_ROT_Y_RAD: f32 = -23.0_f32.to_radians();
 const FIRST_PERSON_ARM_MODEL_ROT_Z_RAD: f32 = 29.0_f32.to_radians();
+// Hand swing. Break is a punch arc, place a shorter, shallower jab; both ride
+// on the existing arm pose composition rather than a separate animation system.
+const HAND_SWING_BREAK_SECONDS: f32 = 0.22;
+const HAND_SWING_PLACE_SECONDS: f32 = 0.15;
+const HAND_SWING_BREAK_PITCH_RAD: f32 = 38.0_f32.to_radians();
+const HAND_SWING_PLACE_PITCH_RAD: f32 = 17.0_f32.to_radians();
+const HAND_SWING_BREAK_FORWARD: f32 = 0.16;
+const HAND_SWING_PLACE_FORWARD: f32 = 0.09;
+const HAND_SWING_BREAK_DOWN: f32 = 0.10;
+const HAND_SWING_PLACE_DOWN: f32 = 0.04;
+
 const FIRST_PERSON_HELD_ITEM_SCALE: f32 = 0.35;
 const FIRST_PERSON_HELD_ITEM_SIDE_OFFSET: f32 = 0.0;
 const FIRST_PERSON_HELD_ITEM_DOWN_OFFSET: f32 = 0.0;
@@ -2179,6 +2190,65 @@ fn relative_asset_path_from_key(texture_key: &str) -> &str {
 }
 
 #[cfg(test)]
+mod hand_swing_tests {
+    use super::{HAND_SWING_BREAK_SECONDS, HandSwing, HandSwingKind};
+
+    #[test]
+    fn idle_leaves_the_resting_pose_untouched() {
+        let swing = HandSwing::default();
+        assert_eq!(swing.offsets(), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn a_swing_rises_to_a_peak_and_eases_back_to_rest() {
+        let mut swing = HandSwing::default();
+        swing.trigger(HandSwingKind::Break);
+        assert_eq!(swing.offsets().0, 0.0, "starts at the rest pose");
+
+        swing.advance(HAND_SWING_BREAK_SECONDS * 0.5);
+        let peak = swing.offsets();
+        assert!(peak.0 > 0.0 && peak.1 > 0.0 && peak.2 > 0.0);
+
+        swing.advance(HAND_SWING_BREAK_SECONDS * 0.4);
+        let tail = swing.offsets();
+        assert!(tail.0 < peak.0, "must be on the way back down");
+
+        // Finishing clears the swing rather than parking it at a non-zero pose.
+        swing.advance(HAND_SWING_BREAK_SECONDS);
+        assert_eq!(swing.offsets(), (0.0, 0.0, 0.0));
+        assert!(swing.kind.is_none());
+    }
+
+    #[test]
+    fn placing_swings_less_far_than_breaking() {
+        let sample = |kind| {
+            let mut swing = HandSwing::default();
+            swing.trigger(kind);
+            let (duration, ..) = kind.shape();
+            swing.advance(duration * 0.5);
+            swing.offsets()
+        };
+        let break_peak = sample(HandSwingKind::Break);
+        let place_peak = sample(HandSwingKind::Place);
+        assert!(place_peak.0 < break_peak.0, "place is the lighter jab");
+        assert!(place_peak.1 < break_peak.1);
+    }
+
+    #[test]
+    fn retriggering_restarts_instead_of_freezing_at_the_peak() {
+        // Holding the mine button fires repeatedly; each hit must swing again.
+        let mut swing = HandSwing::default();
+        swing.trigger(HandSwingKind::Break);
+        swing.advance(HAND_SWING_BREAK_SECONDS * 0.5);
+        assert!(swing.offsets().0 > 0.0);
+
+        swing.trigger(HandSwingKind::Break);
+        assert_eq!(swing.elapsed, 0.0);
+        assert_eq!(swing.offsets().0, 0.0);
+    }
+}
+
+#[cfg(test)]
 mod gui_pack_scale_tests {
     use super::gui_pack_scale;
 
@@ -2652,6 +2722,78 @@ pub(crate) struct HitchCounters {
     pub active_sim_columns: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HandSwingKind {
+    Break,
+    Place,
+}
+
+impl HandSwingKind {
+    /// Duration, peak pitch, forward reach and drop of the arc.
+    const fn shape(self) -> (f32, f32, f32, f32) {
+        match self {
+            Self::Break => (
+                HAND_SWING_BREAK_SECONDS,
+                HAND_SWING_BREAK_PITCH_RAD,
+                HAND_SWING_BREAK_FORWARD,
+                HAND_SWING_BREAK_DOWN,
+            ),
+            Self::Place => (
+                HAND_SWING_PLACE_SECONDS,
+                HAND_SWING_PLACE_PITCH_RAD,
+                HAND_SWING_PLACE_FORWARD,
+                HAND_SWING_PLACE_DOWN,
+            ),
+        }
+    }
+}
+
+/// A single in-flight swing. Idle is `kind: None`, which costs nothing per
+/// frame and leaves the resting pose untouched.
+#[derive(Clone, Copy, Debug, Default)]
+struct HandSwing {
+    kind: Option<HandSwingKind>,
+    elapsed: f32,
+}
+
+impl HandSwing {
+    /// Restarts from zero, so holding the mine button re-swings on every hit
+    /// instead of freezing at the peak.
+    fn trigger(&mut self, kind: HandSwingKind) {
+        self.kind = Some(kind);
+        self.elapsed = 0.0;
+    }
+
+    fn advance(&mut self, dt: f32) {
+        let Some(kind) = self.kind else {
+            return;
+        };
+        let (duration, ..) = kind.shape();
+        self.elapsed += dt.max(0.0);
+        if self.elapsed >= duration {
+            self.kind = None;
+            self.elapsed = 0.0;
+        }
+    }
+
+    /// Pitch, forward and down offsets to add to the resting pose.
+    ///
+    /// `sin(pi * t)` rises to the peak and eases back to exactly zero, so the
+    /// arm always returns to the `arm_tweak` rest pose without a snap.
+    fn offsets(self) -> (f32, f32, f32) {
+        let Some(kind) = self.kind else {
+            return (0.0, 0.0, 0.0);
+        };
+        let (duration, pitch, forward, down) = kind.shape();
+        if duration <= 0.0 {
+            return (0.0, 0.0, 0.0);
+        }
+        let t = (self.elapsed / duration).clamp(0.0, 1.0);
+        let arc = (std::f32::consts::PI * t).sin();
+        (pitch * arc, forward * arc, down * arc)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct FirstPersonArmTweak {
     scale: f32,
@@ -2662,6 +2804,18 @@ struct FirstPersonArmTweak {
     model_rot_x_rad: f32,
     model_rot_y_rad: f32,
     model_rot_z_rad: f32,
+}
+
+impl FirstPersonArmTweak {
+    /// Folds a swing into the resting pose. The held item rides the same arm
+    /// basis, so it swings along without extra plumbing.
+    fn with_swing(mut self, swing: HandSwing) -> Self {
+        let (pitch, forward, down) = swing.offsets();
+        self.model_rot_x_rad += pitch;
+        self.forward_offset += forward;
+        self.down_offset += down;
+        self
+    }
 }
 
 impl Default for FirstPersonArmTweak {
@@ -5374,6 +5528,10 @@ pub(crate) struct State {
     menu_button_atlas: MenuButtonAtlas,
     first_person_skin_layer: u32,
     first_person_arm_tweak: FirstPersonArmTweak,
+    hand_swing: HandSwing,
+    /// Player placement read from `world.meta`, cleared for freshly generated
+    /// worlds so they keep the origin spawn.
+    saved_player_spawn: Option<PlayerSpawn>,
     block_texture_lookup: Arc<BlockTextureLookup>,
     _mesh_pool: MeshWorkerPool,
     _chunkgen_pool: ChunkGenWorkerPool,
@@ -6223,6 +6381,11 @@ impl State {
         self.world.configure_world_config(cfg, meta.preset);
         self.reset_weather_for_environment();
         self.worldgen_preset = meta.preset;
+        // Picked up before the startup task starts, so the warmup prepares the
+        // terrain the player will actually land in rather than the origin.
+        self.saved_player_spawn = meta
+            .player_spawn
+            .filter(|spawn| spawn.is_usable(cfg.min_y(), cfg.max_y()));
         crate::console_info!(
             "[storage][saved_load] restored world definition seed={} preset={:?} environment={} save_root={}",
             meta.world_seed,
@@ -10219,6 +10382,8 @@ impl State {
             menu_button_atlas,
             first_person_skin_layer,
             first_person_arm_tweak: FirstPersonArmTweak::default(),
+            hand_swing: HandSwing::default(),
+            saved_player_spawn: None,
             block_texture_lookup,
             _mesh_pool: mesh_pool,
             _chunkgen_pool: chunkgen_pool,
@@ -10598,6 +10763,16 @@ impl State {
         rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
         rpass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         rpass.draw_indexed(0..mesh.index_count, 0, 0..1);
+    }
+
+    /// Starts a swing. Called on the frame a break or place actually happens,
+    /// not on button-down, so a click that hits nothing does not animate.
+    pub(crate) fn trigger_hand_swing(&mut self, kind: HandSwingKind) {
+        self.hand_swing.trigger(kind);
+    }
+
+    pub(crate) fn advance_hand_swing(&mut self, dt: f32) {
+        self.hand_swing.advance(dt);
     }
 
     pub(crate) fn rebuild_preview_mesh(&mut self, block: BlockId) {
@@ -14467,9 +14642,16 @@ impl State {
     }
 
     fn startup_spawn_chunk_center(&self) -> (i32, i32) {
-        // Spawn policy is currently origin-centered; both startup warmup and final spawn
-        // settlement use the same focus so the first playable frame lands in prepared terrain.
-        (0, 0)
+        // Both startup warmup and final spawn settlement use the same focus so the
+        // first playable frame lands in prepared terrain. A saved world therefore
+        // warms up around where the player left off; a new one stays origin-centred.
+        match self.saved_player_spawn {
+            Some(spawn) => (
+                (spawn.x.floor() as i32).div_euclid(CHUNK_SIZE),
+                (spawn.z.floor() as i32).div_euclid(CHUNK_SIZE),
+            ),
+            None => (0, 0),
+        }
     }
 
     fn begin_world_startup_task(
@@ -14715,10 +14897,17 @@ impl State {
             task.startup_plan.target_sections.len(),
             task.started_at.elapsed().as_secs_f64() * 1000.0
         );
-        let spawn_x = task.warmup_center_x * CHUNK_SIZE;
-        let spawn_z = task.warmup_center_z * CHUNK_SIZE;
-        let terrain_y = self.world.terrain_height_at(spawn_x, spawn_z) as f32;
-        let spawn = Vec3::new(spawn_x as f32 + 0.5, terrain_y + 2.0, spawn_z as f32 + 0.5);
+        let spawn = match self.saved_player_spawn {
+            // Exact position: the caller still settles it onto ground, so a
+            // block removed under the player while away cannot drop them.
+            Some(saved) => Vec3::new(saved.x, saved.y, saved.z),
+            None => {
+                let spawn_x = task.warmup_center_x * CHUNK_SIZE;
+                let spawn_z = task.warmup_center_z * CHUNK_SIZE;
+                let terrain_y = self.world.terrain_height_at(spawn_x, spawn_z) as f32;
+                Vec3::new(spawn_x as f32 + 0.5, terrain_y + 2.0, spawn_z as f32 + 0.5)
+            }
+        };
 
         self.world_generation_task = None;
         // Sections applied between the 85 % trigger and here were re-deferred and
@@ -14732,8 +14921,22 @@ impl State {
         Some(spawn)
     }
 
-    pub(crate) fn save_world(&mut self) {
+    /// Reports the view direction to restore, if the save carried one. Consumed
+    /// once by the app right after the player is settled.
+    pub(crate) fn take_saved_view_angles(&mut self) -> Option<(f32, f32)> {
+        self.saved_player_spawn
+            .take()
+            .map(|spawn| (spawn.yaw_rad, spawn.pitch_rad))
+    }
+
+    pub(crate) fn save_world(&mut self, player_spawn: Option<PlayerSpawn>) {
         let started = Instant::now();
+        if let Some(spawn) = player_spawn
+            && let Err(err) =
+                world_meta::set_player_spawn(&Self::world_meta_path_for(&self.save_root), spawn)
+        {
+            crate::console_error!("world save: failed to record player spawn: {err}");
+        }
         if let Err(err) = self.save_ticking_areas() {
             crate::console_error!("world save: failed to save ticking areas: {err}");
         }
@@ -19790,7 +19993,7 @@ impl State {
                 camera,
                 &self.block_texture_lookup,
                 self.first_person_skin_layer,
-                self.first_person_arm_tweak,
+                self.first_person_arm_tweak.with_swing(self.hand_swing),
                 held_block,
             );
             self.upload_frame_mesh(FRAME_MESH_FIRST_PERSON_OVERLAY, vertices, indices);

@@ -21,8 +21,18 @@
 //!   degrade to air instead of silently resolving to a foreign block.
 //!
 //! Adding a v3 means bumping [`COLUMN_PAYLOAD_FORMAT_VERSION`] and keeping both
-//! older branches in [`decode_column`]; see `docs/TODO.md` for the open
-//! compaction ideas.
+//! older branches in [`decode_column`].
+//!
+//! **A more compact layout was measured and rejected**
+//! (`cargo test storage::chunk_codec::v2_size_report -- --nocapture`). Names are
+//! only 5.2 % of a raw terrain payload — block indices are 92.4 % — and zlib
+//! already compresses the whole payload to 11.9 %. Replacing names with `u16`
+//! ids would save 11.7 % on disk (34.4 % for heavily built chunks) but give up
+//! the self-describing decode above, which is the whole reason v2 exists.
+//! Sharing one *name* palette per column instead of per section is a measured
+//! **regression** (-18.0 %): widening `bits_per_entry` across a column costs
+//! more than the repeated names save. Do not implement either without new
+//! numbers.
 
 use std::collections::{HashMap, HashSet};
 use std::io;

@@ -31,12 +31,13 @@ use crate::player::*;
 use crate::render::State;
 use crate::render::player_model::PlayerModelView;
 use crate::render::state::{
-    ChatOverlay, ChatOverlayLine, DebugOverlay, GenerationOverlay, HitchCounters, InventoryOverlay,
-    MenuOverlay, SavedWorldSummary, WorldGenParams, WorldGenRequest, WorldLoadStageStats,
+    ChatOverlay, ChatOverlayLine, DebugOverlay, GenerationOverlay, HandSwingKind, HitchCounters,
+    InventoryOverlay, MenuOverlay, SavedWorldSummary, WorldGenParams, WorldGenRequest,
+    WorldLoadStageStats,
     menu_slider_fill_at_pos_px, pause_menu_item_at_pos_px,
 };
 use crate::settings::{AppSettings, InputAction, SettingsScope, keycode_label};
-use crate::storage::world_meta;
+use crate::storage::world_meta::{self, PlayerSpawn};
 use crate::world::ticking_areas::{TICKING_AREA_MAX_RADIUS_CHUNKS, TickingArea, TickingFlags};
 use crate::world::{FluidKind, World, WorldEnvironment};
 use crate::worldgen::ClassicLevelSize;
@@ -511,21 +512,27 @@ impl App {
             return;
         }
         let next = (self.selected_slot as i32 + steps).rem_euclid(count as i32) as usize;
-        if self.set_selected_slot(next) {
-            let held = self
-                .selected_block()
-                .map(BlockId::display_name)
-                .unwrap_or("Empty");
-            crate::console_info!(
-                "Selected slot: {}/{} ({held})",
-                self.selected_slot + 1,
-                HOTBAR_SLOT_COUNT
-            );
-            if let Some(selected) = self.selected_block()
-                && let Some(state) = self.state.as_mut()
-            {
-                state.rebuild_preview_mesh(selected);
-            }
+        self.select_slot(next);
+    }
+
+    /// Selects a hotbar slot and brings the held-item preview along.
+    fn select_slot(&mut self, slot: usize) {
+        if !self.set_selected_slot(slot) {
+            return;
+        }
+        let held = self
+            .selected_block()
+            .map(BlockId::display_name)
+            .unwrap_or("Empty");
+        crate::console_info!(
+            "Selected slot: {}/{} ({held})",
+            self.selected_slot + 1,
+            HOTBAR_SLOT_COUNT
+        );
+        if let Some(selected) = self.selected_block()
+            && let Some(state) = self.state.as_mut()
+        {
+            state.rebuild_preview_mesh(selected);
         }
     }
 
@@ -1648,15 +1655,17 @@ impl App {
             1 => self.start_new_default_level_generation(),
             2 => self.push_menu_screen(MenuScreen::LoadLevel),
             3 => {
+                let spawn = self.current_player_spawn();
                 if let Some(state) = self.state.as_mut() {
-                    state.save_world();
+                    state.save_world(spawn);
                     crate::console_info!("Saved.");
                 }
             }
             4 => self.push_menu_screen(MenuScreen::Options(OptionsScreen::Root)),
             5 => {
+                let spawn = self.current_player_spawn();
                 if let Some(state) = self.state.as_mut() {
-                    state.save_world();
+                    state.save_world(spawn);
                     state.shutdown_world_session("exit_to_main_menu");
                 }
                 self.enter_main_menu();
@@ -2738,6 +2747,22 @@ impl App {
         (settled_feet, settle_flags.hit_y_down)
     }
 
+    /// Player placement to persist. `None` outside an active world, so saving
+    /// from a menu cannot overwrite a good spawn with a stale camera.
+    fn current_player_spawn(&self) -> Option<PlayerSpawn> {
+        if !self.is_in_game() && !self.is_paused() {
+            return None;
+        }
+        let feet = self.player.feet_position;
+        Some(PlayerSpawn {
+            x: feet.x,
+            y: feet.y,
+            z: feet.z,
+            yaw_rad: self.camera.yaw,
+            pitch_rad: self.camera.pitch,
+        })
+    }
+
     fn apply_settled_spawn(&mut self, settled_feet: Vec3, on_ground: bool) {
         self.player.feet_position = settled_feet;
         self.player.mode = MoveMode::Flight;
@@ -2995,8 +3020,9 @@ impl ApplicationHandler for App {
 
         match event {
             WindowEvent::CloseRequested => {
+                let spawn = self.current_player_spawn();
                 if let Some(state) = self.state.as_mut() {
-                    state.save_world();
+                    state.save_world(spawn);
                 }
                 event_loop.exit();
             }
@@ -3207,6 +3233,23 @@ impl ApplicationHandler for App {
                         }
                         return;
                     }
+
+                    // Deliberately not rebindable actions: nine more entries
+                    // would triple the Controls list for keys nobody remaps,
+                    // and each one costs a field in the persisted bindings.
+                    // Checked *after* the bound actions, so rebinding something
+                    // onto a digit key still wins.
+                    if !event.repeat
+                        && !generating
+                        && self.is_in_game()
+                        && !menu_open
+                        && !inventory_open
+                        && !ticking_areas_open
+                        && let Some(slot) = crate::input::hotbar_slot_for_key(code)
+                    {
+                        self.select_slot(slot);
+                        return;
+                    }
                 }
 
                 if menu_open {
@@ -3409,8 +3452,9 @@ impl ApplicationHandler for App {
                         }
 
                         if !generating && matches!(code, KeyCode::Enter | KeyCode::NumpadEnter) {
+                            let spawn = self.current_player_spawn();
                             if let Some(state) = self.state.as_mut() {
-                                state.save_world();
+                                state.save_world(spawn);
                             }
                         }
                     }
@@ -3739,6 +3783,15 @@ impl ApplicationHandler for App {
                     });
                     if let Some((settled_feet, on_ground)) = spawn_data {
                         self.apply_settled_spawn(settled_feet, on_ground);
+                        // After settling, so the restored view is not overwritten
+                        // by the spawn's own camera sync.
+                        if let Some(state) = self.state.as_mut()
+                            && let Some((yaw, pitch)) = state.take_saved_view_angles()
+                        {
+                            self.camera.yaw = yaw;
+                            self.camera.pitch = pitch;
+                            self.sync_camera_to_player_eye(true);
+                        }
                     }
                     if let Some(state) = self.state.as_mut() {
                         state.set_render_distance(
@@ -3922,6 +3975,7 @@ impl ApplicationHandler for App {
                                 gameplay_active,
                             );
 
+                            state.advance_hand_swing(dt_non_negative);
                             self.break_cooldown_seconds =
                                 (self.break_cooldown_seconds - dt_non_negative).max(0.0);
                             self.place_cooldown_seconds =
@@ -3937,6 +3991,7 @@ impl ApplicationHandler for App {
                                         &view_camera,
                                         self.player.player_mode,
                                     );
+                                    state.trigger_hand_swing(HandSwingKind::Break);
                                     self.break_cooldown_seconds =
                                         Self::block_action_repeat_cooldown_seconds();
                                 }
@@ -3952,6 +4007,7 @@ impl ApplicationHandler for App {
                                             selected_block,
                                             self.player.feet_position,
                                         );
+                                        state.trigger_hand_swing(HandSwingKind::Place);
                                         self.place_cooldown_seconds =
                                             Self::block_action_repeat_cooldown_seconds();
                                     }

@@ -336,11 +336,15 @@ impl PalettedBlocks {
 /// plain `Arc<Vec<BlockId>>` this replaced. A chunk therefore stays compact
 /// until it is actually edited, and edited chunks keep today's write speed.
 ///
-/// Read costs, measured in `palette_probe`: a bulk `decode_into` (what the
-/// mesher's padded staging buffer needs) costs +3.6 us per mesh job, 0.03 % of
-/// a mesh pass. A random single-voxel `get` costs +30 % at realistic resident
-/// size — which is why `World::build_lighting_snapshot` decodes to flat once
-/// rather than letting the light BFS pay it per read.
+/// Measured in `storage_report` / `read_cost_report`: 403 B per section instead
+/// of 4096 B (10.2x smaller, 103.1 -> 10.2 MiB at Insane view distance). A bulk
+/// `decode_into` — what the mesher's padded staging buffer needs — costs
+/// +2.2 us per mesh job, 0.017 % of a mesh pass; a random single-voxel `get`
+/// costs about +16 %, which the light BFS pays because the memory is worth it.
+///
+/// Merging `blocks` and `block_data` into one `u16` block-state id was measured
+/// and rejected: 2x1 B becomes 1x2 B, so it saves *nothing*, while touching
+/// ~150 call sites. Revisit only if blocks gain per-block state variants.
 #[derive(Clone, Debug)]
 pub(crate) enum ChunkBlocks {
     /// One block for the whole section — about half of all stored sections.

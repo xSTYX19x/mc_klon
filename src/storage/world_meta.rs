@@ -11,7 +11,9 @@ use crate::world::CHUNK_SIZE;
 use crate::world::WorldEnvironment;
 use crate::worldgen::WorldgenPreset;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+// `Eq` is gone with the float-carrying spawn; nothing compares metas for
+// equality outside tests.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct WorldMeta {
     pub(crate) format_version: u16,
     pub(crate) world_seed: u64,
@@ -28,6 +30,35 @@ pub(crate) struct WorldMeta {
     pub(crate) block_registry_hash: Option<String>,
     /// User-facing name. `None` falls back to the save directory's name.
     pub(crate) display_name: Option<String>,
+    /// Where the player stood and looked when the world was last saved.
+    /// `None` for worlds that were never saved by a build that records it, in
+    /// which case startup falls back to the origin-centred spawn search.
+    pub(crate) player_spawn: Option<PlayerSpawn>,
+}
+
+/// Persisted player placement. Angles are radians in the camera's own
+/// convention, stored as-is so a reload restores the exact view.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlayerSpawn {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) z: f32,
+    pub(crate) yaw_rad: f32,
+    pub(crate) pitch_rad: f32,
+}
+
+impl PlayerSpawn {
+    /// Rejects values that would place the player nowhere useful. A corrupt or
+    /// hand-edited entry must degrade to the normal spawn search, not strand
+    /// the player outside the world.
+    pub(crate) fn is_usable(&self, min_y: i32, max_y: i32) -> bool {
+        [self.x, self.y, self.z, self.yaw_rad, self.pitch_rad]
+            .iter()
+            .all(|value| value.is_finite())
+            && self.y >= min_y as f32
+            && self.y <= max_y as f32 + 1.0
+    }
 }
 
 impl WorldMeta {
@@ -57,6 +88,7 @@ impl WorldMeta {
             save_format_version: 2,
             block_registry_hash: None,
             display_name: None,
+            player_spawn: None,
         };
         validate(&meta)?;
         Ok(meta)
@@ -87,6 +119,8 @@ struct WorldMetaWire {
     block_registry_hash: Option<String>,
     #[serde(default)]
     display_name: Option<String>,
+    #[serde(default)]
+    player_spawn: Option<PlayerSpawn>,
 }
 
 pub(crate) fn save_atomic(path: &Path, meta: &WorldMeta) -> io::Result<()> {
@@ -112,6 +146,7 @@ pub(crate) fn save_atomic(path: &Path, meta: &WorldMeta) -> io::Result<()> {
         save_format_version: meta.save_format_version,
         block_registry_hash: meta.block_registry_hash.clone(),
         display_name: meta.display_name.clone(),
+        player_spawn: meta.player_spawn,
     };
 
     let mut bytes = serde_json::to_vec_pretty(&wire)
@@ -183,6 +218,7 @@ pub(crate) fn load(path: &Path) -> io::Result<Option<WorldMeta>> {
         save_format_version: wire.save_format_version,
         block_registry_hash: wire.block_registry_hash,
         display_name: wire.display_name,
+        player_spawn: wire.player_spawn,
     };
     validate(&meta)?;
 
@@ -219,6 +255,19 @@ pub(crate) fn sanitize_world_dir_name(raw: &str) -> Option<String> {
     } else {
         Some(trimmed)
     }
+}
+
+/// Rewrites only the player spawn of an existing `world.meta`, so saving does
+/// not have to rebuild (and risk disagreeing with) the rest of the file.
+pub(crate) fn set_player_spawn(path: &Path, spawn: PlayerSpawn) -> io::Result<()> {
+    let mut meta = load(path)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("missing world meta at {}", path.display()),
+        )
+    })?;
+    meta.player_spawn = Some(spawn);
+    save_atomic(path, &meta)
 }
 
 /// Rewrites only the display name of an existing `world.meta`.
@@ -497,6 +546,77 @@ mod tests {
         let err = load(&path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn player_spawn_round_trips_and_stays_optional() {
+        let path = temp_meta_path();
+        let mut meta = WorldMeta::new(
+            7,
+            WorldgenPreset::Hilly,
+            64,
+            0,
+            255,
+            16,
+            false,
+            128,
+            WorldEnvironment::Temperate,
+        )
+        .unwrap();
+        assert!(meta.player_spawn.is_none(), "a new world has no saved spawn");
+        save_atomic(&path, &meta).unwrap();
+        assert!(load(&path).unwrap().unwrap().player_spawn.is_none());
+
+        let spawn = super::PlayerSpawn {
+            x: 12.5,
+            y: 71.0,
+            z: -304.25,
+            yaw_rad: 1.25,
+            pitch_rad: -0.4,
+        };
+        meta.player_spawn = Some(spawn);
+        save_atomic(&path, &meta).unwrap();
+        assert_eq!(load(&path).unwrap().unwrap().player_spawn, Some(spawn));
+
+        // The partial rewrite must touch only the spawn.
+        let moved = super::PlayerSpawn {
+            x: -8.0,
+            ..spawn
+        };
+        super::set_player_spawn(&path, moved).unwrap();
+        let reloaded = load(&path).unwrap().unwrap();
+        assert_eq!(reloaded.player_spawn, Some(moved));
+        assert_eq!(reloaded.world_seed, 7);
+        assert_eq!(reloaded.preset, WorldgenPreset::Hilly);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unusable_spawns_are_rejected_so_startup_falls_back() {
+        let ok = super::PlayerSpawn {
+            x: 0.0,
+            y: 64.0,
+            z: 0.0,
+            yaw_rad: 0.0,
+            pitch_rad: 0.0,
+        };
+        assert!(ok.is_usable(0, 255));
+
+        for broken in [
+            super::PlayerSpawn { y: -5.0, ..ok },
+            super::PlayerSpawn { y: 400.0, ..ok },
+            super::PlayerSpawn {
+                x: f32::NAN,
+                ..ok
+            },
+            super::PlayerSpawn {
+                yaw_rad: f32::INFINITY,
+                ..ok
+            },
+        ] {
+            assert!(!broken.is_usable(0, 255), "{broken:?} must not be used");
+        }
     }
 
     #[test]

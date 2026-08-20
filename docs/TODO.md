@@ -54,21 +54,9 @@ When an item ships, delete it from here instead of marking it done.
 - add a visual/manual checklist for chunk-border seams
 - measure that startup/chunkgen stay within acceptable warmup budgets after ore tuning
 
-## Storage / Content Foundation
-
-- if measurements justify it: design a more compact v2.1/v3 column storage layout (less string overhead than the current name-palette, forward-compatible). Measured, so this is now a cost/benefit call rather than an open question — see the numbers below. Two candidates were sized: a `u16`-id palette saves 11.7 % on disk for terrain and 34.4 % for heavily built chunks, but gives up the self-describing decode that lets unknown names degrade to air without the manifest (that is what v1 did); a column-level *name* palette keeps that property but is a measured **regression** (-18.0 % for terrain), because widening `bits_per_entry` across the whole column costs more than the repeated names save. Do not implement the column-palette variant
-- the `BlockStateId` half of the old storage-migration item is **deliberately not done** and should stay that way unless block states gain per-block variants. Measured (`cargo test --release world::chunk::storage_report -- --nocapture`): merging `blocks` + `block_data` into one `u16` state id saves *exactly zero* bytes (2x1 B becomes 1x2 B) while touching ~150 call sites across meshing, worldgen, lighting, render and storage. The palette/bitpack half — the part the item listed as "optional" — is where the win was, and it has shipped as `ChunkBlocks`: **403 B per section instead of 4096 B, 10.2x smaller** (Insane view distance 103.1 MiB -> 10.2 MiB). Separate dirty flags were not needed; `Chunk::revision` already serves that purpose
-
 ## UI / UX
 
 - keep expanding the options UI without reintroducing scattered hard-coded runtime settings
-
-## Gameplay
-
-- wire hotbar digit keys `1..9` to slot selection and decide whether they become rebindable actions (`hotbar_slot_for_key` in `src/input.rs` exists but is never called)
-- continue block-shape gameplay polish so interaction boxes stay close to visible geometry for future non-cube blocks
-- decide how spawn persistence and first-view direction should affect startup readiness/target selection
-- add a hand swing animation on break/place: the first-person arm/held-item model already exists and is tunable (`arm_model_rotation`, `arm_tweak.model_rot_*_rad`, held-item pose consts, `hand_anchor_local` around `src/render/state.rs:3467-3499`), but it's a static pose — add a short timed swing (punch arc on break, a lighter jab on place) driven by a timer set on the mine/place action, eased back to the resting `arm_tweak` pose, reusing the existing rotation composition instead of a new animation system
 
 ## Performance
 
@@ -92,7 +80,7 @@ When an item ships, delete it from here instead of marking it done.
 
 ## Docs / Cleanup
 
-- keep README, status docs, backlog docs, and worldgen TODOs updated after feature landings
+- keep README, status docs, backlog docs, and worldgen TODOs updated after feature landings. Storage / Content Foundation and Gameplay are closed; their two rejected designs (a compact v2.1/v3 column layout, and merging blocks + block_data into a `BlockStateId`) are recorded with their measurements next to the code, in `storage/chunk_codec.rs` and `world/chunk.rs`, rather than lingering here as open work
 - convert important contracts into short code comments near their source modules
 - remove stale assumptions whenever a system stops being experimental
 - make `cargo clippy --all-targets -- -D warnings` (the lint command in `CLAUDE.md`) usable again: the one hard clippy error is gone, but ~102 `never used` warnings remain, so `-D warnings` still fails. Needs a decision per item — bulk-deleting would likely remove scaffolding for in-flight work, bulk-`#[allow]` would hide future real findings

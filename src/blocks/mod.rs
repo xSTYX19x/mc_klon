@@ -524,6 +524,15 @@ impl BlockSpec {
         }
     }
 
+    /// The box the player aims at, kept close to the block's *visible*
+    /// geometry — deliberately separate from `collision_shape` (which may be
+    /// empty for a block you can still select) and from `occlusion_shape`.
+    ///
+    /// The catch-all below is only correct for models that really fill the
+    /// cell. `interaction_shape_tests::every_model_states_its_raycast_shape`
+    /// matches on `BlockModelSpec` exhaustively, so adding a non-cube model
+    /// (stairs, panes, fences, torches, rails) fails to compile until its shape
+    /// is stated here rather than silently inheriting `FullCube`.
     const fn raycast_shape(self) -> CollisionShape {
         match self.model {
             BlockModelSpec::None => CollisionShape::Empty,
@@ -2862,5 +2871,110 @@ mod tests {
         grass_random_tick(&mut world, pos, BlockId::Grass, 0);
 
         assert_eq!(world.get_block(pos), BlockId::Dirt);
+    }
+}
+
+#[cfg(test)]
+mod interaction_shape_tests {
+    use super::{
+        BlockAabb, BlockId, BlockModelSpec, CROSS_PLANT_SELECTION_AABB, CollisionShape,
+        FULL_CUBE_AABB, LOWER_SLAB_AABB, SNOW_LAYER_AABB, block_spec_for,
+    };
+
+    /// Whether a model fills its whole cell visually. Exhaustive on purpose:
+    /// this is the guard that stops a future non-cube model from quietly
+    /// inheriting a full-cube selection box.
+    fn model_fills_the_cell(model: BlockModelSpec) -> bool {
+        match model {
+            BlockModelSpec::None => false,
+            BlockModelSpec::CubeAll { .. }
+            | BlockModelSpec::CubeTopSideBottom { .. }
+            | BlockModelSpec::GrassTopSideBottom { .. }
+            // A liquid *source* fills the cell; flowing levels render lower, but
+            // their height lives in block data, which a per-spec shape cannot
+            // see. Water is excluded from targeting entirely
+            // (`raycast::blocks_raycast_targeting`).
+            | BlockModelSpec::LiquidTopSideBottom { .. } => true,
+            BlockModelSpec::LayerBottomTopSideBottom { .. }
+            | BlockModelSpec::PlantCross { .. }
+            | BlockModelSpec::SlabBottomTopSideBottom { .. } => false,
+        }
+    }
+
+    fn all_blocks() -> Vec<BlockId> {
+        (0u16..=255)
+            .filter_map(|raw| BlockId::from_u8(raw as u8).ok())
+            .collect()
+    }
+
+    #[test]
+    fn every_model_states_its_raycast_shape() {
+        for block in all_blocks() {
+            let spec = block_spec_for(block);
+            let shape = block.raycast_shape();
+            if model_fills_the_cell(spec.model) {
+                continue;
+            }
+            assert!(
+                !matches!(shape, CollisionShape::FullCube),
+                "{block:?} renders smaller than its cell but is selected as a full cube"
+            );
+        }
+    }
+
+    #[test]
+    fn selection_boxes_stay_inside_their_cell() {
+        for block in all_blocks() {
+            let Some(bounds) = block.raycast_shape().local_bounds() else {
+                continue;
+            };
+            let (min, max) = bounds.world_bounds(glam::IVec3::ZERO);
+            for axis in 0..3 {
+                assert!(
+                    min[axis] >= 0.0 && max[axis] <= 1.0,
+                    "{block:?} selection box leaves its cell on axis {axis}"
+                );
+                assert!(
+                    max[axis] > min[axis],
+                    "{block:?} selection box is degenerate on axis {axis}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn partial_height_models_are_selected_at_their_rendered_height() {
+        for block in all_blocks() {
+            let spec = block_spec_for(block);
+            let expected: Option<BlockAabb> = match spec.model {
+                BlockModelSpec::None => None,
+                BlockModelSpec::SlabBottomTopSideBottom { .. } => Some(LOWER_SLAB_AABB),
+                BlockModelSpec::LayerBottomTopSideBottom { height_px, .. } => Some(if height_px == 2
+                {
+                    SNOW_LAYER_AABB
+                } else {
+                    BlockAabb::from_pixels([0, 0, 0], [16, height_px, 16])
+                }),
+                BlockModelSpec::PlantCross { .. } => Some(CROSS_PLANT_SELECTION_AABB),
+                _ => Some(FULL_CUBE_AABB),
+            };
+            assert_eq!(
+                block.raycast_shape().local_bounds(),
+                expected,
+                "{block:?} selection box does not match its rendered height"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_models_cannot_be_selected() {
+        for block in all_blocks() {
+            if matches!(block_spec_for(block).model, BlockModelSpec::None) {
+                assert!(
+                    block.raycast_shape().local_bounds().is_none(),
+                    "{block:?} has no geometry but offers a selection box"
+                );
+            }
+        }
     }
 }
