@@ -194,6 +194,12 @@ impl ViewBobbing {
         );
     }
 
+    /// Walk-cycle phase and strength, shared with the third-person limb swing so
+    /// the model's stride matches the view bob.
+    pub(crate) fn stride(self) -> (f32, f32) {
+        (self.stride_phase_radians, self.intensity)
+    }
+
     pub(crate) fn sample(self) -> ViewBobbingSample {
         ViewBobbingSample {
             local_offset: self.local_offset,

@@ -3,6 +3,7 @@ pub(crate) mod depth;
 pub(crate) mod lighting_worker;
 pub(crate) mod mesh_gpu;
 pub(crate) mod mesh_worker;
+pub(crate) mod player_model;
 pub(crate) mod screenshot;
 pub(crate) mod shaders;
 pub(crate) mod state;

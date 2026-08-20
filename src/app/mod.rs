@@ -28,6 +28,7 @@ use crate::perf::trace as perf_trace;
 use crate::perf::{PerfCat, PerfStats};
 use crate::player::*;
 use crate::render::State;
+use crate::render::player_model::PlayerModelView;
 use crate::render::state::{
     ChatOverlay, ChatOverlayLine, DebugOverlay, GenerationOverlay, HitchCounters, InventoryOverlay,
     MenuOverlay, SavedWorldSummary, WorldGenParams, WorldGenRequest, WorldLoadStageStats,
@@ -507,6 +508,40 @@ impl App {
             state.set_camera_mode(self.camera_mode);
         }
         crate::console_info!("Camera: {}", self.camera_mode.label());
+    }
+
+    /// Pose handed to the renderer for the third-person player model. `None` in
+    /// first person, where the model would only clip through the near plane.
+    ///
+    /// Takes its inputs explicitly rather than `&self`, so it can be called
+    /// while the render `State` is mutably borrowed.
+    fn build_player_model_view(
+        camera_mode: CameraMode,
+        in_game: bool,
+        camera: &Camera,
+        player: &Player,
+        view_bobbing: ViewBobbing,
+        sneak_held: bool,
+        skin_layer: u32,
+    ) -> Option<PlayerModelView> {
+        if camera_mode.is_first_person() || !in_game {
+            return None;
+        }
+        let (stride_phase, stride_intensity) = view_bobbing.stride();
+        // The body follows the look direction; a separate turn-in-place
+        // animation is out of scope, so body and head share the yaw.
+        Some(PlayerModelView {
+            feet: player.feet_position,
+            body_yaw: camera.yaw,
+            look_yaw: camera.yaw,
+            look_pitch: camera.pitch,
+            stride_phase,
+            stride_intensity,
+            sneaking: sneak_held && !matches!(player.mode, MoveMode::Flight),
+            // Filled in by the renderer, which owns the world light data.
+            light_packed: 0,
+            skin_layer,
+        })
     }
 
     /// Back to first person whenever a world session ends, so a fresh world
@@ -3836,6 +3871,16 @@ impl ApplicationHandler for App {
                             ),
                         )
                     };
+                    let player_model_view = Self::build_player_model_view(
+                        self.camera_mode,
+                        in_game,
+                        &self.camera,
+                        &self.player,
+                        self.view_bobbing,
+                        self.controller.move_down,
+                        state.player_skin_layer(),
+                    );
+                    state.set_player_model_view(player_model_view);
                     let world_time = state.world_time;
                     {
                         let _perf_scope = self.perf.scope(PerfCat::Uniforms);

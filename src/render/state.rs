@@ -67,6 +67,7 @@ use crate::config::sim::RANDOM_TICK_SPEED_DEFAULT;
 use crate::meshing::{CpuMeshData, FULLBRIGHT_LIGHT_PACKED, MeshLayerMask, Vertex, WorldVertex};
 use crate::perf::trace as perf_trace;
 use crate::player::PlayerMode;
+use crate::render::player_model::{self, PlayerModelView};
 use crate::render::screenshot;
 use crate::sim::{ActiveSimColumns, ColumnCoord, SimSystem};
 use crate::storage::chunk_codec::{
@@ -1243,6 +1244,7 @@ const FRAME_MESH_GENERATING_OVERLAY: &str = "Generating Overlay";
 const FRAME_MESH_MENU_OVERLAY: &str = "Menu Overlay";
 const FRAME_MESH_DEBUG_OVERLAY: &str = "Debug Overlay";
 const FRAME_MESH_FIRST_PERSON_OVERLAY: &str = "First Person Overlay";
+const FRAME_MESH_PLAYER_MODEL: &str = "Player Model";
 
 /// Wall-clock bound for the blocking spawn-placement column wait.
 const ENSURE_COLUMN_GENERATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -5238,6 +5240,8 @@ pub(crate) struct State {
     gui_scale: f32,
     /// Viewpoint the frame is rendered from; hides first-person-only overlays.
     camera_mode: CameraMode,
+    /// Player pose for this frame; `None` in first person or outside a session.
+    player_model_view: Option<PlayerModelView>,
     _texture_registry: TextureRegistry,
     _world_texture_array: TextureArray,
     _sky_texture_array: TextureArray,
@@ -7872,8 +7876,31 @@ impl State {
         }
     }
 
+    pub(crate) fn player_skin_layer(&self) -> u32 {
+        self.first_person_skin_layer
+    }
+
     pub(crate) fn set_camera_mode(&mut self, mode: CameraMode) {
         self.camera_mode = mode;
+        if mode.is_first_person() {
+            self.player_model_view = None;
+        }
+    }
+
+    /// Supplies the player pose for the next frame. The caller does not know the
+    /// world light at the player's position, so it is sampled here.
+    pub(crate) fn set_player_model_view(&mut self, view: Option<PlayerModelView>) {
+        self.player_model_view = view.map(|mut view| {
+            // Sample around chest height so standing in a lit room does not pick
+            // up the dark block the feet are embedded in.
+            let sample = view.feet + Vec3::new(0.0, 1.0, 0.0);
+            view.light_packed = u32::from(self.world.get_light_packed(IVec3::new(
+                sample.x.floor() as i32,
+                sample.y.floor() as i32,
+                sample.z.floor() as i32,
+            )));
+            view
+        });
     }
 
     pub(crate) fn set_gui_scale(&mut self, gui_scale: GuiScale) {
@@ -10006,6 +10033,7 @@ impl State {
             inventory_overlay_cache: None,
             gui_scale: GuiScale::default().factor(),
             camera_mode: CameraMode::default(),
+            player_model_view: None,
             _texture_registry: texture_registry,
             _world_texture_array: world_texture_array,
             _sky_texture_array: sky_texture_array,
@@ -19555,6 +19583,20 @@ impl State {
             && !showing_generation_screen
             && !showing_pause_menu
             && !showing_inventory;
+        // The model belongs in the world pass, but it is built here with the
+        // other per-frame meshes.
+        let show_player_model = !self.camera_mode.is_first_person()
+            && !showing_generation_screen
+            && self.player_model_view.is_some();
+        if show_player_model {
+            let view = self
+                .player_model_view
+                .expect("checked by show_player_model");
+            let (vertices, indices) = player_model::build_player_model_mesh(view);
+            self.upload_frame_mesh(FRAME_MESH_PLAYER_MODEL, vertices, indices);
+        } else {
+            self.clear_frame_mesh(FRAME_MESH_PLAYER_MODEL);
+        }
         if show_first_person_overlay {
             let held_block =
                 hotbar[selected_hotbar_slot.min(HUD_HOTBAR_SLOT_COUNT.saturating_sub(1))];
@@ -19856,6 +19898,41 @@ impl State {
                     rpass.draw(0..BLOCK_OUTLINE_VERTEX_COUNT, 0..1);
                 }
             }
+        }
+
+        if let Some(mesh) = self.frame_mesh_to_draw(FRAME_MESH_PLAYER_MODEL) {
+            // Loads the world depth instead of clearing it, so the player is
+            // correctly occluded by terrain between them and the camera.
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Player Model Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+            rpass.set_pipeline(&self.ui_3d_overlay_pipeline);
+            rpass.set_bind_group(0, &self.world_texture_bind_group, &[]);
+            rpass.set_bind_group(1, &self.camera_bind_group, &[]);
+            rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            rpass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            rpass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            world_drawcalls += 1;
         }
 
         if let Some(mesh) = self.frame_mesh_to_draw(FRAME_MESH_FIRST_PERSON_OVERLAY) {
