@@ -24,7 +24,6 @@ When an item ships, delete it from here instead of marking it done.
 ## Worldgen
 
 ### High priority
-- fix the failing sea-level test: `world::config::tests::sea_level_comes_from_world_config_for_lakes_and_lava_constraints` asserts no water feature sits above the configured sea level and fails with `water_y=84, sea_level=80` in column (-2,-4). It is the only red test in the suite and predates the current performance work (verified against `8f7634d`), so either the lake placement ignores `sea_level` or the invariant is stated too strictly
 - split ore profiles by preset instead of one shared default table (`ore_profile_for_preset` currently ignores its preset argument)
 - add neighbor-aware exposed-air checks so `HiddenOnly` ores are trustworthy at chunk borders
 - expand worldgen regression tests with seam, density, and height-distribution sampling

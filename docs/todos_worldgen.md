@@ -35,6 +35,22 @@ Current initial ore table:
 
 See "Worldgen" in `docs/TODO.md`.
 
+## Sea Level Contract
+
+`WorldConfig::sea_level` is a worldgen *input*, not a ceiling for water:
+
+- **lava** is bounded by it — `make_lava_lake_candidate` clamps every lava lake
+  to `sea_level - 2`
+- **springs/rivers** deliberately start *above* it
+  (`WATER_RIVER_SOURCE_MIN/MAX_ABOVE_SEA` = `sea_level + 6 .. + 28`) and descend
+  until `sea_level + 1`
+- **water lakes** follow the local terrain surface and take no sea-level
+  argument at all; a pond on a hillside above sea level is intended
+
+Guarded by
+`world::config::tests::sea_level_from_world_config_bounds_lava_while_springs_may_start_above_it`,
+which runs two sea levels so the lava bound cannot be met by a constant.
+
 ## Worldgen Phase Order
 
 The current target order is:

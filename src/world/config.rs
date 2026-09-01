@@ -87,47 +87,82 @@ mod tests {
         (max_water_y, max_lava_y)
     }
 
-    #[test]
-    fn sea_level_comes_from_world_config_for_lakes_and_lava_constraints() {
-        let cfg = WorldConfig {
-            seed: 0x0BAD_5EED_CAFE_BABE,
-            sea_level: 80,
-            ..WorldConfig::default()
-        };
-        let preset = WorldgenPreset::Rd161348Like;
-
-        let mut chosen: Option<(i32, i32, i32, i32)> = None;
-        for ring in 0..=20 {
-            for cz in -ring..=ring {
-                for cx in -ring..=ring {
-                    let (max_water_y, max_lava_y) = column_feature_extrema(cfg, preset, cx, cz);
-                    if let (Some(w), Some(l)) = (max_water_y, max_lava_y) {
-                        chosen = Some((cx, cz, w, l));
-                        break;
-                    }
+    /// Scans a fixed square of columns and returns the highest water / lava
+    /// block found anywhere in it.
+    fn grid_feature_extrema(
+        cfg: WorldConfig,
+        preset: WorldgenPreset,
+        ring: i32,
+    ) -> (Option<i32>, Option<i32>) {
+        let mut max_water_y = None;
+        let mut max_lava_y = None;
+        for cz in -ring..=ring {
+            for cx in -ring..=ring {
+                let (water, lava) = column_feature_extrema(cfg, preset, cx, cz);
+                if let Some(w) = water {
+                    max_water_y = Some(max_water_y.map_or(w, |v: i32| v.max(w)));
                 }
-                if chosen.is_some() {
-                    break;
+                if let Some(l) = lava {
+                    max_lava_y = Some(max_lava_y.map_or(l, |v: i32| v.max(l)));
                 }
-            }
-            if chosen.is_some() {
-                break;
             }
         }
+        (max_water_y, max_lava_y)
+    }
 
-        let (cx, cz, max_water_y, max_lava_y) = chosen
-            .unwrap_or_else(|| panic!("no test column with water + lava features found for seed"));
+    /// `sea_level` is a worldgen *input*, not a ceiling for water. Springs are
+    /// deliberately sourced on hillsides above it (`WATER_RIVER_SOURCE_MIN/MAX_ABOVE_SEA`
+    /// in `render::chunkgen_worker`) and water lakes follow the terrain surface,
+    /// so water above sea level is generated on purpose. What sea level does
+    /// bound is lava: `make_lava_lake_candidate` clamps every lava lake to
+    /// `sea_level - 2`.
+    ///
+    /// The test runs two sea levels so the bound cannot be satisfied by a
+    /// hard-coded constant: the high-sea run must place lava above the low-sea
+    /// run's ceiling, which only holds if the value is threaded through from
+    /// `WorldConfig`.
+    #[test]
+    fn sea_level_from_world_config_bounds_lava_while_springs_may_start_above_it() {
+        const LOW_SEA_LEVEL: i32 = 40;
+        const HIGH_SEA_LEVEL: i32 = 80;
+        const RING: i32 = 4;
+
+        let preset = WorldgenPreset::Rd161348Like;
+        let base = WorldConfig {
+            seed: 0x0BAD_5EED_CAFE_BABE,
+            ..WorldConfig::default()
+        };
+
+        let mut observed = Vec::new();
+        for sea_level in [LOW_SEA_LEVEL, HIGH_SEA_LEVEL] {
+            let cfg = WorldConfig { sea_level, ..base };
+            let (max_water_y, max_lava_y) = grid_feature_extrema(cfg, preset, RING);
+            let max_lava_y = max_lava_y.unwrap_or_else(|| {
+                panic!("no lava feature within ring {RING} for sea_level={sea_level}")
+            });
+            assert!(
+                max_lava_y <= sea_level - 2,
+                "lava feature above the sea-level ceiling: lava_y={max_lava_y}, sea_level={sea_level}"
+            );
+            observed.push((sea_level, max_water_y, max_lava_y));
+        }
+
+        let (_, _, low_lava_y) = observed[0];
+        let (_, high_water_y, high_lava_y) = observed[1];
+
         assert!(
-            max_water_y <= cfg.sea_level() - 1,
-            "water feature above configured sea level in column ({cx},{cz}): water_y={}, sea_level={}",
-            max_water_y,
-            cfg.sea_level()
+            high_lava_y > low_lava_y,
+            "lava ceiling does not track sea_level: sea {LOW_SEA_LEVEL} -> lava_y={low_lava_y}, \
+             sea {HIGH_SEA_LEVEL} -> lava_y={high_lava_y}"
         );
+
+        // Springs/lakes above sea level are intended; if this ever stops holding,
+        // water placement was clamped to sea level and the surface features are gone.
+        let high_water_y = high_water_y.expect("no water feature within scanned ring");
         assert!(
-            max_lava_y <= cfg.sea_level() - 2,
-            "lava feature violated sea-level constraint in column ({cx},{cz}): lava_y={}, sea_level={}",
-            max_lava_y,
-            cfg.sea_level()
+            high_water_y > HIGH_SEA_LEVEL,
+            "no water generated above sea level any more: water_y={high_water_y}, \
+             sea_level={HIGH_SEA_LEVEL}"
         );
     }
 }

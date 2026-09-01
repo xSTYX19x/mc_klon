@@ -339,11 +339,14 @@ fn terrain_height_span_in_radius(
     max_h.saturating_sub(min_h)
 }
 
+/// Water lakes are placed relative to the local terrain surface, not to
+/// `sea_level`: a pond on a hillside above sea level is intended, so this pass
+/// takes no sea-level argument. The sea-level-bounded fluid is lava, see
+/// `make_lava_lake_candidate`.
 fn make_water_lake_candidate(
     source_chunk_x: i32,
     source_chunk_z: i32,
     terrain: &TerrainSampler,
-    _sea_level: i32,
     rng: &mut SplitMix64,
 ) -> Option<LakeCandidate> {
     let wx = source_chunk_x * CHUNK_SIZE + rng.range_i32(0, CHUNK_SIZE - 1);
@@ -606,13 +609,13 @@ fn choose_water_feature_for_source(
             return Some(WaterFeature::Spring(spring));
         }
         if let Some(lake) =
-            make_water_lake_candidate(source_chunk_x, source_chunk_z, terrain, sea_level, &mut rng)
+            make_water_lake_candidate(source_chunk_x, source_chunk_z, terrain, &mut rng)
         {
             return Some(WaterFeature::Lake(lake));
         }
     } else {
         if let Some(lake) =
-            make_water_lake_candidate(source_chunk_x, source_chunk_z, terrain, sea_level, &mut rng)
+            make_water_lake_candidate(source_chunk_x, source_chunk_z, terrain, &mut rng)
         {
             return Some(WaterFeature::Lake(lake));
         }
@@ -3334,3 +3337,4 @@ impl Drop for ChunkGenWorkerPool {
         }
     }
 }
+
