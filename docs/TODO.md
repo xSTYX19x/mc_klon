@@ -31,9 +31,16 @@ Niederschlag, Screenshots, Menüs/Options/Settings, Ticking-Areas) steht nicht
 mehr hier. Multiplayer/SMP (Abschnitt 6 der Featureliste) ist explizit
 ausgeklammert.
 
-Die Welt ist heute schon **0..255** hoch (`WorldConfig::min_y/max_y`,
-`world/config.rs:45-48`) statt der 128 der Vorlage — das bleibt so, die
-Featureliste ist Inhalts-, keine Limit-Vorgabe.
+**Grundregel bei Widerspruch: das vorhandene Feature gewinnt.** Wo der Code
+über a1.0.17_04 hinaus ist, ist das ein bewusster Vorgriff auf eine spätere
+Version — nichts davon wird zurückgebaut, um die Vorlage exakt zu treffen. Die
+Featureliste liefert den *Inhalt*, der noch fehlt, nicht die Obergrenze.
+Betroffen sind heute: Weltgrenzen **0..255** statt 128 (`WorldConfig::min_y/
+max_y`, `world/config.rs:45-48`), **Sprint/Sneak** (`InputAction::Sprint`/
+`Sneak`, in der Vorlage erst ab Alpha 1.2.0), `Player::food_level`
+(`player/mod.rs:52`, gated heute `can_sprint_swim`, `:100`), die sechs
+Baum-Presets statt zwei Eichenformen, und `WorldEnvironment` als expliziter
+Weltparameter statt einer reinen Winter-Zufallsflagge.
 
 ### Querschnitts-Voraussetzung: Block-States
 
@@ -91,12 +98,13 @@ der Vorlage. Der Blocktextur-Bestand deckt fast alles ab
 Varianten): `torch`, `ladder`, `clay`, `cactus_*`, `sugar_cane`, `diamond_ore`,
 `redstone_ore`, `lapis_ore`, `crafting_table_*`, `furnace_*`, `jukebox_*`,
 `note_block`, `spawner`, `rail`, `lever`, `redstone_dust_*`, `oak_door_*` sind
-alle vorhanden — für diese Blöcke fehlt also nur die `BlockSpec`-Zeile. Zwei
-Ausnahmen, die vorher beschafft werden müssen: die **Kiste** hat im modernen
-Layout keine Blocktextur, sondern eine Entity-Textur
-(`textures/entity/chest/*`), und dort liegt heute nur `skin.png`; **Zaun** und
-**Knopf** haben ebenfalls keine eigene Textur und leihen sich Planken bzw.
-Stein, was beim Modellbau bewusst so umgesetzt werden muss.
+alle vorhanden — für diese Blöcke fehlt also nur die `BlockSpec`-Zeile. Die
+**Kiste** hat im modernen Layout keine Blocktextur, sondern eine Entity-Textur;
+`textures/entity/chest/` liegt inzwischen vor (`normal`, `normal_left`,
+`normal_right`, `trapped*`, `ender`), das Kistenmodell muss also als
+Entity-artiges Modell mit eigener Textur gebaut werden, nicht als Würfel aus dem
+Blockatlas. **Zaun** und **Knopf** haben keine eigene Textur und leihen sich
+Planken bzw. Stein — beim Modellbau bewusst so umsetzen.
 
 **Ohne neue Blockform (billig, reine Tabellen-Einträge in `BLOCK_SPECS`
 (`blocks/mod.rs:700`) plus `CLASSIC_PALETTE_ORDER` (`:139`)):** beides sind
@@ -179,22 +187,22 @@ Effiziente Reihenfolge:
    flache Items kommt ein Sprite-Pfad daneben — `ItemPreviewDraw`
    (`render/state.rs:3004`) ist der Anknüpfungspunkt.
 
-**Achtung Assets:** `assets/minecraft/textures/item/` enthält heute **genau eine
-Datei** (`apple.png`) — gegenüber 2113 Dateien im Blockordner. Für Items müssen
-die Texturen erst beschafft werden; das ist ein eigener, blockierender
-Arbeitsschritt vor Punkt 4, keine Nebensache.
+**Assets: erledigt bis auf einen kleinen Rest.**
+`assets/minecraft/textures/item/` enthält jetzt 462 Dateien, dazu
+`textures/entity/chest/` und `textures/entity/signs/`. Werkzeuge, Rüstung,
+Barren, Nahrung, Eimer, Bogen/Pfeil, Musikplatten, Buch/Papier, `slime_ball`,
+`clay_ball`, `brick` und `wheat_seeds` sind da. Noch offen und vor der
+Item-UI zu beschaffen: `feather`, `wheat`, `bowl`, `saddle`, `snowball` sowie
+15 der 16 Farbstoffe (nur `yellow_dye.png` liegt vor) — für a1.0.17 werden
+davon 8 gebraucht.
 
 Inhalt danach, in der Reihenfolge der Abhängigkeit:
 
 - Werkzeugstufen Holz/Stein/Eisen/Gold/Diamant × Spitzhacke/Axt/Schaufel/Hacke/
   Schwert; Diamant 1025 Uses.
-- Block-Härte + werkzeugabhängige Abbauzeit. **Fehlt heute komplett** — der
-  Abbau ist sofortig (`destroy_block_at_camera_ray`,
-  `render/state.rs:19103`, prüft nur `is_breakable`). Umsetzung: `hardness: f32`
-  + `tool_class` in `BlockSpec`,
-  Abbaufortschritt als Timer im Player-State, Fortschrittsanzeige über die
-  vorhandene Destroy-Stage-Texturfamilie (`assets/.../block/destroy_stage_*.png`,
-  bereits im Pack) als zusätzliches Overlay-Quad auf dem Selektionsblock.
+- Werkzeug-Effizienz und Haltbarkeit als *Daten* (`tool_class`, `tier`,
+  `durability`) gehören in die `ITEM_SPECS`-Tabelle; die *Wirkung* (Abbauzeit,
+  Verschleiß) steht unter "Survival-Gameplay", weil sie nur dort greift.
 - Drops beim Abbau (inkl. Setzling 1/20 aus Laub, Apfel aus Laub,
   Ton→4 Tonbällchen, Kies→Feuerstein-Chance). Ohne Entity-System zunächst
   direkt ins Inventar; die Item-Entity kommt am Entity-Punkt.
@@ -205,11 +213,12 @@ Inhalt danach, in der Reihenfolge der Abhängigkeit:
   pro Item. Der Ofen-Stub existiert bereits als Registrierung
   (`CORE_FURNACE_STUB_BLOCK_ENTITY_KEY`, `blocks/mod.rs:66`) — dort andocken.
 - Rüstung (Leder/Eisen/Gold/Diamant, 4 Slots), Bogen + Pfeile.
-- Nahrung: Apfel, Brot, rohes/gebratenes Schwein, Pilzsuppe. In Alpha heilt
-  Essen **sofort**, es gibt keine Hungerleiste — `Player::food_level`
-  (`player/mod.rs:52`) existiert bereits als Feld und sollte für diese Ära
-  entweder unbenutzt bleiben oder entfernt werden, statt eine Hungermechanik
-  vorzutäuschen.
+- Nahrung: Apfel, Brot, rohes/gebratenes Schwein, Pilzsuppe. In dieser Ära heilt
+  Essen **sofort** und es gibt keine Hungerleiste. `Player::food_level`
+  (`player/mod.rs:52`) bleibt trotzdem stehen — es ist heute die Bedingung für
+  `can_sprint_swim` (`:100`) und damit ein vorhandenes Feature, kein toter Rest.
+  Essen setzt es auf 20 zurück und heilt zusätzlich sofort; die Hungerleiste als
+  *UI* kommt erst mit der Version, in der sie hingehört.
 - Eimer (Wasser/Lava/Milch): setzt/entfernt Quellblöcke über den vorhandenen
   `FluidSystem`-Pfad; Milch braucht die Kuh.
 - Restliche Items: Schüssel, Feuerzeug, Sattel, Musikplatten (13, Cat),
@@ -267,37 +276,142 @@ Inhalt:
 
 ### Survival-Gameplay
 
-`PlayerMode::Survival` existiert und wird per `/gamemode` gesetzt, ändert heute
-aber nur den Bewegungsmodus (`app/mod.rs:2899`) und ob Bedrock abbaubar ist
-(`render/state.rs:19139`, in `destroy_block_at_camera_ray`). Es gibt keine
-Gesundheit, keinen Schaden, keinen Tod.
+Ist-Stand: `PlayerMode::Survival` existiert und wird per `/gamemode` gesetzt,
+**Standard ist aber `PlayerMode::Creative`** (`player/mod.rs:62`). Der Modus
+unterscheidet heute genau zwei Dinge: den Bewegungsmodus (Survival →
+`MoveMode::Walk` + Boden-Snap, `app/mod.rs:2899`) und ob Bedrock abbaubar ist
+(`render/state.rs:19139`). Es gibt keine Gesundheit, keinen Schaden, keinen
+Tod, keine Abbauzeit und keinen Ressourcenverbrauch. Survival ist damit heute
+"Creative ohne Fliegen", nicht ein eigener Spielmodus.
 
-- Gesundheit: 20 HP, Regeneration in dieser Ära **nur** durch Essen (sofortiger
-  Heileffekt), keine Hungerleiste.
-- Schadensquellen: Fall (ab >3 Blöcke), Ertrinken, Lava, Feuer, Ersticken in
-  Blöcken, Mob-Nahkampf, TNT, Kaktuskontakt. Die Zustände dafür liegen schon
-  vor: `PlayerFluidState` (`player/mod.rs:787`) kennt Eintauchtiefe und
-  Augen-unter-Wasser pro `FluidKind`, `CollisionFlags`/`on_ground` kennen die
-  Landung, `time_since_grounded` läuft bereits.
-- Fallschaden konkret: Fallhöhe aus dem letzten `on_ground == true` mitschleifen
-  und beim Grounded-Übergang auswerten — kein neuer Zustand nötig.
-- Tod + Respawn + Todesbildschirm. Respawn-Punkt: `PlayerSpawn` in
-  `storage/world_meta.rs` existiert bereits und wird geladen
-  (`render/state.rs:6421`).
-- HUD: Herzen (10), Rüstungsleiste. **Keine** Hungerleiste — die Vorlage hat
-  keine.
-- Bewusst nicht enthalten: Sprint, Schleichen (kamen erst in Alpha 1.2.0). Der
-  Code hat heute `InputAction::Sprint`/`Sneak` und `sprint_swim_active`; das ist
-  eine bewusste Abweichung nach vorn und sollte nicht zurückgebaut werden — nur
-  nicht als „fehlend" gegen die Vorlage geführt.
-- Reiten: Schwein (mit Sattel, nur Richtungssteuerung), Lore, Boot
-  (Rechtsklick zum Einsteigen). Hängt am Entity-System.
-- Interaktion: ein echter „Benutzen"-Pfad. Heute gibt es nur
-  Abbauen/Platzieren; Türen, Kisten, Werkbank, Ofen, Jukebox und Hebel brauchen
-  alle einen Rechtsklick-Handler pro Block. Umsetzung: ein Feld
-  `on_use: Option<UseFn>` in `BlockSpec` — dieselbe Bauform wie das schon
-  vorhandene `random_tick: Option<RandomTickFn>`, damit die Dispatch-Tabelle
-  einheitlich bleibt.
+Alles Folgende ist **modusgegated**: Creative behält Sofort-Abbau, Flug,
+unbegrenzte Blöcke, keinen Schaden. Der Ort dafür ist nicht verstreut — es gibt
+bereits einen `player_mode`-Parameter, der bis in den Block-Edit-Pfad
+durchgereicht wird (`destroy_block_at_camera_ray(&camera, player_mode)`,
+`render/state.rs:19103`, aufgerufen `app/mod.rs:3702` und `:4017`). Diese
+Signatur ist der richtige Angriffspunkt; sie sollte **nicht** durch ein globales
+"is_survival"-Flag ersetzt werden.
+
+#### Modus-Kontrakt
+
+Zuerst festschreiben, was der Modus überhaupt gatet, bevor Einzelfeatures
+gebaut werden — sonst wandert die Fallunterscheidung in jeden Call-Site:
+
+- Abbau: sofort (Creative) vs. Härte/Werkzeug (Survival)
+- Platzieren: unbegrenzt vs. verbraucht Stack
+- Drops: keine vs. Item-Entity/Inventar
+- Bewegung: Flug vs. Gehen (steht schon)
+- Schaden/Tod: aus vs. an
+- Bedrock: abbaubar vs. nicht (steht schon)
+- Mob-Aggression: ignoriert den Spieler vs. greift an
+
+Umsetzung: ein `struct ModeRules` mit `const fn for_mode(PlayerMode) -> Self`
+in `player/mod.rs`, in dem genau diese Booleans stehen. Jede Fallunterscheidung
+liest daraus, statt `matches!(mode, PlayerMode::Creative)` erneut zu schreiben —
+dieses Muster steht heute schon zweimal im Code und würde sonst zweistellig oft.
+
+#### Block-Abbau: Härte, Werkzeug-Effizienz, Haltbarkeit
+
+**Fehlt komplett** — der Abbau ist sofortig. Der Wiederholungspfad ist aber
+schon genau richtig gebaut und muss nur gefüllt werden: `App::break_held` +
+`break_cooldown_seconds` (`app/mod.rs:417-419`) treiben in der Frame-Schleife
+(`app/mod.rs:4011-4023`) wiederholtes Abbauen mit einer festen Wartezeit aus
+`block_action_repeat_cooldown_seconds()` (`:479`).
+
+- `BlockSpec` bekommt `hardness: f32` und `tool_class: ToolClass`
+  (`None`/`Pickaxe`/`Axe`/`Shovel`/`Shears`) plus `requires_tier: Option<Tier>`.
+  Beides sind konstante Tabellenfelder wie `breakable` heute — kein neuer
+  Speicher pro Voxel.
+- In Survival ersetzt ein **Fortschrittszähler pro Ziel** die feste Wartezeit:
+  `struct BreakProgress { target: IVec3, progress: f32 }`. Zurücksetzen, sobald
+  der Raycast ein anderes Ziel liefert oder die Maustaste losgelassen wird —
+  sonst kann man durch Zielwechsel weiterbohren. Der Raycast-Treffer liegt schon
+  vor (`world/raycast.rs`, `hit.hit_block_pos`).
+- Fortschrittsanzeige: `assets/minecraft/textures/block/destroy_stage_0..9.png`
+  liegen bereits im Pack (10 Stufen). Als zusätzliches Overlay-Quad auf den
+  Flächen des Zielblocks zeichnen — die Selektionsbox-Geometrie existiert
+  bereits und liefert dieselben Flächen.
+- Haltbarkeit: pro erfolgreichem Abbau ein Punkt Verschleiß auf dem gehaltenen
+  Werkzeug; bei 0 verschwindet das Item. Diamant 1025 Uses (Vorlage,
+  seit a1.0.3).
+- Creative bleibt sofort: `ModeRules::instant_break`.
+
+#### Gesundheit & Schaden
+
+- 20 HP (10 Herzen), Regeneration in dieser Ära **nur** durch Essen (sofortiger
+  Heileffekt). Keine Hungerleiste — siehe Grundregel oben zu `food_level`.
+- Schadensquellen der Vorlage: Fall, Ertrinken, Lava, Feuer, Ersticken in
+  Blöcken, Mob-Nahkampf, TNT-Explosion, Kaktus-Kontakt.
+- **Fallschaden**: der Landepunkt steht exakt fest — `collision.hit_y_down` in
+  `update_walk_movement` (`player/mod.rs:710-713`) setzt `on_ground = true` und
+  nullt `_velocity_y`. Unmittelbar davor ist `_velocity_y` die Aufprallgeschwin-
+  digkeit. Die Vorlage rechnet aber über die **Fallstrecke**, nicht über die
+  Geschwindigkeit; ein `fall_start_y: f32` im `Player` (ein `f32`, gesetzt beim
+  Verlassen des Bodens, ausgewertet an derselben Stelle) trifft die Originalformel
+  (`Schaden = floor(Fallhöhe) - 3`) direkt. Wasser/Leiter setzen ihn zurück.
+- **Ertrinken**: `PlayerFluidState` (`player/mod.rs:787`) kennt bereits
+  `eyes_in_for_kind(FluidKind::Water)`. Luftvorrat als Tick-Zähler dazu; unter 0
+  ein Herz pro Sekunde. Die Luftblasen-Anzeige gehört ins HUD.
+- **Lava/Feuer**: `in_body_for_kind(FluidKind::Lava)` liegt ebenfalls vor. Feuer
+  als Zustand am Spieler mit Restdauer, nicht als Weltblock — der Feuerblock
+  selbst ist nicht Teil dieser Liste.
+- **Ersticken**: Kopfzelle solide → Schaden. `aabb_collides`
+  (`player/mod.rs:135`) beantwortet das direkt.
+- **Kaktus**: Kontaktschaden über die AABB-Überlappung, sobald der Block
+  existiert (siehe "Blöcke").
+- Alle Quellen laufen über **eine** Funktion `apply_damage(&mut Player, amount,
+  DamageSource)` mit gemeinsamer Unverwundbarkeitszeit (Vorlage: 0.5 s), sonst
+  addieren sich Lava und Feuer pro Tick doppelt.
+
+#### Tod & Respawn
+
+- Todesbildschirm mit Respawn-Knopf (neuer `GameState`-Zweig, siehe UI/UX).
+- Respawn setzt auf `PlayerSpawn` aus `storage/world_meta.rs` — wird bereits
+  geladen (`render/state.rs:6421`) und ist damit schon persistent.
+- Beim Tod fällt das Inventar als Item-Entities zu Boden (hängt am
+  Entity-System) — bis dahin ersatzweise leeren.
+- Die Vorlage zeigt auf dem Todesbildschirm "Score: &e0"; das ist ein Bug der
+  Vorlage und wird nicht nachgebaut (siehe "Nicht übernommen").
+
+#### Kampf
+
+- Nahkampf: Linksklick auf ein Entity statt auf einen Block. Der Raycast muss
+  dafür Entities mittreffen — heute testet `world/raycast.rs` nur Voxel. Am
+  günstigsten als zweiter, separater Test gegen die Entity-AABBs **in derselben
+  Reichweite**, dann das nähere Ergebnis gewinnt; kein Umbau des Voxel-Raycasts.
+- Schadenswerte pro Werkzeugstufe, Rüstungsreduktion über die 4 Rüstungsslots.
+- Fernkampf: Bogen (in dieser Ära **unendlich viele Pfeile**) und Pfeil als
+  Projektil-Entity.
+- Knockback beim Treffer in beide Richtungen.
+
+#### Interaktion ("Benutzen")
+
+Heute gibt es nur Abbauen und Platzieren (`place_block_at_camera_ray`,
+`render/state.rs:19233`). Türen,
+Kisten, Werkbank, Ofen, Jukebox, Hebel und Knopf brauchen einen echten
+Rechtsklick-Handler pro Block, der *vor* dem Platzieren greift.
+
+Umsetzung: ein Feld `on_use: Option<UseFn>` in `BlockSpec` — dieselbe Bauform
+wie das schon vorhandene `random_tick: Option<RandomTickFn>`
+(`blocks/mod.rs:514`, `with_random_tick` `:2007`), damit die Dispatch-Tabelle
+einheitlich bleibt. Der Rechtsklick-Pfad fragt zuerst `on_use` des getroffenen
+Blocks; nur wenn das `None` liefert oder ablehnt, wird platziert. Sneak-Halten
+überspringt `on_use` (Vorlage-Verhalten für "auf eine Kiste bauen").
+
+#### Reiten
+
+Schwein (mit Sattel, in dieser Ära nur Richtungssteuerung ohne Karotte), Lore
+(mit Sitz-Animation seit a1.0.4), Boot (Rechtsklick zum Einsteigen, zerbricht an
+Land). Hängt vollständig am Entity-System. Die Kamera muss dafür einem Entity
+statt `player.feet_position` folgen — `sync_camera_to_player_eye`
+(`app/mod.rs:1068`) ist die eine Stelle, die das entscheidet.
+
+#### Bewusst abweichend
+
+Sprint und Schleichen gibt es in der Vorlage nicht (kamen erst in Alpha 1.2.0),
+im Code aber schon (`InputAction::Sprint`/`Sneak`, `sprint_swim_active`). Nach
+der Grundregel oben bleiben beide. Sneak bekommt mit Survival zusätzlich seine
+klassische Aufgabe: nicht über Kanten laufen, und `on_use` überspringen.
 
 ### Redstone & Logik
 
@@ -317,29 +431,133 @@ Komplett nicht vorhanden. Hängt an Block-States (Signalstärke = 4 Bit in
   übernehmen statt neu erfinden.
 - Bewusst nicht enthalten: Kolben, Schiebetüren (kamen später).
 
-### Storage: Block-Entities und Entities persistieren
+### Storage: Column-Payload v3 für Block-Entities und Entities
 
-**Harter Blocker für Kisten, Öfen, Schilder, Jukebox, Notenblock und alle
-Mobs/Drop-Items.**
+**Eigener, vorgezogener TODO — harter Blocker für Kisten, Öfen, Schilder,
+Jukebox, Notenblock, Spawner und jedes Mob/Drop-Item.** Ohne ihn ist jeder
+Inhalt mit Zustand nach einem Chunk-Unload weg, und das fällt erst beim Testen
+auf, nicht beim Bauen.
 
-Befund: `encode_column` schreibt ausschließlich Blöcke und `block_data`
-(`storage/chunk_codec.rs:294-339`); im gesamten `chunk_codec.rs` kommt weder
-`block_entit` noch `entities` vor. Block-Entities überleben also heute kein
-Speichern/Laden, sie werden beim Chunk-Load neu aus der Blocktabelle erzeugt
-(`BlockSpec::block_entity`).
+#### Befund
 
-Umsetzung, entlang des im Datei-Kopf von `chunk_codec.rs` bereits beschriebenen
-Wegs (dort steht ausdrücklich, wie ein v3 einzuführen ist):
+- `encode_blob` (`storage/chunk_codec.rs:460`) schreibt Header, Sektionen
+  (Blöcke + `block_data`) und CRC32 — sonst nichts. Weder `block_entit` noch
+  `entities` kommt in der Datei vor.
+- Block-Entities werden beim Laden aus der Blocktabelle neu erzeugt
+  (`BlockSpec::block_entity`), haben also heute per Definition keinen Zustand,
+  den man verlieren könnte. Genau das ändert sich mit der ersten Kiste.
+- Der Weg ist im Dateikopf von `chunk_codec.rs:23-24` schon vorgezeichnet:
+  "Adding a v3 means bumping `COLUMN_PAYLOAD_FORMAT_VERSION` and keeping both
+  older branches in `decode_column`."
 
-- `COLUMN_PAYLOAD_FORMAT_VERSION` 2 → 3, v2 und v1 weiter lesbar halten (der
-  Decoder trägt die Fallunterscheidung schon, `chunk_codec.rs:512-517`).
-- Zwei optionale Sektionen anhängen: `block_entities` (pro Chunk: lokaler
-  Index + Typschlüssel + Payload) und `entities` (pro Spalte).
-- `BlockEntity` braucht dafür `fn save(&self) -> Vec<u8>` /
-  `fn load(&mut self, &[u8])` im Trait (`world/block_entity_types.rs:16`) und
-  der `create`-Funktionszeiger in `BlockEntityType` eine Load-Variante.
-- Serialisierung: Serde ist bereits Abhängigkeit; das Regionformat komprimiert
-  ohnehin mit zlib, ein kompaktes Serde-Format reicht.
+#### Formatvorschlag v3
+
+Der entscheidende Punkt: **die Sektionen bleiben bitgleich v2.** v3 hängt nur
+einen Column-Trailer zwischen der letzten Sektion und der CRC32 an. Damit ist
+der teure, gemessene Teil des Formats (Blockindizes, 92.4 % der Nutzlast, siehe
+die Ablehnungsnotiz in `chunk_codec.rs:26-35`) unverändert und die
+v2→v3-Migration ist reines Anhängen.
+
+Der Erweiterungspunkt existiert schon: das `u16`-Feld **column flags** direkt
+hinter der Version ist heute `COLUMN_FLAGS_V2 = 0` (`chunk_codec.rs:51`) und
+wird beim Lesen auf exakt 0 geprüft (`:521-523`).
+
+```
+Header      … unverändert (magic, version=3, flags, 8×i32, section_count, reserved0)
+Sections    … unverändert v2-Kodierung
+[Trailer]   … nur wenn flags & COLUMN_FLAG_HAS_TRAILER
+CRC32       … über alles davor, unverändert
+```
+
+Trailer-Layout (little endian, wie der Rest):
+
+```
+u16 trailer_version            (1)
+u16 trailer_reserved           (muss 0 sein)
+u16 type_key_count             Palette zuerst, damit ein Durchlauf reicht
+  je Eintrag: u16 len + UTF-8 bytes   (NamespacedKey als Name, nicht als ID)
+u32 block_entity_count
+  je Eintrag:
+    i32  cy                    (Sektion)
+    u16  local                 (gepackter lokaler Index, wie pack_local)
+    u16  type_key_index        (Index in die Palette oben)
+    u32  payload_len
+    u8[] payload
+u32 entity_count
+  je Eintrag:
+    u16  type_key_index
+    u32  payload_len
+    u8[] payload
+```
+
+Begründungen, die beim Umsetzen nicht wegdiskutiert werden sollten:
+
+- **Namen statt numerischer IDs** für `type_key`, aus demselben Grund, aus dem
+  v2 Blocknamen speichert: selbstbeschreibend, ein unbekannter Typ degradiert
+  sauber (Block-Entity wird verworfen und aus der Blocktabelle neu erzeugt,
+  Entity wird verworfen) statt still auf einen fremden Typ zu zeigen.
+- **Eine Palette pro Column**, nicht pro Eintrag: es gibt wenige Typen und viele
+  Einträge. Das ist die *umgekehrte* Entscheidung zur Blockpalette, wo eine
+  Column-Palette gemessen 18 % schlechter war — dort kostete das breitere
+  `bits_per_entry`, hier gibt es kein bitpacking.
+- **Flag statt neuer Pflichtsektion**: eine Column ohne Block-Entities und ohne
+  Entities schreibt weiterhin exakt die v2-Bytes plus einer Version. Terrain,
+  also die große Mehrheit aller Columns, wird nicht größer.
+
+#### Arbeitsschritte
+
+1. `COLUMN_PAYLOAD_FORMAT_VERSION` 2 → 3 in `storage/format.rs:13`.
+   `COLUMN_FLAGS_HAS_TRAILER: u16 = 0x0001` daneben. Die Flag-Prüfung in
+   `decode_column` (`:521`) von "muss 0 sein" auf "unbekannte Bits müssen 0
+   sein" ändern — sonst ist der nächste Erweiterungsschritt wieder ein
+   Versionsbump.
+2. v1- und v2-Zweig in `decode_column` unangetastet lassen. Der Decoder trägt
+   die Fallunterscheidung schon (`:512-517`); es kommt ein dritter Wert dazu,
+   kein Umbau.
+3. `BlockEntity`-Trait (`world/block_entity_types.rs:16`) um
+   `fn save(&self) -> Vec<u8>` und einen `load`-Pfad erweitern. `BlockEntityType`
+   (`:11`) bekommt neben `create` ein
+   `load: fn(pos: IVec3, &[u8]) -> Option<Box<dyn BlockEntity>>`. Serde ist
+   bereits Abhängigkeit, und das Regionformat komprimiert ohnehin mit zlib —
+   ein kompaktes Serde-Format reicht, es braucht kein eigenes Binärlayout pro
+   Typ.
+4. **`ColumnSaveSnapshot` erweitern — und hier liegt die Performance-Falle.**
+   Der Snapshot wird auf dem Frame-Thread gebaut
+   (`build_column_save_snapshot`, `render/state.rs:6695`) und nutzt bewusst nur
+   billige Operationen: `Arc::clone` für `block_data`, ein Clone der paletted
+   Blocks. `Box<dyn BlockEntity>` lässt sich nicht billig klonen, also **nicht**
+   im Frame serialisieren. Zwei gangbare Wege:
+   - jede Block-Entity hält ihre zuletzt serialisierte Form als
+     `Option<Arc<[u8]>>` und invalidiert sie beim Mutieren; der Snapshot nimmt
+     den `Arc` — das ist die gleiche Bauform wie `block_data` heute, und
+     Block-Entities ändern sich selten relativ zur Speicherfrequenz;
+   - oder der Save-Worker bekommt eine eigene, per-Column gesperrte Kopie.
+     Teurer und führt Sperren auf einem Pfad ein, der heute keine hat.
+   Der erste Weg ist der, der zum bestehenden Code passt.
+5. `apply_column` (`chunk_codec.rs:736`) muss den Trailer wieder in
+   `BlockEntitiesStore` (`world/block_entities_storage.rs:51`) einspielen —
+   **nach** dem Setzen der Blöcke, sonst erzeugt die Blocktabelle die
+   Block-Entity erneut und überschreibt den geladenen Zustand.
+6. Entities gehören pro *Column*, nicht pro Sektion: sie bewegen sich über
+   Sektionsgrenzen, und der Save-/Load-Pfad arbeitet ohnehin spaltenweise.
+   Beim Unload einer Spalte müssen sie **vor** dem Verwerfen eingesammelt
+   werden — `on_columns_exited` im künftigen `EntitiesSystem` ist der Haken
+   dafür, aber die Reihenfolge gegenüber dem Save muss explizit festgelegt
+   werden, sonst speichert man eine bereits geleerte Spalte.
+
+#### Tests, die es dafür geben muss
+
+- Round-Trip: Column mit Block-Entities und Entities encoden → decoden →
+  gleiche Werte. `chunk_codec.rs` hat bereits eine Round-Trip-Testfamilie, in
+  die das gehört.
+- **v2-Blob bleibt lesbar** und ergibt eine Column ohne Trailer. Der
+  v1-Fixture-Encoder `encode_blob_v1` (`chunk_codec.rs:1474`) ist die Bauform,
+  die es dafür in v2 auch braucht.
+- Unbekannter `type_key` degradiert, statt zu scheitern.
+- CRC32 deckt den Trailer mit ab (Byte-Flip im Trailer muss auffallen);
+  `decode_column_rejects_header_signature_drift` (`chunk_codec.rs:1621`) ist die
+  Vorlage, und seine Fall-Tabelle muss um das Flag-Feld erweitert werden, sobald
+  "flags != 0" nicht mehr pauschal abgelehnt wird.
 
 ### Audio
 
