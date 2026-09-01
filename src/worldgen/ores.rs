@@ -30,6 +30,11 @@ impl OreReplaceRule {
 pub(crate) enum HeightAnchor {
     Absolute(i32),
     AboveBottom(i32),
+    /// Vocabulary for ore tables that should follow a taller world's ceiling.
+    /// No current table anchors to the world top - the per-preset caps are
+    /// terrain-envelope values, which are absolute - so this is only
+    /// constructed by tests today.
+    #[allow(dead_code)]
     BelowTop(i32),
 }
 
@@ -45,6 +50,9 @@ impl HeightAnchor {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OreHeightDistribution {
+    /// Vocabulary for a flat band; every current ore uses `Triangle`, so this
+    /// is only constructed by tests today.
+    #[allow(dead_code)]
     Uniform {
         min: HeightAnchor,
         max: HeightAnchor,
@@ -96,43 +104,70 @@ impl OreFeatureProfile {
     }
 }
 
-const DEFAULT_ORE_TABLE: [OreFeatureConfig; 3] = [
+// Per-preset ore tables.
+//
+// The three ore families share their shape (replace rule, vein size, exposure
+// policy, salt) and differ only in the numbers a preset's terrain actually
+// changes, so the rows below are built by these constructors instead of being
+// copied four times.
+//
+// Why the tables are split at all: an ore's height band only produces ore where
+// it intersects *rock*. A band anchored above a preset's terrain envelope wastes
+// its samples in air. Measured with one shared table over 25 columns per preset
+// (seed 132211): coal came out 1777 (`Rd161348Like`) to 3428 (`Hilly`), a 1.93x
+// spread nobody asked for, because coal's band ran to y=207 while the flatter
+// presets' surface tops out near y=95. Iron and gold, whose bands sit fully
+// inside rock everywhere, stayed within 1.25x. So the per-preset numbers are the
+// *top of the band* (the preset's terrain envelope) and the attempt count that
+// re-normalises the resulting density.
+//
+// Guarded by `ore_density_stays_within_tolerance_across_presets`.
+
+const fn coal_ore(peak_y: i32, max_y: i32, attempts_per_chunk: u32) -> OreFeatureConfig {
     OreFeatureConfig {
         name: "coal_ore_upper",
         ore_block: BlockId::CoalOre,
         replace_rule: OreReplaceRule::AnyOf(&REPLACE_STONE),
         vein_size: 12,
-        attempts_per_chunk: 18,
+        attempts_per_chunk,
         chance_per_attempt_256: 192,
         height_distribution: OreHeightDistribution::Triangle {
             min: HeightAnchor::AboveBottom(0),
-            peak: HeightAnchor::Absolute(96),
-            max: HeightAnchor::BelowTop(48),
+            peak: HeightAnchor::Absolute(peak_y),
+            max: HeightAnchor::Absolute(max_y),
         },
         exposed_policy: ExposedOrePolicy::Allow,
         salt: 0x24C8_52FA_03D9_6A11,
-    },
+    }
+}
+
+const fn iron_ore(peak_y: i32, max_y: i32, attempts_per_chunk: u32) -> OreFeatureConfig {
     OreFeatureConfig {
         name: "iron_ore_main",
         ore_block: BlockId::IronOre,
         replace_rule: OreReplaceRule::AnyOf(&REPLACE_STONE),
         vein_size: 9,
-        attempts_per_chunk: 14,
+        attempts_per_chunk,
         chance_per_attempt_256: 160,
         height_distribution: OreHeightDistribution::Triangle {
             min: HeightAnchor::AboveBottom(0),
-            peak: HeightAnchor::Absolute(40),
-            max: HeightAnchor::Absolute(136),
+            peak: HeightAnchor::Absolute(peak_y),
+            max: HeightAnchor::Absolute(max_y),
         },
         exposed_policy: ExposedOrePolicy::Allow,
         salt: 0x79E4_6AD1_5D36_BC23,
-    },
+    }
+}
+
+/// Gold's band (0..64) sits below every preset's terrain, so it needs no
+/// envelope-dependent cap - only the attempt count is a per-preset knob.
+const fn gold_ore(attempts_per_chunk: u32) -> OreFeatureConfig {
     OreFeatureConfig {
         name: "gold_ore_lower",
         ore_block: BlockId::GoldOre,
         replace_rule: OreReplaceRule::AnyOf(&REPLACE_STONE),
         vein_size: 8,
-        attempts_per_chunk: 6,
+        attempts_per_chunk,
         chance_per_attempt_256: 104,
         height_distribution: OreHeightDistribution::Triangle {
             min: HeightAnchor::AboveBottom(0),
@@ -141,13 +176,51 @@ const DEFAULT_ORE_TABLE: [OreFeatureConfig; 3] = [
         },
         exposed_policy: ExposedOrePolicy::Allow,
         salt: 0xA6F2_3D11_97CC_4E7B,
-    },
+    }
+}
+
+/// `base_height` 78, `height_amp` 14 - measured surface envelope 69..95.
+const FLATISH_ORE_TABLE: [OreFeatureConfig; 3] = [
+    coal_ore(53, 95, 8),
+    iron_ore(40, 95, 12),
+    gold_ore(6),
 ];
 
-pub(crate) fn ore_profile_for_preset(_preset: WorldgenPreset) -> OreFeatureProfile {
-    OreFeatureProfile {
-        entries: &DEFAULT_ORE_TABLE,
-    }
+/// `base_height` 84, `height_amp` 20 - measured surface envelope 73..104.
+const CLASSIC_FLATTER_ORE_TABLE: [OreFeatureConfig; 3] = [
+    coal_ore(59, 104, 8),
+    iron_ore(40, 104, 12),
+    gold_ore(6),
+];
+
+/// `base_height` 86, `height_amp` 26, active cliffs - measured envelope 67..107.
+/// The cliff presets lose more of the deep band to carvers, so gold gets one
+/// extra attempt (6 -> 7) to land next to the flat presets' yield.
+const RD161348_LIKE_ORE_TABLE: [OreFeatureConfig; 3] = [
+    coal_ore(61, 107, 8),
+    iron_ore(40, 107, 12),
+    gold_ore(7),
+];
+
+/// `base_height` 90, `height_amp` 34, strongest cliffs - measured envelope
+/// 76..125, the tallest rock column of the four. Same gold correction as
+/// `RD161348_LIKE_ORE_TABLE`; coal and iron need no attempt change once their
+/// band tracks the envelope, because the taller column and the wider band grow
+/// together.
+const HILLY_ORE_TABLE: [OreFeatureConfig; 3] = [
+    coal_ore(65, 125, 8),
+    iron_ore(40, 125, 12),
+    gold_ore(7),
+];
+
+pub(crate) fn ore_profile_for_preset(preset: WorldgenPreset) -> OreFeatureProfile {
+    let entries: &'static [OreFeatureConfig] = match preset {
+        WorldgenPreset::Flatish => &FLATISH_ORE_TABLE,
+        WorldgenPreset::ClassicFlatter => &CLASSIC_FLATTER_ORE_TABLE,
+        WorldgenPreset::Rd161348Like => &RD161348_LIKE_ORE_TABLE,
+        WorldgenPreset::Hilly => &HILLY_ORE_TABLE,
+    };
+    OreFeatureProfile { entries }
 }
 
 pub(crate) fn apply_ores_to_column(
@@ -473,6 +546,7 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::chunkgen_worker::generate_streaming_column_for_test;
 
     fn stone_column() -> ColumnBuffer {
         let mut column = ColumnBuffer::new();
@@ -521,6 +595,109 @@ mod tests {
         }
     }
 
+    const ALL_PRESETS: [WorldgenPreset; 4] = [
+        WorldgenPreset::Flatish,
+        WorldgenPreset::ClassicFlatter,
+        WorldgenPreset::Rd161348Like,
+        WorldgenPreset::Hilly,
+    ];
+
+    #[test]
+    fn every_preset_gets_its_own_ore_table() {
+        for (idx, preset) in ALL_PRESETS.iter().enumerate() {
+            for other in &ALL_PRESETS[idx + 1..] {
+                let a = ore_profile_for_preset(*preset);
+                let b = ore_profile_for_preset(*other);
+                assert!(
+                    !std::ptr::eq(a.entries, b.entries),
+                    "{preset:?} and {other:?} still share one ore table"
+                );
+                assert_ne!(
+                    a.entries.iter().map(|e| e.height_distribution).collect::<Vec<_>>(),
+                    b.entries.iter().map(|e| e.height_distribution).collect::<Vec<_>>(),
+                    "{preset:?} and {other:?} have identical ore height bands"
+                );
+            }
+        }
+    }
+
+    /// Counts ore blocks in a fully generated square of columns, i.e. after
+    /// terrain, carvers and the ore pass - the ore pass alone cannot show this,
+    /// because the effect being guarded is a height band intersecting *rock*.
+    fn ore_counts_for_preset(
+        seed: u64,
+        preset: WorldgenPreset,
+        ring_lo: i32,
+        ring_hi: i32,
+    ) -> [u32; 3] {
+        let cfg = WorldConfig {
+            seed,
+            ..WorldConfig::default()
+        };
+        let mut counts = [0_u32; 3];
+        for cz in ring_lo..=ring_hi {
+            for cx in ring_lo..=ring_hi {
+                let column = generate_streaming_column_for_test(cfg, preset, cx, cz);
+                for y in 0..ColumnBuffer::HEIGHT {
+                    for z in 0..CHUNK_SIZE {
+                        for x in 0..CHUNK_SIZE {
+                            match column.get_block(x, y, z) {
+                                BlockId::CoalOre => counts[0] += 1,
+                                BlockId::IronOre => counts[1] += 1,
+                                BlockId::GoldOre => counts[2] += 1,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        counts
+    }
+
+    /// A preset must not change how much ore a world holds, only where it sits.
+    ///
+    /// This is the regression guard for the shared ore table that
+    /// `ore_profile_for_preset` used to return for every preset: coal's band ran
+    /// to y=207 while `Flatish` tops out near y=95, so most coal attempts landed
+    /// in air and the four presets came out 1.93x apart on coal (1777 vs 3428
+    /// over 25 columns, seed 132211). With the per-preset bands the measured
+    /// spread is 1.17-1.23x for coal, 1.18-1.30x for iron and 1.24-1.41x for
+    /// gold across the two seeds below, so 1.6x is headroom that still fails on
+    /// a return to one shared table.
+    #[test]
+    fn ore_density_stays_within_tolerance_across_presets() {
+        const MAX_SPREAD: f32 = 1.6;
+        const ORE_NAMES: [&str; 3] = ["coal", "iron", "gold"];
+        // 4x4 columns per preset; large enough that the per-column noise does
+        // not dominate, small enough to keep the whole test around 2.5 s.
+        const RING_LO: i32 = -2;
+        const RING_HI: i32 = 1;
+
+        for seed in [132_211_u64, 0x5EED_0001] {
+            let per_preset: Vec<[u32; 3]> = ALL_PRESETS
+                .iter()
+                .map(|preset| ore_counts_for_preset(seed, *preset, RING_LO, RING_HI))
+                .collect();
+
+            for (ore_idx, ore_name) in ORE_NAMES.iter().enumerate() {
+                let counts: Vec<u32> = per_preset.iter().map(|c| c[ore_idx]).collect();
+                let min = *counts.iter().min().expect("preset list is not empty");
+                let max = *counts.iter().max().expect("preset list is not empty");
+                assert!(
+                    min > 0,
+                    "seed {seed:x}: a preset generated no {ore_name} at all: {counts:?} for {ALL_PRESETS:?}"
+                );
+                let spread = max as f32 / min as f32;
+                assert!(
+                    spread <= MAX_SPREAD,
+                    "seed {seed:x}: {ore_name} density is preset-dependent: spread {spread:.2}x \
+                     (counts {counts:?} for {ALL_PRESETS:?}), tolerance {MAX_SPREAD}x"
+                );
+            }
+        }
+    }
+
     #[test]
     fn segmented_vein_can_reach_into_neighbor_chunk_space() {
         let world_cfg = WorldConfig::default();
@@ -552,3 +729,4 @@ mod tests {
         );
     }
 }
+

@@ -24,7 +24,6 @@ When an item ships, delete it from here instead of marking it done.
 ## Worldgen
 
 ### High priority
-- split ore profiles by preset instead of one shared default table (`ore_profile_for_preset` currently ignores its preset argument)
 - add neighbor-aware exposed-air checks so `HiddenOnly` ores are trustworthy at chunk borders
 - expand worldgen regression tests with seam, density, and height-distribution sampling
 - continue consolidating legacy/older worldgen entry points against the active worker pipeline
@@ -44,7 +43,6 @@ When an item ships, delete it from here instead of marking it done.
 - improve water pond/lake generation, which currently reads as bare sand+water clumps rather than believable small ponds: the logic actually lives outside `worldgen/carvers/` in `src/render/chunkgen_worker.rs` (`LakeCandidate` at `chunkgen_worker.rs:192`, `make_water_lake_candidate` at `:342`, boundary sealing `apply_water_lake_boundary_seal_to_chunk` at `:639`, carve/fill `apply_lake_carve_and_fill_to_chunk` at `:707`, size bounds `WATER_LAKE_R_MIN/MAX` at `:29-35`); consider moving this into a proper `worldgen/carvers/ponds.rs` module alongside `ravine.rs`/`caves.rs`, and improving the shape (organic/noise-perturbed basin outline instead of a filled sphere/blob) plus a proper sand-shore rim (graded sand band around the water edge instead of sand and water occupying the same footprint)
 
 ### Test/acceptance ideas
-- sample several fixed seeds, assert per-ore counts stay within defined tolerances
 - keep deterministic tests for same-seed/same-column equality
 - add a visual/manual checklist for chunk-border seams
 - measure that startup/chunkgen stay within acceptable warmup budgets after ore tuning

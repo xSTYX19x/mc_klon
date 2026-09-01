@@ -25,11 +25,22 @@ Current guarantees:
 - deterministic generation for a world seed and preset
 - seam-stable cross-border veins by sampling neighboring source chunks
 
-Current initial ore table:
+Current initial ore table (coal, iron, gold), split per preset:
+`FLATISH_ORE_TABLE`, `CLASSIC_FLATTER_ORE_TABLE`, `RD161348_LIKE_ORE_TABLE`,
+`HILLY_ORE_TABLE` in `worldgen/ores.rs`.
 
-- coal
-- iron
-- gold
+A preset changes *where* ore sits, not *how much* of it a world holds. An ore's
+height band only yields ore where it intersects rock, so a band anchored above a
+preset's terrain envelope wastes its samples in air: with the previous single
+shared table, coal came out **1.93x** apart across the four presets (1777 for
+`Rd161348Like` vs 3428 for `Hilly`, 25 columns, seed 132211) while iron and gold,
+whose bands sit fully inside rock everywhere, stayed within 1.25x.
+
+Each table therefore carries its preset's terrain envelope as the band cap plus
+the attempt count that re-normalises the density. Measured spread afterwards:
+coal 1.17-1.23x, iron 1.18-1.30x, gold 1.24-1.41x over two seeds. Guarded by
+`worldgen::ores::tests::ore_density_stays_within_tolerance_across_presets`
+(tolerance 1.6x) and `..::every_preset_gets_its_own_ore_table`.
 
 ## Priorities
 
