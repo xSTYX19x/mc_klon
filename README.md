@@ -1,112 +1,160 @@
 # mc_klon
 
-Rust/WGPU Minecraft-like voxel engine with a Classic/Pre-Classic feature order and a modern implementation strategy.
+A voxel sandbox engine written in Rust on top of `wgpu` and `winit`.
 
-## Direction
+Gameplay features are added roughly in the order early block-building games
+introduced them, starting with the Classic era. The engine underneath (rendering,
+chunk streaming, world generation, storage and settings) is built against modern,
+measured contracts so later content does not force a rewrite.
 
-The project does not treat early-era features as permission for throwaway code.
-Gameplay and content are still introduced in a roughly historical order, but rendering, UI, worldgen, storage, and settings are built toward modern contracts so they can scale without a later rewrite.
+> **Status:** hobby project, work in progress. Expect breaking changes to the
+> save format and settings between commits.
 
-## Current State
+> **Disclaimer:** this is an independent project. It is not affiliated with,
+> endorsed by or connected to Mojang Studios or Microsoft. "Minecraft" is a
+> trademark of Mojang Synergies AB. No game assets are included in this
+> repository.
 
-- Rendering with `wgpu`, layered world passes, fog, overlays, sky cycle, and debug views
-- Deterministic terrain shading contract with explicit render/collision/raycast/occlusion shapes
-- Startup loading screen that prepares the first playable area before entering gameplay
-- Persistent settings in `save/settings.json` with gameplay, graphics, and control bindings
-- Main menu, pause menu, and options screens using textured Minecraft-style widget buttons
-- 3D cached hotbar/inventory block previews for cubes, slabs, and cross-plants
-- Smaller plant selection boxes for flowers, mushrooms, saplings, and similar decorative cross-plants
-- Chunk streaming through worker pipelines for chunkgen, meshing, lighting, and save/load
-- Worldgen with presets, terrain, carvers, lakes/springs, foliage, and a dedicated ore feature pass
-- Save/load with `save/world.meta`, `save/manifest.json`, `save/ticking_areas.bin`, `save/region/*.mca`
-- Simulation with fixed tick rate (20 TPS), random ticks, fluids, and separate simulation distance
+## Features
 
-## Build / Run
+- **Rendering:** `wgpu` with opaque/cutout/transparent layers, fog, sky and day
+  cycle, precipitation, baked ambient occlusion, far LOD and a set of debug views
+- **Chunk pipeline:** worker pools for generation, meshing, lighting and save/load
+  with per-frame budgets; greedy meshing plus dedicated plant and liquid meshers
+- **World generation:** seeded presets, density/surface rules, caves and ravines,
+  lakes and springs, foliage and a separate ore pass
+- **Simulation:** fixed 20 TPS tick, random ticks, water/lava flow and mixing,
+  ticking areas and a separate simulation distance
+- **Storage:** region files (`.mca`) with a palette-based column format, a content
+  manifest and a v1 to v2 save migration
+- **UI:** main/pause/options menus, world list with rename and delete, inventory
+  and hotbar with 3D block previews, chat commands, GUI scale, FOV slider,
+  third-person camera and screenshots
+- **Resource packs:** folder or `.zip` packs in the Java Edition layout, selected
+  in the options menu
+- **Profiling:** opt-in trace output, stall reports and per-stage budget reports
 
-- `cargo run`
-- `cargo run -- --migrate-save-v1-to-v2`
-- `cargo test`
-- `cargo fmt`
-- `cargo clippy`
+## Getting started
 
-## Important Controls
+### Requirements
 
-- `WASD`: move
-- Mouse: look
-- first mouse click in the window: enable mouse capture
-- `LMB` / `RMB`: break / place block
-- `Mouse Wheel`: hotbar selection
-- `1`-`9`: select hotbar slot directly (fixed, not rebindable)
-- `B`: inventory
-- `T`: chat
-- `Space`: jump / move upward (depending on mode)
-- `Shift`: descend (while flying) / context-dependent movement
-- `Ctrl`: hold sprint (in addition to double-tap `W`)
-- Double `Space`: walking <-> flight
-- `ESC`: pause / close menus
-- `N`: generate a new world
-- `Enter`: save world
-- `K`: ticking-area editor (radius / flags)
-- `F2`: screenshot -> `screenshots/<YYYY-MM-DD_HH-MM-SS>.png`
-- `F5`: cycle camera perspective (first person / third person back / front)
-- `F`: cycle render distance
-- `G`: cycle simulation distance
-- `F3`: debug overlay
-- `F4`: depth-test debug toggle
-- `F6`: far LOD on/off
-- `F7`: ambient occlusion debug toggle
-- `F8`: cycle lighting debug view
-- `F9`: fluid debug line under the crosshair
-- `F10`: perf summary toggle
-- `F11`: precipitation toggle
-- `F12`: boundary-ocean ring on/off (to attribute distant rendering artifacts)
+- A recent stable Rust toolchain (edition 2024)
+- A GPU and driver supported by `wgpu` (Vulkan, Metal or DirectX 12)
 
-The `F3` overlay also reports draw calls, preview-cache growth, and the occlusion shape, face coverage and baked AO of the block under the crosshair.
-- `Ctrl+T`: create a ticking area at the current chunk position
-- `Ctrl+Shift+T`: remove the nearest ticking area
+### Textures
 
-Rebindable actions (movement, jump, sneak, sprint, inventory, chat, ticking areas,
-screenshot, camera perspective, pause) can be changed under Options -> Controls.
+The repository ships **no textures**. The engine loads them from
+`assets/minecraft/textures/...` (Java Edition resource pack layout) and will not
+start without them. See [assets/README.md](assets/README.md) for where to put a
+pack and which files are needed.
 
-Note: hotbar selection through number keys `1..9` is still not wired.
+### Build and run
 
-## Runtime Defaults
+```sh
+cargo run --release
+```
 
-- Player start mode: `Flight` (toggle via double-space)
-- Double-tap windows: `Space=0.24s`, `W=0.30s`
-- Default worldgen preset: `Rd161348Like`
-- Random tick speed: `3` samples per active chunk and sim tick
-- Settings file: `save/settings.json`
+On first launch the game creates `save/`, `logs/`, `screenshots/` and
+`resourcepacks/` in the working directory.
 
-## Resource Packs
+Migrate an old v1 save in `save/` to the current format:
 
-- `resourcepacks/` is created next to `save/`, `logs/` and `screenshots/` on first launch
-- Drop a pack in as a folder or a `.zip`, then pick it under Options -> Video / Graphics
-- Both layouts are detected: `textures/...` and `assets/minecraft/textures/...` (folder or archive root)
-- A pack is an overlay: anything it does not ship falls back to the bundled `assets/minecraft`
-- `.mcmeta` animation sidecars are read from the same pack as their texture
-- Textures are uploaded into GPU arrays at startup, so switching packs takes effect after a restart
+```sh
+cargo run --release -- --migrate-save-v1-to-v2
+```
 
-## Save System
+### Development
 
-- Metadata: `save/world.meta`
-- Content manifest: `save/manifest.json`
-- Ticking areas: `save/ticking_areas.bin`
-- Chunk columns: `save/region/r.<rx>.<rz>.mca`
-- Persists world seed, preset, height parameters, sea level, block data, and registry context
-- Client settings are stored separately in `save/settings.json`
-- Runtime lighting is rebuilt after load
+```sh
+cargo check
+cargo test
+cargo test world::raycast::            # tests of one module
+cargo clippy --all-targets
+cargo fmt
+```
 
-Note: legacy `save/world.bin` still exists in code as an older path, but it is not the active runtime storage path.
+`cargo clippy --all-targets -- -D warnings` is the target lint level; there are
+still open warnings, tracked in [docs/TODO.md](docs/TODO.md).
 
-## Relevant Documentation
+#### Profiling
 
-- `docs/00_idee_und_ziel.md`: target vision and principles
-- `docs/01_status_und_aktueller_stand.md`: current technical status and open work
-- `docs/05_gameplay_feature_backlog_1_21_11_alignment.md`: prioritized backlog grouped by subsystem
-- `docs/06_runtime_contracts_and_pipelines.md`: current shading, loading, settings, and ore-generation contracts
-- `docs/todos_worldgen.md`: worldgen-specific next steps
-- `docs/performance_optimizations.md`: implemented and open performance work
-- `docs/save_region_format_v1.md`: storage format notes
-- `docs/03_java_bedrock_takeaways.md`: architecture north star
-- `docs/04_content_foundation.md`: content/data foundation
+| Variable | Values | Effect |
+|---|---|---|
+| `MC_KLON_TRACE` | `off`, `ring` (default), `full` | `ring` keeps an in-memory buffer for stall reports, `full` also writes a JSON trace to `logs/` |
+| `MC_KLON_TRACE_RING_MB` | number | Memory budget of the in-memory ring buffer (default 16) |
+
+The Cargo feature `perf_trace` makes `full` the default for a build.
+
+## Controls
+
+| Input | Action |
+|---|---|
+| `W` `A` `S` `D`, mouse | Move, look (click into the window to capture the mouse) |
+| `Space` / `Shift` | Jump or fly up / sneak or fly down |
+| Double `Space` | Toggle walking and flying |
+| `Ctrl` or double `W` | Sprint |
+| `LMB` / `RMB` / `MMB` | Break / place / pick block |
+| Mouse wheel, `1`-`9` | Select hotbar slot |
+| `B` | Inventory |
+| `T` | Chat and commands |
+| `K` | Ticking-area editor |
+| `F2` | Screenshot |
+| `F5` | Cycle camera perspective |
+| `F3` | Debug overlay |
+| `Esc` | Pause menu / close current screen |
+
+Most actions can be rebound under *Options > Controls*. The complete list,
+including render and debug toggles, is in
+[docs/reference/keybinds.md](docs/reference/keybinds.md); chat commands are in
+[docs/reference/commands.md](docs/reference/commands.md).
+
+## Save data
+
+| Path | Contents |
+|---|---|
+| `save/settings.json` | Client settings and key bindings |
+| `save/world.meta` | Seed, preset, height parameters, sea level |
+| `save/manifest.json` | Block registry context with stable IDs |
+| `save/ticking_areas.bin` | Ticking areas |
+| `save/region/r.<x>.<z>.mca` | Chunk columns |
+
+Lighting is rebuilt after loading. The format is described in
+[docs/architecture/save-format.md](docs/architecture/save-format.md).
+
+New worlds start in flight mode with the `ClassicFlatter` worldgen preset.
+
+## Project layout
+
+| Path | Contents |
+|---|---|
+| `src/app/` | Startup, event loop, menus |
+| `src/render/` | GPU state, shaders, chunkgen/mesh/lighting workers, frame budgets |
+| `src/meshing/` | Greedy, plant and liquid meshing, mesh pools |
+| `src/world/` | Chunks, block access, fluids, raycast, time, ticking areas |
+| `src/worldgen/` | Terrain, density, carvers, ores, noise |
+| `src/storage/` | Region files, column codec, world metadata, migration |
+| `src/blocks/`, `src/registry/` | Block definitions and IDs |
+| `src/player/`, `src/camera.rs`, `src/input.rs` | Player movement, camera, input mapping |
+| `src/sim/`, `src/commands/`, `src/config/` | Simulation tick, chat commands, configuration |
+| `src/assets.rs`, `src/texture*.rs` | Resource pack lookup and texture loading |
+| `src/perf/` | Tracing, stage budgets, allocation tracking |
+| `docs/` | Design notes, formats, planning ([index](docs/README.md)) |
+
+## Documentation
+
+Start with [docs/README.md](docs/README.md). Most documents are in English;
+the open-work list ([docs/TODO.md](docs/TODO.md)), the performance audit and the
+a1.0.17_04 feature reference are written in German.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this project, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
