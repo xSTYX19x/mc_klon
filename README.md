@@ -1,5 +1,11 @@
 # mc_klon
 
+> [!WARNING]
+> **AI notice:** This project is developed with the help of AI (Claude by
+> Anthropic). Planning, code and documentation are wholly or partly
+> AI-generated. They are reviewed and play-tested by the maintainer, but
+> mistakes are possible. Use at your own risk.
+
 A voxel sandbox engine written in Rust on top of `wgpu` and `winit`.
 
 Gameplay features are added roughly in the order early block-building games
