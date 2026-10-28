@@ -2,6 +2,11 @@
 name = "mc_klon"
 version = "0.0.1"
 edition = "2024"
+description = "Voxel sandbox engine in Rust with wgpu, chunk streaming and a region-file save format"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/xSTYX19x/mc_klon"
+readme = "README.md"
+publish = false
 
 [features]
 default = []
