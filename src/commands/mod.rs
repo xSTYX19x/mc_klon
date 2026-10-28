@@ -216,7 +216,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn commands_doc_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/commands-index-markdown.md")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/reference/commands.md")
     }
 
     #[test]

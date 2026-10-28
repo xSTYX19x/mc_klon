@@ -63,9 +63,9 @@ It is about extending those contracts without breaking them:
 
 Details are in:
 
-- `docs/01_status_und_aktueller_stand.md`
-- `docs/05_gameplay_feature_backlog_1_21_11_alignment.md`
-- `docs/06_runtime_contracts_and_pipelines.md`
-- `docs/performance_optimizations.md`
-- `docs/todos_worldgen.md`
+- `docs/status.md`
+- `docs/planning/gameplay-backlog.md`
+- `docs/architecture/runtime-contracts.md`
+- `docs/performance/optimizations.md`
+- `docs/planning/worldgen.md`
 - `docs/TODO.md`

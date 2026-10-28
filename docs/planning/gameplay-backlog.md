@@ -40,8 +40,8 @@ The following items were previously listed as upcoming and are now part of the i
 After any feature in this file moves from backlog to implementation, update at least:
 
 - `README.md`
-- `docs/01_status_und_aktueller_stand.md`
-- `docs/06_runtime_contracts_and_pipelines.md`
+- `docs/status.md`
+- `docs/architecture/runtime-contracts.md`
 - `docs/TODO.md` (remove the item)
-- `docs/todos_worldgen.md` if worldgen is involved
-- `docs/keybinds-index-markdown.md` if inputs/UI changed
+- `docs/planning/worldgen.md` if worldgen is involved
+- `docs/reference/keybinds.md` if inputs/UI changed

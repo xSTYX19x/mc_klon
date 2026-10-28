@@ -3,10 +3,10 @@
 Status: 2026-09-28 (Audit gegen Code-Stand `81757f3`)
 
 Single source of truth for open/not-yet-done work. Previously this list was
-duplicated across `01_status_und_aktueller_stand.md`,
-`02_expanded_roadmap_to_c0.0.13a_03.md`, `03_java_bedrock_takeaways.md`,
-`04_content_foundation.md`, `05_gameplay_feature_backlog_1_21_11_alignment.md`,
-`performance_optimizations.md`, and `todos_worldgen.md`. Those files now point
+duplicated across `docs/status.md`,
+`docs/planning/roadmap-c0.0.13a_03.md`, `docs/architecture/java-bedrock-takeaways.md`,
+`docs/architecture/content-foundation.md`, `docs/planning/gameplay-backlog.md`,
+`docs/performance/optimizations.md`, and `docs/planning/worldgen.md`. Those files now point
 here for open work; keep their "Already Implemented" / status sections
 separate from this file.
 
@@ -556,7 +556,7 @@ nächsten billiger macht:
 
 ## Content-Abgleich gegen Alpha v1.0.17_04
 
-Quelle: `docs/a1.0.17_04.md`. Aufgenommen sind nur Punkte, die im Code **fehlen**
+Quelle: `docs/planning/feature-reference-a1.0.17_04.md`. Aufgenommen sind nur Punkte, die im Code **fehlen**
 oder gegenüber dem heutigen Stand **erweitert** werden müssen; alles bereits
 Implementierte (Chunk-/Region-Storage, Terrain+Carver+Erz-Pässe, Bäume, Blumen,
 Pilze, Winterwelten, Wasser/Lava-Fluid-Sim, Tag/Nacht, Third-Person-Modell,
@@ -709,7 +709,7 @@ also je Block mitwachsen.
   heute `[OreFeatureConfig; 3]`). Achtung: der Test
   `ore_density_stays_within_tolerance_across_presets` (Toleranz 1.6x) gilt auch
   für neue Erze, die Höhenbänder müssen also pro Preset an der Terrain-Hülle
-  ausgerichtet werden — genau wie bei Kohle beschrieben in `todos_worldgen.md`.
+  ausgerichtet werden — genau wie bei Kohle beschrieben in `docs/planning/worldgen.md`.
 - Tonblock (Clay), Schneeblock (der heutige `BlockId::Snow` ist die 2px-**Decke**,
   nicht der Vollblock), Werkbank, Ofen (an/aus als zwei Texturen-Sätze),
   Notenblock, Jukebox, Kiste.
@@ -1471,7 +1471,7 @@ Aus der Vorlage ausdrücklich **nicht** auf die Liste genommen:
     noch Worker-Plumbing.
   - *Vorbild:* Vanilla `ChunkGenerator` mit `ChunkStatus`-Phasen. Übertragung:
     eine `ColumnPipeline` mit fester Phasenliste in der Reihenfolge von
-    `docs/todos_worldgen.md`.
+    `docs/planning/worldgen.md`.
   - *Vorgehen:* 1) Phasen einzeln nach `worldgen/` verschieben (reine
     Verschiebung; der Determinismus-Test muss bitgleich bleiben), Seen zuerst —
     das deckt `worldgen/carvers/ponds.rs` aus "Low priority" ab. 2) Helfer
@@ -1490,24 +1490,23 @@ Aus der Vorlage ausdrücklich **nicht** auf die Liste genommen:
 - **Preset-Unterschiede und Phasenreihenfolge dokumentieren** (neu formuliert
   2026-09-28; bisher "document preset differences and worldgen phase order
   where contributors will find it quickly")
-  - *Ist:* Die Phasenliste steht in `docs/todos_worldgen.md:65-77` und in
-    `docs/06_runtime_contracts_and_pipelines.md` ("Ore Generation Pipeline"),
+  - *Ist:* Die Phasenliste steht in `docs/planning/worldgen.md:65-77` und in
+    `docs/architecture/runtime-contracts.md` ("Ore Generation Pipeline"),
     ist gegenüber dem Code (`render/chunkgen_worker.rs:1742-1855`) aber
     unvollständig: Surface-Rules laufen *innerhalb* der Terrain-Phase
     (`worldgen/pipeline.rs:203-234`), Phase 5 enthält eine Dirt→Gras-Promotion
     und eine Sand-Bereinigung (`chunkgen_worker.rs:961`, `:1171`), es gibt eine
     Winterphase 8 (`:1849-1853`) und **keine Meeresfüllung** (siehe
     a1.0.17-Abgleich unten). Preset-Parameter stehen nur im Code
-    (`worldgen/terrain.rs:40-124`). `README.md:77` nennt `Rd161348Like` als
-    Default, der Code `ClassicFlatter` (`worldgen/terrain.rs:11`).
+    (`worldgen/terrain.rs:40-124`).
   - *Ziel:* Ein Contributor findet Phasen, Presets und deren Unterschiede an
     einer Stelle.
   - *Vorbild:* — (Doku).
-  - *Vorgehen:* 1) "Worldgen Phase Order" in `docs/todos_worldgen.md` an den
+  - *Vorgehen:* 1) "Worldgen Phase Order" in `docs/planning/worldgen.md` an den
     Code angleichen. 2) Tabelle Preset × (base_height, height_amp, cliff_amp,
     octaves, Erz-Hülle). 3) README korrigieren. 4) Beim Umzug nach `worldgen/`
     die Liste als Doc-Kommentar an die Phasenliste hängen.
-  - *Dateien:* `docs/todos_worldgen.md`, `README.md`, `worldgen/terrain.rs`.
+  - *Dateien:* `docs/planning/worldgen.md`, `README.md`, `worldgen/terrain.rs`.
   - *Abhängigkeiten:* keine.
   - *Priorität/Aufwand/Impact:* **P2**, S, niedrig.
   - *Akzeptanz:* Die Doku nennt alle 8 Phasen und den richtigen Default.
@@ -1586,7 +1585,7 @@ Aus der Vorlage ausdrücklich **nicht** auf die Liste genommen:
 ### Aus dem a1.0.17_04-Abgleich
 
 Alles hier gehört in die dokumentierte Phasenreihenfolge aus
-`docs/todos_worldgen.md` ("Worldgen Phase Order"), nicht an ihr vorbei.
+`docs/planning/worldgen.md` ("Worldgen Phase Order"), nicht an ihr vorbei.
 
 - **Dungeons**: 7x7x7-Raum aus Bruchstein/moosigem Bruchstein mit Spawner und
   2 Truhen. Neue Phase *nach* den Carvern und *vor* Erzen, weil der Raum die
@@ -1783,7 +1782,7 @@ Welttypen" wählbar (Grundregel: das vorhandene Feature gewinnt).
   gewinnt) und nur im Spiel ohne offenes Menü/Inventar. Bewusst nicht als
   `InputAction` umgesetzt, sodass `InputAction::ALL`/`index()`
   (`settings.rs:92-124`) nicht wachsen mussten. Der Caveat in
-  `01_status_und_aktueller_stand.md` ist damit gegenstandslos. Die Warnung
+  `docs/status.md` ist damit gegenstandslos. Die Warnung
   von damals gilt weiter für jede *neue* Aktion (z. B. F1): `InputAction::ALL`
   ist ein Array fester Länge mit handgepflegtem `index()` — beides muss
   mitwachsen, sonst bricht der Settings-Serializer still
@@ -1818,13 +1817,13 @@ Welttypen" wählbar (Grundregel: das vorhandene Feature gewinnt).
   überschreiben kann
 - neue Chat-Kommandos für die Survival-Ära (`/give`, `/kill`, `/summon`) erst
   anlegen, wenn Items bzw. Entities existieren. `COMMAND_DOCS`
-  (`commands/mod.rs:13`) und `docs/commands-index-markdown.md` werden vom Test
+  (`commands/mod.rs:13`) und `docs/reference/commands.md` werden vom Test
   `commands_doc_lists_every_registered_command` gegeneinander geprüft — beide
   müssen im selben Commit wachsen
 
 ## Performance
 
-- **Referenzmessung 2026-08-20: Chunk-Streaming ~50 FPS (vorher 10-20).** Details und Ursachenkette in `docs/07_performance_rendering_audit.md` → "Nachtrag 2026-08-20". Vor weiterem Streaming-Tuning einen frischen `stall.txt` + `gpu.csv` aufnehmen — alle Messwerte unten stammen von *vor* dieser Runde
+- **Referenzmessung 2026-08-20: Chunk-Streaming ~50 FPS (vorher 10-20).** Details und Ursachenkette in `docs/performance/audit-2026-08.md` → "Nachtrag 2026-08-20". Vor weiterem Streaming-Tuning einen frischen `stall.txt` + `gpu.csv` aufnehmen — alle Messwerte unten stammen von *vor* dieser Runde
 
 ### Decouple frame rate from chunk streaming
 
@@ -1951,7 +1950,7 @@ loading screen, where throughput legitimately outranks frame time.
 
 ### Other performance work
 
-- finish the streaming-lag hunt — the open half of the reported symptom. Measured after the fixes in `07_performance_rendering_audit.md`: streaming frames are median **10.6 ms / p90 53.1 ms**, and `state.process_dirty_chunk_meshes` alone is **mean 12.9 ms**, ~60 % of a 21 ms frame. Chunk apply is no longer the cost (104 ms → 0.51 ms per applied chunk). The p90 spikes are what feels laggy, and they never cross the 200 ms stall threshold, so no stall report ever contained them. Open: where the remaining ~9 ms/frame inside `process_dirty_chunk_meshes` goes. The `gpu.csv` breakdown columns answer this from one normal play session — read them before changing anything else here
+- finish the streaming-lag hunt — the open half of the reported symptom. Measured after the fixes in `docs/performance/audit-2026-08.md`: streaming frames are median **10.6 ms / p90 53.1 ms**, and `state.process_dirty_chunk_meshes` alone is **mean 12.9 ms**, ~60 % of a 21 ms frame. Chunk apply is no longer the cost (104 ms → 0.51 ms per applied chunk). The p90 spikes are what feels laggy, and they never cross the 200 ms stall threshold, so no stall report ever contained them. Open: where the remaining ~9 ms/frame inside `process_dirty_chunk_meshes` goes. The `gpu.csv` breakdown columns answer this from one normal play session — read them before changing anything else here
 - document reproducible startup and streaming benchmark scenes as a baseline
 - measure startup warmup and first-playable-frame timing under fixed scenes
 - measure ore-pass, preview-cache, and loading-screen warmup costs before deeper optimization work
@@ -2140,7 +2139,7 @@ loading screen, where throughput legitimately outranks frame time.
   - *Abhängigkeiten:* "Persistente Heightmaps"; ergänzt "Lighting-bedingte
     Remeshes"; Grundlage für Option (b) beim `LightingWorkerPool`.
   - *Priorität/Aufwand/Impact:* **P2**, L, hoch (Lighting ist laut Audit der
-    Engpass beim Streamen, `docs/07_performance_rendering_audit.md`, Anhang C).
+    Engpass beim Streamen, `docs/performance/audit-2026-08.md`, Anhang C).
   - *Akzeptanz:* Voxel-Schritte pro hinzugefügter Sektion sinken um mindestens
     50 %; der `lighting`-Bucket im Stall-Report sinkt; Vergleichstests
     bitgleich; eine entfernte Fackel ist innerhalb eines Frame-Budgets dunkel.
@@ -2283,7 +2282,7 @@ loading screen, where throughput legitimately outranks frame time.
     Release-Build-Zeit.
 - **Rest der Optimierungsrunde abschließen (Pools, SIMD, Allocation-Tracking)**
   (neu 2026-09-28; Verifikation der Runde aus
-  `docs/performance_optimizations.md` und `docs/memory_pool_implementation.md`)
+  `docs/performance/optimizations.md` und `docs/architecture/meshing-memory-pool.md`)
   - *Ist — umgesetzt, nicht erneut anfassen:* Grid statt HashMap im
     Density-Cache (`worldgen/density/cache.rs:8-20`); Frustum-Culling vor dem
     Meshing (Defer um 24 Frames, `render/state.rs:18064-18076`; Zähler
@@ -2395,7 +2394,7 @@ loading screen, where throughput legitimately outranks frame time.
   2026-09-28, damit diese Konzepte nicht erneut geprüft werden)
   - *Palettierte, bitgepackte Sektionen:* im Speicher schon vorhanden
     (`ChunkBlocks::Uniform/Paletted/Flat`, `world/chunk.rs:332-338`; leere
-    Sektionen werden gar nicht gespeichert). `docs/03_java_bedrock_takeaways.md`
+    Sektionen werden gar nicht gespeichert). `docs/architecture/java-bedrock-takeaways.md`
     führt das noch als PARTIAL — veraltet. Rest siehe "Editierte Sektionen
     wieder kompaktieren".
   - *Texture Arrays statt Atlas:* umgesetzt (`TextureViewDimension::D2Array`,
@@ -2427,8 +2426,8 @@ loading screen, where throughput legitimately outranks frame time.
 - keep README, status docs, backlog docs, and worldgen TODOs updated after feature landings. Storage / Content Foundation and Gameplay are closed; their two rejected designs (a compact v2.1/v3 column layout, and merging blocks + block_data into a `BlockStateId`) are recorded with their measurements next to the code, in `storage/chunk_codec.rs` and `world/chunk.rs`, rather than lingering here as open work
 - convert important contracts into short code comments near their source modules
 - remove stale assumptions whenever a system stops being experimental
-- **`cargo clippy --all-targets -- -D warnings` (der Lint-Befehl in
-  `CLAUDE.md`) wieder grün machen** (neu formuliert 2026-09-28; der bisherige
+- **`cargo clippy --all-targets -- -D warnings` (der Lint-Befehl des
+  Projekts) wieder grün machen** (neu formuliert 2026-09-28; der bisherige
   Punkt ist enthalten)
   - *Ist (gemessen 2026-09-28):* Der harte Clippy-Fehler ist weg, aber
     `cargo clippy --all-targets` meldet **120** Warnungen: **26** Dead-Code-
@@ -2466,18 +2465,14 @@ loading screen, where throughput legitimately outranks frame time.
   - *Priorität/Aufwand/Impact:* **P2**, S-M, mittel.
   - *Akzeptanz:* `cargo clippy --all-targets -- -D warnings` endet mit Exit 0.
 - **Veraltete Aussagen in Status-Dokumenten** (neu 2026-09-28)
-  - *Ist:* `docs/03_java_bedrock_takeaways.md` führt "Palette/bitpacking as
+  - *Ist:* `docs/architecture/java-bedrock-takeaways.md` führt "Palette/bitpacking as
     runtime storage" als PARTIAL (im Speicher längst paletted,
     `world/chunk.rs:332-338`) und "Lighting as a separate asynchronous path"
     als DONE (der Lighting-Worker ist toter Code, siehe Performance
-    "`LightingWorkerPool`"). `README.md:77` nennt den falschen Default-Preset
-    (siehe Worldgen "Preset-Unterschiede dokumentieren"). `CLAUDE.md` nennt
-    `cargo test --lib world::raycast::` als Befehl für eine Testdatei; das
-    Crate hat kein Library-Target (`error: no library targets found in
-    package`), richtig ist `cargo test world::raycast::`.
-  - *Ziel/Vorgehen:* Die drei Stellen korrigieren; bei künftigen Audits
+    "`LightingWorkerPool`").
+  - *Ziel/Vorgehen:* Die Stellen korrigieren; bei künftigen Audits
     Status-Matrizen gegen den Code prüfen statt fortschreiben.
-  - *Dateien:* `docs/03_java_bedrock_takeaways.md`, `README.md`, `CLAUDE.md`.
+  - *Dateien:* `docs/architecture/java-bedrock-takeaways.md`.
   - *Abhängigkeiten:* keine.
   - *Priorität/Aufwand/Impact:* **P3**, S, niedrig.
   - *Akzeptanz:* Die Aussagen stimmen mit dem Code überein.

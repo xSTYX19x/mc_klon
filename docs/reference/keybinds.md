@@ -13,7 +13,7 @@ Source of truth:
 | `Escape` | Close chat | Chat open |
 | `Escape` | Close inventory | Inventory open |
 | `Escape` | Back / close options | Options menu |
-| `E` | Toggle inventory | In-game (not paused/generating) |
+| `B` | Toggle inventory (rebindable) | In-game (not paused/generating) |
 | `F3` | Toggle debug overlay | In-game, paused, inventory |
 
 ## Gameplay
@@ -30,14 +30,18 @@ Source of truth:
 | `RMB` | Place block | In-game, mouse captured |
 | `MMB` | Pick block into current hotbar slot | In-game, mouse captured |
 | `Mouse Wheel` | Cycle hotbar slot | In-game |
+| `1`-`9` | Select hotbar slot (fixed) | In-game |
 | `Enter` / `NumpadEnter` | Save world | In-game |
 | `N` | Generate new level | Not generating |
-| `T` | Open chat | In-game |
+| `T` | Open chat (rebindable) | In-game |
+| `F2` | Screenshot to `screenshots/` (rebindable) | In-game |
+| `F5` | Cycle camera perspective (rebindable) | In-game |
 
-## Ticking-Area Shortcut
+## Ticking Areas
 
 | Input | Action | Context |
 |---|---|---|
+| `K` | Open ticking-area editor (rebindable) | In-game |
 | `Ctrl + T` | Create ticking area radius 4 at player chunk | In-game |
 | `Ctrl + Shift + T` | Remove nearest ticking area | In-game |
 
@@ -51,23 +55,10 @@ Source of truth:
 | `F8` | Cycle lighting debug view | In-game |
 | `F9` | Print fluid debug line under crosshair | In-game |
 | `F10` | Toggle rolling perf summary logger (1s) | In-game |
+| `F11` | Toggle precipitation | In-game |
+| `F12` | Toggle boundary-ocean ring | In-game |
 | `F` | Cycle render distance | In-game |
 | `G` | Cycle simulation distance | In-game |
-
-## First-Person Hand Tweak Mode
-
-Enable/disable with `K`.
-
-| Input | Action |
-|---|---|
-| `Mouse Wheel` | Hand scale |
-| `ArrowLeft` / `ArrowRight` | Side offset - / + |
-| `ArrowUp` / `ArrowDown` | Down offset - / + |
-| `PageUp` / `PageDown` | Forward offset + / - |
-| `[` / `]` | Roll - / + |
-| `X` / `C` | Model rot X - / + |
-| `Y` / `H` | Model rot Y - / + |
-| `Z` / `V` | Model rot Z - / + |
 
 ## Pause Menu
 
@@ -114,7 +105,7 @@ Enable/disable with `K`.
 
 ## Notes
 
-- Number keys `1..9` are currently **not** bound to hotbar selection (a helper exists in `src/input.rs`, but it is unused).
+- Number keys `1..9` select hotbar slots and are deliberately not rebindable; a rebindable action on a digit key takes precedence.
 - Core movement/UI actions can be rebound through the Options -> Controls menu and are persisted in `save/settings.json`.
 - Backface culling is configured through Options -> Video / Graphics and is persisted in `save/settings.json`.
 - Rebinding conflicts are currently handled by swapping the existing assignment onto the displaced action.

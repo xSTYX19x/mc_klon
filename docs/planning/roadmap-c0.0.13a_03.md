@@ -18,7 +18,7 @@ See "Historical / Classic Parity" in `docs/TODO.md`.
 
 ## Active References
 
-- `docs/01_status_und_aktueller_stand.md`
-- `docs/todos_worldgen.md`
-- `docs/performance_optimizations.md`
+- `docs/status.md`
+- `docs/planning/worldgen.md`
+- `docs/performance/optimizations.md`
 - `docs/TODO.md`

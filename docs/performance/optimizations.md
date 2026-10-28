@@ -7,7 +7,7 @@ Status: 2026-08-20
 Chunk streaming (moving through ungenerated terrain): **~50 FPS**, up from 10-20 FPS before the
 2026-08-20 round of fixes (measured in-game by the maintainer, same scene and settings).
 Treat this as the regression baseline for streaming work; details and what caused the jump are in
-`docs/07_performance_rendering_audit.md` → "Nachtrag 2026-08-20".
+`docs/performance/audit-2026-08.md` → "Nachtrag 2026-08-20".
 
 ## Already Implemented
 
