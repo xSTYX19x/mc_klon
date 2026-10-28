@@ -34,7 +34,7 @@ is deleted there; the documents below describe what exists.
 | [planning/gameplay-backlog.md](planning/gameplay-backlog.md) | Gameplay, UI and rendering backlog by subsystem |
 | [planning/worldgen.md](planning/worldgen.md) | World generation state and phase order |
 | [planning/roadmap-c0.0.13a_03.md](planning/roadmap-c0.0.13a_03.md) | Historical roadmap up to the c0.0.13a_03 milestone |
-| [planning/feature-reference-a1.0.17_04.md](planning/feature-reference-a1.0.17_04.md) | Feature overview of the a1.0.17_04 milestone used for gap analysis (German) |
+| [planning/feature-reference-a1.0.17_04.md](planning/feature-reference-a1.0.17_04.md) | Feature overview of the a1.0.17_04 milestone used for gap analysis, with Minecraft Wiki sources (German) |
 
 ## Performance
 

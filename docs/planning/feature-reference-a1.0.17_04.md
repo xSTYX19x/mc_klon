@@ -1,329 +1,193 @@
-Feature-Übersicht von Alpha v1.0.17_04
-
-Die Version Alpha v1.0.17_04 (veröffentlicht am 23. August 2010) markiert das Ende der Seecret Friday Updates rund um Update 8.
-1. Weltgenerierung & Chunk-System
-Chunk-Format & Speichern
-
-    Chunk-Größe: 16×16×128 Blöcke (Y=0 bis 127).
-
-    Speicherformat: Alpha-Level-Format (NBT-basiert, komprimiert mit zlib) .
-
-    Weltgrenzen: Theoretisch ±32 Millionen Blöcke; Far Lands bei ±12.550.820 mit Mesh-Verzerrungen.
-
-    Session-Lock: session.lock verhindert, dass zwei Instanzen dieselbe Welt gleichzeitig speichern.
-
-Terrain & Noise
-
-    Generator: Perlin/Simplex-Noise für Höhenkarte, Höhlen (3D-Noise), Erzgänge.
-
-    Biom-Vorläufer: Keine echten Biomes, aber „Winter-Maps" (25% Chance bei Welterstellung) mit Schneebedeckung und zufrierendem Wasser.
-
-    Strukturen:
-
-        Dungeons: 7×7×7 Raum mit Monster-Spawner und 2 Truhen.
-
-        Bäume: Eichen (klein und groß/fancy), Setzlinge mit 1/20 Drop-Chance.
-
-        Erze: Kohle, Eisen, Gold, Diamant, Redstone, Lapis (noch nicht als Erzblock, nur als Item).
-
-        Gewässer: Ozeane, Seen, Flüsse; Kiesstrände mit teilweise nicht gefrorenem Wasser in Winterwelten.
-
-        Höhlen: Große, verzweigte Höhlensysteme, teilweise mit Lavaseen.
-
-        Schluchten: Tief eingeschnittene Canyons (durch Generierungsfehler/Edge-Cases) .
-
-Vegetation & Dekoration
-
-    Pflanzen:
-
-        Bäume: Eichen (Standard und „Fancy"-Variante).
-
-        Blumen: Gelbe und rote Blumen in kleinen Patches.
-
-        Pilze: Rote und braune Pilze im Schatten (auch auf Gras).
-
-        Zuckerrohr: An Stränden und Flussufern (damals „Schilf").
-
-        Kakteen: Nur auf Sand, maximal 3 Blöcke hoch, verursachen Kontakt-Schaden.
-
-        Schnee: Dünne Schneeschicht auf Blöcken in Winterwelten; Schneebedeckung wächst bei Schneefall.
-
-    Oberflächenmaterialien:
-
-        Ton: In der Nähe von Wasser generiert, droppt 4 Tonbällchen.
-
-        Sand & Kies: An Stränden, in Wüsten-Patches und als Schichten in Höhlen .
-
-2. Blöcke (vollständige Liste)
-Naturblöcke
-
-    Grundgestein: Bedrock (unzerstörbar, Y=0) .
-
-    Steinvarianten: Stein, Kopfsteinpflaster (Cobblestone), Bruchstein-Stufen, Bruchstein-Treppen.
-
-    Erde & Gras: Erde, Grasblock (grüne Textur in Alpha) .
-
-    Sand & Kies: Sand, Kies (fällt bei fehlender Unterstützung) .
-
-    Erzblöcke: Kohle-, Eisen-, Gold-, Diamant-, Redstone-Erz (visuell als Erz im Stein).
-
-    Holz: Eichenstamm, Eichenbretter, Eichenlaub (verrottet nicht mehr).
-
-    Pflanzen: Setzling, Blumen (gelb/rot), Pilz (rot/braun), Zuckerrohr, Kaktus.
-
-    Schnee & Eis: Schneeblock, Schneedecke (Layer), Eis (rutschig).
-
-    Ton: Tonblock.
-
-    Obsidian: TNT-resistent (seit a1.0.14).
-
-    Sonder: Bücherregal, Glas, Schwamm (noch nicht natürlich generierend, nur im Code) .
-
-Funktionsblöcke
-
-    Werkbank: 3×3 Crafting .
-
-    Ofen: Brennt Erze, Sand zu Glas, Ton zu Ziegel, Nahrungsmittel.
-
-    Kiste: Einzel- und Doppelkiste (seit a1.0.14) .
-
-    Jukebox: Spielt Musikplatten (13, Cat).
-
-    Redstone-Komponenten:
-
-        Redstone-Staub, Redstone-Fackel, Redstone-Erz.
-
-        Hebel, Steinknopf, Holzdruckplatte, Steindruckplatte.
-
-        Eisentür, Holztür (öffnen/schließen per Rechtsklick/Redstone).
-
-    Transport: Schiene, Lore (Minecart), Ofen-Lore, Truhen-Lore.
-
-    Sonstige:
-
-        Fackel (Beleuchtung, Monster-Spawn-Prävention) .
-
-        Leiter (Klettern).
-
-        Tür (Holz/Eisen).
-
-        Schild (Text, kein Redstone-Signal).
-
-        Treppe & Stufe (Holz/Stein).
-
-        Zaun (neu in a1.0.17, 1,5 Blöcke Kollisionshöhe) .
-
-        Notenblock (noch nicht funktional spielbar, nur als Block) .
-
-3. Items & Werkzeuge
-Werkzeuge & Waffen
-
-    Werkzeugstufen: Holz, Stein, Eisen, Gold, Diamant (Spitzhacke, Axt, Schaufel, Hacke, Schwert) .
-
-    Haltbarkeit: Diamant-Werkzeuge seit a1.0.3: 1025 Uses (vorher 513).
-
-    Rüstung: Leder, Eisen, Gold, Diamant (Helm, Brust, Hose, Stiefel); Kettenrüstung im Code, aber nicht craftbar .
-
-    Bogen & Pfeile: Bogen (unendlich viele Pfeile in Alpha), Pfeil (Flint + Stock + Feder).
-
-Ressourcen & Materialien
-
-    Rohstoffe: Kohle, Eisenbarren, Goldbarren, Diamant, Redstone, Tonbällchen, Ziegel (gebrannter Ton).
-
-    Baumaterialien: Bretter, Zaun (neu in a1.0.17), Glas, Bücherregal, Wolle (8 Farben) .
-
-    Nahrung:
-
-        Äpfel (Drop von Eichenlaub, noch nicht 100%) .
-
-        Brot (3 Weizen) .
-
-        Rohes/gebratenes Schweinefleisch .
-
-        Pilzsuppe (2 Pilze + Schüssel) .
-
-        Weizen & Samen (noch nicht als Farm-Pflanze, nur als Drop/Item) .
-
-    Sonstige Items:
-
-        Eimer (Wasser, Lava, Milch) .
-
-        Schüssel .
-
-        TNT (1 TNT + 4 Sand/Kies) .
-
-        Feuerzeug (Flint & Steel) .
-
-        Sattel (nur in Dungeon-Truhen, zum Reiten von Schweinen).
-
-        Musikplatten (13, Cat).
-
-        Schneeball (werfbar, kein Schaden).
-
-        Ei (werfbar, kein Spawn) .
-
-        Farbe (Dye, 8 Farben) .
-
-        Papier & Buch (für Bücherregal, noch kein Buch-Item als solches).
-
-        Slimeball (Drop von kleinen Slimes, noch ohne Verwendung).
-
-4. Mobs & Entitäten
-Passive Mobs
-
-    Schwein: Aufsattelbar, Drop: rohes Schweinefleisch.
-
-    Schaf: Wolle regeneriert, Drop: Wolle + Fleisch.
-
-    Kuh: Melkbar (Milcheimer), Drop: rohes Rindfleisch + Leder.
-
-    Huhn: Drop: Federn, rohes Huhn, Eier (legen zufällig).
-
-Hostile Mobs
-
-    Zombie: Nahkampf, Drop: Federn (Bug, später Fleisch).
-
-    Skelett: Fernkampf mit Bogen, Drop: Pfeile, Knochen (noch nicht implementiert als Item) .
-
-    Spinne: Klettert, nachts aktiv, Tag neutral .
-
-    Creeper: Explodiert bei Annäherung .
-
-    Slime: Teilt sich in kleinere Slimes (Frieden: keine großen Slimes).
-
-    Spider Jockey: Skelett reitet Spinne (neu in a1.0.17) .
-
-Nicht-Mob-Entitäten
-
-    Lore: Normale Lore, Ofen-Lore, Truhen-Lore.
-
-    Boot: Wasserfahrzeug, zerbricht an Land.
-
-    Drop-Item: Alle Items als Entities im Boden .
-
-    Pfeil: Flugprojektil .
-
-    TNT: Explodiert nach Zündung .
-
-    Erfahrungskugeln: Noch nicht vorhanden (kamen erst in Beta) .
-
-5. Gameplay-Mechaniken
-Gesundheit & Nahrung
-
-    Gesundheit: 20 HP (10 Herzen), Heilung durch Essen (sofort, keine Hungerleiste) .
-
-    Schadenquellen: Fall, Ertrinken, Lava, Feuer, Erstickung (in Blöcken), Mob-Angriffe, TNT-Explosion, Kaktus-Kontakt.
-
-Bewegung & Physik
-
-    Bewegung: Gehen, Springen (max. 2 Blöcke horizontal seit a1.0.4), Schwimmen.
-
-    Sprint & Schleichen: Nicht vorhanden (kamen erst in Alpha 1.2.0) .
-
-    Reiten:
-
-        Schwein: Mit Sattel reiten (Steuerung ohne Karotte, nur Richtung).
-
-        Lore: Mit Sitz-Animation (seit a1.0.4).
-
-        Boot: Rechtsklick zum Einsteigen.
-
-    Fluid-Physik: Wasser und Lava fließen mit einfacher Ausbreitungslogik (Quellenblöcke, fließende Blöcke).
-
-    Sand/Kies: Fallen bei fehlender Unterstützung .
-
-Interaktion & Crafting
-
-    Crafting: 2×2 im Inventar, 3×3 an Werkbank .
-
-    Smelting: Ofen mit Brennstoff (Kohle, Holz, Lava-Eimer).
-
-    Block-Platzierung: Rechtsklick, Schilder benötigen keinen freien Block darüber (seit a1.0.5).
-
-    Block-Abbau: Linksklick, Werkzeug-Effizienz, Haltbarkeit .
-
-    Türen: Öffnen/Schließen per Rechtsklick, Redstone-Signal.
-
-    Kisten: Öffnen/Schließen, Items lagern .
-
-    Jukebox: Rechtsklick mit Platte zum Abspielen.
-
-Redstone & Logik
-
-    Redstone-Staub: Überträgt Signal bis 15 Blöcke.
-
-    Redstone-Fackel: Inverter (Signal umkehren).
-
-    Hebel, Knopf, Druckplatte: Signalquellen.
-
-    Eisentür: Öffnet/Schließt mit Redstone.
-
-    Schiebetüren & Kolben: Noch nicht vorhanden (kamen später) .
-
-6. Multiplayer & Server
-SMP (Survival Multiplayer)
-
-    Einführung: a1.0.10 (erste SMP-Unterstützung, Mojang-Server, Invite-only).
-
-    Server-Features:
-
-        /op, /deop, /pardon, /pardon-ip, /tp (seit a1.0.16/0.1.1/0.1.2) .
-
-        Server-seitige Render-Distanz, Max-Player-Capacity, Chat-Word-Wrap.
-
-        Session-Lock für Weltspeicher.
-
-    Multiplayer-spezifische Features:
-
-        Hühner, Slime, Schwein in SMP (seit a1.0.17) .
-
-        Tag-Nacht-Zyklus in SMP (seit a1.0.17) .
-
-        Arm-Schwing-Animation in SMP/Third-Person (seit a1.0.15) .
-
-7. Audio, UI & Sonstiges
-Audio
-
-    Musik: C418-Tracks (piano1.ogg, piano2.ogg, piano3.ogg, calm1.ogg, calm2.ogg, calm3.ogg, hal1.ogg, hal2.ogg, hal3.ogg, hal4.ogg).
-
-    Ambiente: Höhlen-Geräusche, Schrittgeräusche, Mob-Sounds (hostile Mobs seit a1.0.3).
-
-    Musik: Wiedereingeführt in a1.0.14 nach Entfernung in Infdev.
-
-UI & Menü
-
-    Titelbildschirm: Animiertes Logo (seit a1.0.4), Stein-Textur statt Cobblestone.
-
-    Splashes: Zahlreiche Splash-Texte (z. B. „Seecret Friday update!", „Do not distribute!", „1K IN 24h" in a1.0.13_01).
-
-    Inventar: 40 Slots (36 Inventar + 4 Crafting/Rüstung), keine Hungerleiste .
-
-    HUD: F1 für HUD-Ausblendung, F2 für Screenshots (seit Alpha allgemein) .
-
-    Pause-Menü: Dunklerer Hintergrund (seit a1.0.9).
-
-Technische Features
-
-    Java-Version: Java SE 5 (Minimum).
-
-    Protocol-Version: 12 (a1.0.14), 13 (a1.0.15), 14 (a1.0.16), 1 (a1.0.17).
-
-    Server-Versionen: 0.1.0 (a1.0.15), 0.1.1 (a1.0.16), 0.1.2 (a1.0.16_01), 0.1.4 (a1.0.17) .
-
-8. Bekannte Bugs & Limitationen (für den Abgleich relevant)
-
-    Slime-Spawn: Natürliches Spawnen durch Berechnungsfehler de facto deaktiviert (a1.0.14).
-
-    Score-Anzeige: Todesbild zeigt „Score: &e0" (Bug bis 1.0.0).
-
-    Dritte-Person-Items: Items in Third-Person riesig dargestellt (a1.0.6).
-
-    Arm-Animation: Arm-Schwingen nur in Multiplayer/Third-Person sichtbar (a1.0.15) .
-
-    Fehlende Features (im Vergleich zu später):
-
-        Kein Hunger, kein Sprint, kein Schleichen .
-
-        Kein Nether, keine Betten, keine Biomes (im modernen Sinn) .
-
-        Kein Zaubertisch, kein Verzaubern, kein Amboss .
+# Feature-Referenz: Alpha v1.0.17_04
+
+Stand der Java Edition am Ende der Alpha-1.0-Reihe, als Vorlage für den
+Content-Abgleich in [TODO.md](../TODO.md). Eigene Zusammenfassung; die
+Angaben sind gegen die Versionsseiten des [Minecraft Wiki](https://minecraft.wiki)
+geprüft (Quellen am Ende). Steht bei einem Punkt eine Version, ist das die
+Alpha-Version, in der er dazukam.
+
+- **Veröffentlicht:** 23. August 2010, letzter Patch von Alpha v1.0.17
+  (20. August 2010, "Seecret Friday 8"). Der Patch selbst behebt nur ein
+  Steckenbleiben des Spielers.
+- **Nachfolger:** Alpha v1.1.0. Biome und Nether kommen erst mit v1.2.0.
+
+## 1. Welt und Speicherformat
+
+| Thema | Stand |
+|---|---|
+| Chunk | 16 × 16 × 128 Blöcke, Y 0 bis 127 |
+| Welt | unendlich generiert; ab Koordinate 12.550.824 setzen die Far Lands ein (Noise-Überlauf) |
+| Speicherformat | *Alpha Level Format*: `level.dat` (Seed, Spawn, Zeit, Spieler) plus eine Datei pro Chunk (`c.<x>.<z>.dat`, Base36) in zwei Ebenen Unterordnern; alles NBT, GZip-komprimiert. Regionsdateien kommen erst in Beta 1.3 |
+| `session.lock` | Zeitstempel; wer zuletzt schreibt, besitzt die Welt, andere Instanzen geben auf |
+
+## 2. Weltgenerierung
+
+| Thema | Stand |
+|---|---|
+| Biome | keine. Der Generator kennt nur Geländeformen; echte Biome erst in v1.2.0 |
+| Winterwelten (v1.0.4) | 25 % Chance bei der Welterstellung (`SnowCovered` in `level.dat`): Schneefall, dünne Schneeschicht auf allem unter freiem Himmel, die bei Schneefall wächst; offenes Wasser friert zu Eis, außer an Kiesstränden |
+| Höhlen | verzweigte Höhlensysteme; Schluchten gibt es noch nicht (Beta 1.8) |
+| Erze | Kohle, Eisen, Gold, Diamant, Redstone (v1.0.1). Gold und Diamant seit v1.0.1 doppelt so häufig. Kein Lapis (Beta 1.2) |
+| Dungeons | Monsterräume mit Spawner und Truhen. Seit v1.0.14 doppelt so häufig. Inhalt u. a. Schwarzpulver, Faden, Weizen, Brot, Eisen, Eimer, Sattel, Redstone, selten Goldapfel, Schallplatten (v1.0.14) |
+| Bäume | normale Eiche und "Fancy"-Eiche (v1.0.6 wieder da, seltener) |
+| Pflanzen | gelbe und rote Blumen; Pilze überall, im Sonnenlicht fallen sie mit der Zeit ab (v1.0.1) |
+| Kaktus (v1.0.6) | nur auf Sand, ohne direkte Nachbarblöcke, bis 3 hoch (v1.0.14), Kontaktschaden |
+| Zuckerrohr (v1.0.11) | damals "Reeds", an Stränden, bis 3 hoch |
+| Ton (v1.0.11) | in Wassernähe |
+
+## 3. Blöcke
+
+- **Natur:** Stein, Gras, Erde, Bruchstein, bemooster Bruchstein, Grundgestein,
+  Sand, Kies, Ton, Obsidian (seit v1.0.14 TNT-fest), Stamm, Laub, Setzling,
+  Blumen, Pilze, Kaktus, Zuckerrohr, Wasser, Lava, Feuer
+- **Erze und Erzblöcke:** Kohle-, Eisen-, Gold-, Diamant-, Redstone-Erz;
+  Eisen-, Gold-, Diamantblock
+- **Schnee und Eis (v1.0.4):** Schneeschicht (noch nicht abbaubar), Schneeblock
+  (aus 4 Schneebällen), Eis (rutschig, schmilzt an Feuer/Lava)
+- **Bau:** Bretter, Glas, Ziegel, Bücherregal (seit v1.0.11 herstellbar, droppt
+  nichts), Wolle (**nur weiß**), Steinstufe, Holz- und Bruchsteintreppe,
+  Leiter, Schild, Holztür, Zaun (v1.0.17)
+- **Funktion:** Werkbank, Ofen, Truhe, Jukebox (v1.0.14), Monster-Spawner,
+  TNT, Ackerboden und Weizenpflanze, Schiene
+- **Redstone (v1.0.1):** Redstone-Staub, Redstone-Fackel, Hebel, Steinknopf,
+  Druckplatte aus Stein (nur Spieler/Mobs) und aus Holz (alle Entities),
+  Eisentür (nur per Redstone)
+- **Sonderfall:** Schwamm existiert als Block, wird aber nicht generiert
+
+**Zaun (v1.0.17):** nur auf festen Blöcken platzierbar, verbindet sich nicht
+mit festen Blöcken, auf ihm lässt sich nichts platzieren. Neue Welten starten
+mit 64 Zäunen im Inventar.
+
+**Noch nicht vorhanden:** Kürbis, Netherrack, Glowstone, Seelensand (v1.2.0),
+Lapis, Sandstein, Notenblock, Werfer, farbige Wolle (Beta 1.2), Bett (Beta 1.3).
+
+## 4. Items
+
+- **Werkzeuge:** Spitzhacke, Axt, Schaufel, Hacke, Schwert in Holz, Stein,
+  Eisen, Gold, Diamant
+- **Rüstung:** Leder (seit v1.0.8 aus Leder statt Stoff), Eisen, Gold, Diamant
+- **Fernkampf:** Bogen ohne Aufladen (Schuss sofort, Aufladen erst Beta 1.8),
+  Pfeil (Spitze seit v1.0.14 aus Feuerstein)
+- **Rohstoffe:** Kohle, Diamant, Eisen- und Goldbarren, Redstone, Stock,
+  Faden, Feder, Schwarzpulver, Feuerstein, Leder (v1.0.8), Tonklumpen und
+  Ziegel (v1.0.11), Zuckerrohr, Papier, Buch (v1.0.11), Schleimball
+  (v1.0.11, noch ohne Verwendung), Schneeball (stapelt bis 16)
+- **Nahrung** (heilt sofort, keine Hungerleiste): Apfel, Goldapfel, Brot,
+  rohes und gebratenes Schweinefleisch, Pilzsuppe. Äpfel fallen noch nicht aus
+  Laub (erst Java 1.1)
+- **Landwirtschaft:** Samen entstehen beim Bearbeiten von Gras mit der Hacke;
+  Weizen wird auf Ackerboden angebaut
+- **Sonstiges:** Eimer (Wasser, Lava, Milch; Milch seit v1.0.11 von Kühen,
+  leerbar seit v1.0.17), Feuerzeug, Schüssel, Gemälde, Sattel, Lore, Lore mit
+  Truhe und mit Ofen (v1.0.14), Boot (v1.0.6), Ei (v1.0.14, ohne Funktion,
+  nicht werfbar), Schallplatten "13" und "cat" (v1.0.14)
+
+**Noch nicht vorhanden:** Kompass (v1.1.0), Angel und Fisch (v1.1.1), Uhr
+(v1.2.0), Farbstoffe, Knochen, Zucker, Kuchen (Beta 1.2), Schere (Beta 1.7).
+
+## 5. Mobs
+
+| Mob | seit | Drop | Verhalten |
+|---|---|---|---|
+| Schwein | vor Alpha | 0–2 rohes Schweinefleisch | mit Sattel reitbar, aber **nicht steuerbar** (erst Java 1.4.2) |
+| Schaf | vor Alpha | Wolle (weiß) beim Schlagen | Scheren erst Beta 1.7 |
+| Kuh | v1.0.8 | 0–2 Leder | melkbar mit Eimer (v1.0.11); Rindfleisch erst Beta 1.8 |
+| Huhn | v1.0.14 | 0–2 Federn | legt alle 5–10 min ein Ei; seit v1.0.17 kein Fallschaden, gleitet |
+| Zombie | vor Alpha | 0–2 Federn | brennt im Sonnenlicht |
+| Skelett | vor Alpha | Pfeile | brennt im Sonnenlicht; Knochen erst Beta 1.2 |
+| Spinne | vor Alpha | 0–2 Faden | bei Tageslicht neutral; Wandklettern erst Beta 1.2 |
+| Creeper | vor Alpha | Schwarzpulver | explodiert in Spielernähe |
+| Schleim | v1.0.11 | Schleimball (kleinste Größe) | drei Größen, teilt sich beim Tod; nur unter Y=32. Seit v1.0.14 spawnt er durch einen Rechenfehler praktisch nicht mehr natürlich |
+| Spinnenreiter | v1.0.17 | | Skelett reitet auf Spinne |
+
+## 6. Spielmechanik
+
+- **Gesundheit:** 10 Herzen, Essen heilt sofort. Kein Hunger, kein Sprinten
+  (beides Beta 1.8), kein Schleichen (Alpha v1.1.1).
+- **Laub:** zerfällt nicht (seit v1.0.6); Setzling-Drop 5 %.
+- **Fahrzeuge:** Boot zerbricht an Land oder bei Kollision mit Land (v1.0.6).
+  Sitzhaltung beim Reiten (v1.0.4); seit v1.0.14 sind Booster-Konstruktionen
+  möglich, die Ofen-Lore fährt mit Kohle.
+- **Redstone:** Staub kennt nur an oder aus; Fackeln invertieren. Die
+  Eisentür reagiert nur auf Redstone, die Holztür auf Klick.
+- **Lava** setzt Blöcke in Brand (v1.0.15).
+- **Fluide:** Wasser und Lava fließen dynamisch (seit Infdev).
+- **Arm-Schwingen:** seit v1.0.15 im Multiplayer und in der Third-Person-Ansicht
+  sichtbar; seit v1.0.17 auch beim Rechtsklick auf benutzbare Blöcke.
+
+## 7. Oberfläche und Audio
+
+- **Inventar:** 40 Slots (heute 36); auch der Crafting-Slot kann Items halten.
+  Crafting 2 × 2 im Inventar, 3 × 3 an der Werkbank.
+- **Tasten:** F1 blendet HUD und Arm aus, F1 + F2 speichert einen Screenshot.
+- **Third Person:** gehaltene Items erscheinen stark vergrößert; seit v1.0.17
+  ist die Kamera wieder zentriert.
+- **Titelbildschirm:** animiertes Logo aus Stein (v1.0.4), Splash-Texte.
+- **Musik:** seit v1.0.14 wieder aktiv, mit drei neuen Stücken von C418;
+  dazu Höhlen- und Mob-Geräusche.
+
+## 8. Multiplayer
+
+Für den Abgleich ausgeklammert, nur zur Einordnung:
+
+- Survival-Multiplayer seit v1.0.15 (Server 0.1.0), Verbindung per IP.
+- Server-Operatoren und Befehle wie `/op`, `/deop`, `/kick`, `/ban`,
+  `/pardon`, `/pardon-ip`, `/home`, `/stop` seit v1.0.16.
+- Seit v1.0.17 gibt es Hühner, Schleime und Schweine sowie den Tag-Nacht-Zyklus
+  auch im Multiplayer.
+
+## Korrekturen gegenüber der früheren Fassung
+
+Die vorige Version dieser Datei enthielt Angaben, die laut Wiki nicht auf
+a1.0.17_04 zutreffen. Wo [TODO.md](../TODO.md) daraus Punkte übernommen hat,
+gilt diese Fassung:
+
+- Kein Lapis, kein Notenblock, keine Farbstoffe, Wolle nur weiß (alles Beta 1.2).
+- Keine Schluchten (Beta 1.8); Flüsse sind nicht belegt.
+- Weizen ist anbaubar (seit Indev), nicht nur ein Drop.
+- Schafe lassen Wolle beim Schlagen fallen; sie regenerieren keine Wolle und
+  sind nicht scherbar. Kühe droppen nur Leder, Hühner nur Federn.
+- Schweine sind reitbar, aber nicht steuerbar.
+- Äpfel fallen nicht aus Laub.
+- Eier sind nicht werfbar.
+- Sprinten kam mit Beta 1.8, Schleichen mit Alpha v1.1.1 (nicht "Alpha 1.2.0").
+- Multiplayer startete mit v1.0.15, nicht v1.0.10.
+- Chunkdateien sind GZip-komprimiert, nicht zlib.
+
+## Quellen
+
+Minecraft Wiki, abgerufen am 28.10.2026. Die Wiki-Inhalte stehen unter
+[CC BY-NC-SA 3.0](https://creativecommons.org/licenses/by-nc-sa/3.0/); diese
+Datei übernimmt keinen Text, nur Fakten.
+
+- Versionsseiten: [Alpha](https://minecraft.wiki/w/Java_Edition_Alpha),
+  [v1.0.1](https://minecraft.wiki/w/Java_Edition_Alpha_v1.0.1),
+  [v1.0.4](https://minecraft.wiki/w/Java_Edition_Alpha_v1.0.4),
+  [v1.0.6](https://minecraft.wiki/w/Java_Edition_Alpha_v1.0.6),
+  [v1.0.8](https://minecraft.wiki/w/Java_Edition_Alpha_v1.0.8),
+  [v1.0.11](https://minecraft.wiki/w/Java_Edition_Alpha_v1.0.11),
+  [v1.0.14](https://minecraft.wiki/w/Java_Edition_Alpha_v1.0.14),
+  [v1.0.15](https://minecraft.wiki/w/Java_Edition_Alpha_v1.0.15),
+  [v1.0.16](https://minecraft.wiki/w/Java_Edition_Alpha_v1.0.16),
+  [v1.0.17](https://minecraft.wiki/w/Java_Edition_Alpha_v1.0.17),
+  [v1.0.17_04](https://minecraft.wiki/w/Java_Edition_Alpha_v1.0.17_04),
+  [Infdev](https://minecraft.wiki/w/Java_Edition_Infdev)
+- Format und Welt: [Alpha level format](https://minecraft.wiki/w/Java_Edition_Alpha_level_format),
+  [Far Lands](https://minecraft.wiki/w/Far_Lands),
+  [Monster Room](https://minecraft.wiki/w/Monster_Room),
+  [Ravine](https://minecraft.wiki/w/Ravine),
+  [Lapis Lazuli Ore](https://minecraft.wiki/w/Lapis_Lazuli_Ore)
+- Blöcke und Items: [Oak Fence](https://minecraft.wiki/w/Oak_Fence),
+  [Wool](https://minecraft.wiki/w/Wool),
+  [Note Block](https://minecraft.wiki/w/Note_Block),
+  [Wheat Seeds](https://minecraft.wiki/w/Wheat_Seeds),
+  [Apple](https://minecraft.wiki/w/Apple),
+  [Egg](https://minecraft.wiki/w/Egg),
+  [Bow](https://minecraft.wiki/w/Bow)
+- Mobs und Mechanik: [Pig](https://minecraft.wiki/w/Pig),
+  [Cow](https://minecraft.wiki/w/Cow),
+  [Zombie](https://minecraft.wiki/w/Zombie),
+  [Skeleton](https://minecraft.wiki/w/Skeleton),
+  [Spider](https://minecraft.wiki/w/Spider),
+  [Sneaking](https://minecraft.wiki/w/Sneaking),
+  [Sprinting](https://minecraft.wiki/w/Sprinting)
