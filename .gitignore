@@ -1,0 +1,11 @@
+# Build output
+/target/
+
+# Runtime data created next to the working directory on first launch
+/save/
+/logs/
+/screenshots/
+/resourcepacks/
+
+# Third-party textures are not redistributed; see assets/README.md
+/assets/minecraft/
