@@ -561,7 +561,7 @@ oder gegenüber dem heutigen Stand **erweitert** werden müssen; alles bereits
 Implementierte (Chunk-/Region-Storage, Terrain+Carver+Erz-Pässe, Bäume, Blumen,
 Pilze, Winterwelten, Wasser/Lava-Fluid-Sim, Tag/Nacht, Third-Person-Modell,
 Niederschlag, Screenshots, Menüs/Options/Settings, Ticking-Areas) steht nicht
-mehr hier. Multiplayer/SMP (Abschnitt 6 der Featureliste) ist explizit
+mehr hier. Multiplayer/SMP (Abschnitt 8 der Featureliste) ist explizit
 ausgeklammert.
 
 **Grundregel bei Widerspruch: das vorhandene Feature gewinnt.** Wo der Code
@@ -570,7 +570,9 @@ Version — nichts davon wird zurückgebaut, um die Vorlage exakt zu treffen. Di
 Featureliste liefert den *Inhalt*, der noch fehlt, nicht die Obergrenze.
 Betroffen sind heute: Weltgrenzen **0..255** statt 128 (`WorldConfig::min_y/
 max_y`, `world/config.rs:45-48`), **Sprint/Sneak** (`InputAction::Sprint`/
-`Sneak`, in der Vorlage erst ab Alpha 1.2.0), `Player::food_level`
+`Sneak`; Sprinten kam erst mit Beta 1.8, Schleichen mit Alpha v1.1.1),
+die 16 farbigen Wollblöcke (in der Vorlage nur weiß, Farben erst Beta 1.2),
+`Player::food_level`
 (`player/mod.rs:52`, gated heute `can_sprint_swim`, `:100`), die sechs
 Baum-Presets statt zwei Eichenformen, und `WorldEnvironment` als expliziter
 Weltparameter statt einer reinen Winter-Zufallsflagge.
@@ -585,7 +587,7 @@ Waterlogging, Grenze von 256 Blocktypen.
 
 **Das ist der Blocker für ca. 60 % der Liste unten** (Treppen, Zaun, Tür,
 Leiter, Fackel, Schiene, Hebel, Knopf, Druckplatte, Redstone-Staub, Schild,
-Kaktus/Zuckerrohr-Alter, Schneehöhe). Die Form-/Occlusion-Seite steht unter
+Kaktus/Zuckerrohr-/Weizen-Alter, Schneehöhe). Die Form-/Occlusion-Seite steht unter
 "Rendering / Blockmodelle und Voxel-Shapes"; hier steht die Speicher- und
 Contract-Seite, weil daran alle Content-Punkte hängen.
 
@@ -702,7 +704,8 @@ Planken bzw. Stein — beim Modellbau bewusst so umsetzen.
 Arrays fester Länge (`[BlockSpec; 51]`, `[BlockId; 43]`), die Zahl im Typ muss
 also je Block mitwachsen.
 
-- Diamanterz, Redstone-Erz, Diamantblock, Lapis-Erz. Erz-Seite: neue Einträge in
+- Diamanterz, Redstone-Erz, Diamantblock. (Lapis gehört nicht zu a1.0.17,
+  er kam mit Beta 1.2.) Erz-Seite: neue Einträge in
   den vier Tabellen in `worldgen/ores.rs` (`FLATISH_/CLASSIC_FLATTER_/
   RD161348_LIKE_/HILLY_ORE_TABLE`, `ores.rs:183-216`) — der Pass ist bereits
   datengetrieben, es kommen nur Zeilen dazu (auch hier feste Arraylänge,
@@ -712,7 +715,7 @@ also je Block mitwachsen.
   ausgerichtet werden — genau wie bei Kohle beschrieben in `docs/planning/worldgen.md`.
 - Tonblock (Clay), Schneeblock (der heutige `BlockId::Snow` ist die 2px-**Decke**,
   nicht der Vollblock), Werkbank, Ofen (an/aus als zwei Texturen-Sätze),
-  Notenblock, Jukebox, Kiste.
+  Jukebox, Kiste. (Der Notenblock kam erst mit Beta 1.2.)
 - Redstone-Erz mit Leucht-Zustand: `emitted_light` ist in `BlockSpec` schon da
   (heute nur Lava = 15, `blocks/mod.rs:912,936`), also nur ein zweiter Spec.
 
@@ -723,12 +726,16 @@ also je Block mitwachsen.
   Block-Light-Pfad im Spiel nie benutzt wird.
 - Treppe (Bruchstein/Holz), Stufe oben/unten (`SlabUpper` ist in
   `OcclusionShape` bereits vorgesehen, `blocks/mod.rs:363` — es fehlt nur der
-  Block dazu), Zaun (4 Verbindungsbits, 1.5 Blöcke Kollisionshöhe → braucht
-  eine `CollisionShape::Aabb` höher als der Voxel, prüfen ob
+  Block dazu), Zaun (4 Verbindungsbits; in der Vorlage verbindet er sich nicht
+  mit festen Blöcken, steht nur auf festem Untergrund, und auf ihm lässt sich
+  nichts platzieren. Die spätere Kollisionshöhe von 1.5 Blöcken ist für
+  a1.0.17 nicht belegt; falls übernommen, braucht sie eine
+  `CollisionShape::Aabb` höher als der Voxel, prüfen ob
   `move_with_collisions` das trägt), Leiter, Holz-/Eisentür (2 Blöcke hoch,
   `Half`+`Facing4`+`Open`), Schild (Boden/Wand + Textinhalt → Block-Entity),
-  Kaktus (Kollisionsschaden, nur auf Sand), Zuckerrohr, Schneedecke mit
-  Höhenstufen 1-8.
+  Kaktus (Kontaktschaden, nur auf Sand, keine direkten Nachbarblöcke),
+  Zuckerrohr, Schneedecke mit Höhenstufen 1-8, Ackerboden und Weizenpflanze
+  mit Wachstumsstufen (Random-Tick; beides fehlt heute ganz).
 
 **Verhalten für schon vorhandene Blöcke:**
 
@@ -816,18 +823,20 @@ Effiziente Reihenfolge:
 Barren, Nahrung, Eimer, Bogen/Pfeil, Musikplatten, Buch/Papier, `slime_ball`,
 `clay_ball`, `brick` und `wheat_seeds` sind da. Noch offen und vor der
 Item-UI zu beschaffen: `feather`, `wheat`, `bowl`, `saddle`, `snowball` sowie
-15 der 16 Farbstoffe (nur `yellow_dye.png` liegt vor) — für a1.0.17 werden
-davon 8 gebraucht.
+15 der 16 Farbstoffe (nur `yellow_dye.png` liegt vor) — für a1.0.17 wird
+keiner gebraucht, Farbstoffe kamen erst mit Beta 1.2.
 
 Inhalt danach, in der Reihenfolge der Abhängigkeit:
 
 - Werkzeugstufen Holz/Stein/Eisen/Gold/Diamant × Spitzhacke/Axt/Schaufel/Hacke/
-  Schwert; Diamant 1025 Uses.
+  Schwert. Haltbarkeitswerte pro Stufe sind in der Referenz nicht belegt und
+  vor der Umsetzung nachzuschlagen.
 - Werkzeug-Effizienz und Haltbarkeit als *Daten* (`tool_class`, `tier`,
   `durability`) gehören in die `ITEM_SPECS`-Tabelle; die *Wirkung* (Abbauzeit,
   Verschleiß) steht unter "Survival-Gameplay", weil sie nur dort greift.
-- Drops beim Abbau (inkl. Setzling 1/20 aus Laub, Apfel aus Laub,
-  Ton→4 Tonbällchen, Kies→Feuerstein-Chance). Ohne Entity-System zunächst
+- Drops beim Abbau (inkl. Setzling 1/20 aus Laub, Ton→4 Tonbällchen,
+  Kies→Feuerstein-Chance). Äpfel fallen in der Vorlage nicht aus Laub (erst
+  Java 1.1), und Laub zerfällt nicht. Ohne Entity-System zunächst
   direkt ins Inventar; die Item-Entity kommt am Entity-Punkt.
 - Crafting: 2×2 im Inventar, 3×3 an der Werkbank. Rezepte als deklarative
   Tabelle (shaped/shapeless) in `src/items/recipes.rs`; Matching über eine
@@ -839,7 +848,7 @@ Inhalt danach, in der Reihenfolge der Abhängigkeit:
   (`blocks/mod.rs:979`) und zählt nur einen Zähler hoch
   (`world/block_entity_types.rs:58-89`); beim Anlegen des Ofens umhängen.
 - Rüstung (Leder/Eisen/Gold/Diamant, 4 Slots), Bogen + Pfeile.
-- Nahrung: Apfel, Brot, rohes/gebratenes Schwein, Pilzsuppe. In dieser Ära heilt
+- Nahrung: Apfel, Goldapfel, Brot, rohes/gebratenes Schwein, Pilzsuppe. In dieser Ära heilt
   Essen **sofort** und es gibt keine Hungerleiste. `Player::food_level`
   (`player/mod.rs:52`) bleibt trotzdem stehen — es ist heute die Bedingung für
   `can_sprint_swim` (`:100`) und damit ein vorhandenes Feature, kein toter Rest.
@@ -848,10 +857,13 @@ Inhalt danach, in der Reihenfolge der Abhängigkeit:
 - Eimer (Wasser/Lava/Milch): setzt/entfernt Quellblöcke über den vorhandenen
   `FluidSystem`-Pfad; Milch braucht die Kuh.
 - Restliche Items: Schüssel, Feuerzeug, Sattel, Musikplatten (13, Cat),
-  Schneeball (werfbar, kein Schaden), Ei (werfbar, kein Spawn), Farbe (8),
-  Papier, Buch, Slimeball, Ziegel, Weizen+Samen (nur als Drop/Item, **keine**
-  Farmpflanze in dieser Version), Wolle (8 Farben als Item — die 16
-  Wollblöcke sind bereits da).
+  Schneeball (werfbar), Ei (ohne Funktion, nicht werfbar), Papier, Buch,
+  Slimeball, Tonklumpen, Ziegel, Feder, Faden, Schwarzpulver, Feuerstein,
+  Leder, Gemälde, Boot, Loren (normal, mit Truhe, mit Ofen).
+- Landwirtschaft: Samen beim Bearbeiten von Gras mit der Hacke, Weizen als
+  Feldpflanze auf Ackerboden (Blöcke siehe oben), Ernte ergibt Weizen und
+  Samen. Keine Farbstoffe; Wolle ist in der Vorlage nur weiß, die
+  vorhandenen 16 farbigen Wollblöcke bleiben nach der Grundregel.
 
 ### Entities & Mobs
 
@@ -930,10 +942,15 @@ Player-Modell.
      Reichweite, das nähere Ergebnis gewinnt (siehe "Kampf").
   7. **Persistenz ist ein Blocker**, siehe Storage-Punkt unten.
 - *Inhalt:*
-  - Passiv: Schwein (satteln/reiten), Schaf (Wolle regeneriert, scherbar), Kuh
-    (melkbar), Huhn (legt Eier).
-  - Feindlich: Zombie, Skelett (Fernkampf), Spinne (klettert, tagsüber
-    neutral), Creeper (Explosion), Slime (teilt sich), Spider Jockey.
+  - Passiv: Schwein (satteln/reiten, nicht steuerbar; Drop rohes
+    Schweinefleisch), Schaf (Wolle beim Schlagen; kein Scheren, kein
+    Nachwachsen), Kuh (melkbar, Drop Leder), Huhn (legt Eier, gleitet ohne
+    Fallschaden, Drop Federn).
+  - Feindlich: Zombie (brennt in der Sonne, Drop Federn), Skelett
+    (Fernkampf, brennt in der Sonne, Drop Pfeile), Spinne (tagsüber neutral,
+    klettert noch nicht an Wänden, Drop Faden), Creeper (Explosion, Drop
+    Schwarzpulver), Slime (drei Größen, teilt sich, nur unter Y=32),
+    Spider Jockey.
   - Nicht-Mob-Entities: Drop-Item (Voraussetzung für "Abbau droppt"), Pfeil,
     TNT (gezündet), Lore + Schiene, Ofen-/Truhen-Lore, Boot, später Fall-Block
     (siehe Sand/Kies).
@@ -1016,8 +1033,8 @@ schon genau richtig gebaut und muss nur gefüllt werden: `App::break_held` +
   Flächen des Zielblocks zeichnen — die Selektionsbox-Geometrie existiert
   bereits und liefert dieselben Flächen.
 - Haltbarkeit: pro erfolgreichem Abbau ein Punkt Verschleiß auf dem gehaltenen
-  Werkzeug; bei 0 verschwindet das Item. Diamant 1025 Uses (Vorlage,
-  seit a1.0.3).
+  Werkzeug; bei 0 verschwindet das Item. Werte pro Stufe vor der Umsetzung
+  nachschlagen (in der Referenz nicht belegt).
 - Creative bleibt sofort: `ModeRules::instant_break`.
 
 #### Gesundheit & Schaden
@@ -1054,8 +1071,6 @@ schon genau richtig gebaut und muss nur gefüllt werden: `App::break_held` +
   geladen (`render/state.rs:6421`) und ist damit schon persistent.
 - Beim Tod fällt das Inventar als Item-Entities zu Boden (hängt am
   Entity-System) — bis dahin ersatzweise leeren.
-- Die Vorlage zeigt auf dem Todesbildschirm "Score: &e0"; das ist ein Bug der
-  Vorlage und wird nicht nachgebaut (siehe "Nicht übernommen").
 
 #### Kampf
 
@@ -1064,8 +1079,9 @@ schon genau richtig gebaut und muss nur gefüllt werden: `App::break_held` +
   günstigsten als zweiter, separater Test gegen die Entity-AABBs **in derselben
   Reichweite**, dann das nähere Ergebnis gewinnt; kein Umbau des Voxel-Raycasts.
 - Schadenswerte pro Werkzeugstufe, Rüstungsreduktion über die 4 Rüstungsslots.
-- Fernkampf: Bogen (in dieser Ära **unendlich viele Pfeile**) und Pfeil als
-  Projektil-Entity.
+- Fernkampf: Bogen und Pfeil als Projektil-Entity. In dieser Ära schießt der
+  Bogen sofort ohne Aufladen (Aufladen erst Beta 1.8) und hat keine
+  Haltbarkeit; ob Pfeile verbraucht wurden, ist nicht belegt.
 - Knockback beim Treffer in beide Richtungen.
 
 #### Interaktion ("Benutzen")
@@ -1123,15 +1139,16 @@ Weltseitige Reaktionen (Nachbar-Updates, geplante Ticks) stehen unter
 
 #### Reiten
 
-Schwein (mit Sattel, in dieser Ära nur Richtungssteuerung ohne Karotte), Lore
-(mit Sitz-Animation seit a1.0.4), Boot (Rechtsklick zum Einsteigen, zerbricht an
+Schwein (mit Sattel; in dieser Ära nicht steuerbar, es läuft selbst — gelenkt
+wird erst ab Java 1.4.2), Lore, Boot (Rechtsklick zum Einsteigen, zerbricht an
 Land). Hängt vollständig am Entity-System. Die Kamera muss dafür einem Entity
 statt `player.feet_position` folgen — `sync_camera_to_player_eye`
 (`app/mod.rs:1068`) ist die eine Stelle, die das entscheidet.
 
 #### Bewusst abweichend
 
-Sprint und Schleichen gibt es in der Vorlage nicht (kamen erst in Alpha 1.2.0),
+Sprint und Schleichen gibt es in der Vorlage nicht (Sprinten kam mit Beta 1.8,
+Schleichen mit Alpha v1.1.1),
 im Code aber schon (`InputAction::Sprint`/`Sneak`, `sprint_swim_active`). Nach
 der Grundregel oben bleiben beide. Sneak bekommt mit Survival zusätzlich seine
 klassische Aufgabe: nicht über Kanten laufen, und `on_use` überspringen.
@@ -1143,10 +1160,13 @@ Komplett nicht vorhanden. Hängt an Block-States (Signalstärke = 4 Bit in
 Neighbor-Updates und Scheduled Ticks" — die dort vorgeschlagene generische
 Tick-Queue ist die verallgemeinerte Fassung der unten genannten Fluid-Queue.
 
-- Redstone-Staub mit Signalstärke 0-15 und Ausbreitung über 15 Blöcke.
-- Redstone-Fackel als Inverter (mit Burnout-Verhalten der Ära).
+- Redstone-Staub: in der Vorlage nur an oder aus; abgestufte Signalstärke mit
+  sichtbarer Abdunklung kam erst mit Beta 1.3, eine Reichweitengrenze ist für
+  a1.0.17 nicht belegt. Trotzdem 4 Bit Signalstärke speichern, damit der
+  spätere Ausbau ohne Formatwechsel geht.
+- Redstone-Fackel als Inverter (Burnout ist für a1.0.17 nicht belegt).
 - Signalquellen: Hebel, Steinknopf, Holz-/Steindruckplatte.
-- Verbraucher: Eisentür, Holztür, TNT-Zündung, Notenblock.
+- Verbraucher: Eisentür, Holztür, TNT-Zündung.
 - Umsetzung: **kein** Tick-pro-Block-Scan. Ein `RedstoneSystem: SimSystem` mit
   einer Update-Queue nach dem Muster von `FluidSystem::schedule_fluid_update`
   (`world/fluids.rs:467`) — dort ist die verzögerte, positionsbasierte
@@ -1159,7 +1179,7 @@ Tick-Queue ist die verallgemeinerte Fassung der unten genannten Fluid-Queue.
 ### Storage: Column-Payload v3 für Block-Entities und Entities
 
 **Eigener, vorgezogener TODO — harter Blocker für Kisten, Öfen, Schilder,
-Jukebox, Notenblock, Spawner und jedes Mob/Drop-Item.** Ohne ihn ist jeder
+Jukebox, Spawner und jedes Mob/Drop-Item.** Ohne ihn ist jeder
 Inhalt mit Zustand nach einem Chunk-Unload weg, und das fällt erst beim Testen
 auf, nicht beim Bauen.
 
@@ -1390,18 +1410,16 @@ und keinen Ton im gesamten Repo.
 
 Aus der Vorlage ausdrücklich **nicht** auf die Liste genommen:
 
-- Abschnitt 6 (Multiplayer/SMP) komplett — auf Wunsch ausgeklammert.
-- Far Lands bei ±12.550.820 mit Mesh-Verzerrungen: ein Bug der Vorlage, kein
+- Abschnitt 8 (Multiplayer/SMP) komplett — auf Wunsch ausgeklammert.
+- Far Lands ab 12.550.824: ein Bug der Vorlage, kein
   Feature. Der harte Weltrand mit Boundary-Ocean (`WorldConfig::boundary_ocean`)
   ist die hier gewählte Lösung.
 - `session.lock`: die Vorlage braucht das gegen zwei Java-Instanzen; hier gibt
   es einen asynchronen Save-Writer mit einem Prozess. Aufnehmen erst, wenn
   mehrere Instanzen auf dasselbe Save zeigen können.
-- Die Bug-Liste aus Abschnitt 8 (Score-Anzeige „Score: &e0", riesige Items in
-  Third-Person, Zombie droppt Federn, faktisch deaktiviertes Slime-Spawning) —
-  das sind Fehler der Vorlage, nicht nachzubauen.
-- Java-Version und Protokollversionen (Abschnitt 7 „Technische Features") sind
-  für diese Codebasis gegenstandslos.
+- Fehler der Vorlage: riesige Items in Third-Person und das faktisch
+  deaktivierte natürliche Slime-Spawning (seit a1.0.14) — nicht nachzubauen.
+  Federn als Zombie-Drop waren dagegen Absicht und gehören zum Inhalt.
 
 ## Worldgen
 
@@ -1587,10 +1605,12 @@ Aus der Vorlage ausdrücklich **nicht** auf die Liste genommen:
 Alles hier gehört in die dokumentierte Phasenreihenfolge aus
 `docs/planning/worldgen.md` ("Worldgen Phase Order"), nicht an ihr vorbei.
 
-- **Dungeons**: 7x7x7-Raum aus Bruchstein/moosigem Bruchstein mit Spawner und
-  2 Truhen. Neue Phase *nach* den Carvern und *vor* Erzen, weil der Raum die
-  Erzplatzierung nicht nachträglich zerschneiden soll. Kritisch: der Raum ist
-  größer als eine Chunk-Kante und muss deterministisch aus einem
+- **Dungeons**: Raum aus Bruchstein/bemoostem Bruchstein mit Spawner (Zombie,
+  Skelett oder Spinne) und bis zu 2 Truhen, Loot laut Referenz. Grundfläche
+  nach heutigem Wiki-Stand 7×7 oder 9×9 bei Höhe 6; für a1.0.17 nicht
+  gesondert belegt. Neue Phase *nach* den Carvern und *vor* Erzen, weil der Raum die
+  Erzplatzierung nicht nachträglich zerschneiden soll. Kritisch: der Raum kann
+  über eine Chunkgrenze reichen und muss deterministisch aus einem
   Anker-Chunk erzeugt werden — genau das Muster, das der Erz-Pass für
   nahtstabile Adern schon fährt (Nachbar-Quellchunks sampeln,
   `worldgen/ores.rs`). Kein neuer Nachbearbeitungspass, sondern dieselbe
@@ -1600,13 +1620,14 @@ Alles hier gehört in die dokumentierte Phasenreihenfolge aus
   Material-Cleanup-Phase (5), nicht in einen eigenen Pass —
   `apply_shoreline_pass_to_column` (`chunkgen_worker.rs:1046`) kennt die Wassernähe
   bereits
-- **Zuckerrohr** an Strand- und Flussufern, **Kaktus** auf Sand (max. 3 hoch).
+- **Zuckerrohr** an Stränden, **Kaktus** auf Sand (beide max. 3 hoch).
   Beides in die Foliage-Phase (7) neben Blumen/Pilze; `apply_flowers_to_column`
   (`chunkgen_worker.rs:1474`) ist die direkte Vorlage inklusive
   Untergrundprüfung und Patch-Radius. Beide brauchen erst die Blöcke
-- **Kiesstrände** und **Sand-/Kiesschichten in Höhlen** aus der Vorlage. Sand
-  und Kies existieren als Blöcke; es fehlt die Platzierungsregel in den
-  Surface-Rules bzw. als Nachbearbeitung der Carver-Hohlräume
+- **Kiesstrände** und **Kies-/Erdtaschen unter Tage** aus der Vorlage. Kies
+  und Erde existieren als Blöcke; es fehlt die Strandregel in den
+  Surface-Rules, die Taschen passen als weitere Einträge in den
+  datengetriebenen Erz-Pass
 - **Winterwelten als Welterstellungs-Option mit 25 % Chance**.
   `WorldEnvironment::Winter` und der Schnee-/Eis-Pass
   (`apply_winter_surface_to_column`, `chunkgen_worker.rs:1705`) existieren
@@ -1620,7 +1641,8 @@ Alles hier gehört in die dokumentierte Phasenreihenfolge aus
 - **Nicht gefrorenes Wasser an Kiesstränden** in Winterwelten — eine Ausnahme in
   `winter_surface_supports_snow` (`chunkgen_worker.rs:1685`), sobald Kiesstrände
   existieren
-- **Erzfamilien Diamant, Redstone, Lapis** in die vier Preset-Tabellen in
+- **Erzfamilien Diamant und Redstone** (kein Lapis, der kam mit Beta 1.2)
+  in die vier Preset-Tabellen in
   `worldgen/ores.rs`. Deckt den bereits offenen Punkt "add more ore families
   once replacement/height targets are defined" oben inhaltlich ab: die
   Vorlage liefert die fehlende Zielvorgabe

@@ -26,7 +26,10 @@ Alpha-Version, in der er dazukam.
 |---|---|
 | Biome | keine. Der Generator kennt nur Geländeformen; echte Biome erst in v1.2.0 |
 | Winterwelten (v1.0.4) | 25 % Chance bei der Welterstellung (`SnowCovered` in `level.dat`): Schneefall, dünne Schneeschicht auf allem unter freiem Himmel, die bei Schneefall wächst; offenes Wasser friert zu Eis, außer an Kiesstränden |
+| Ozeane | Wasser unterhalb des Meeresspiegels (vermutlich Y=64; Beta 1.8 senkt ihn um einen Block). Ozeane sind Geländeteile, kein eigenes Biom; Boden aus Erde, Sand und Ton |
+| Strände | Sand- und Kiesstrände; Kiesstrände entfallen erst mit Beta 1.8 |
 | Höhlen | verzweigte Höhlensysteme; Schluchten gibt es noch nicht (Beta 1.8) |
+| Untergrund | Kies- und Erdtaschen, erzartig verteilt (seit Infdev) |
 | Erze | Kohle, Eisen, Gold, Diamant, Redstone (v1.0.1). Gold und Diamant seit v1.0.1 doppelt so häufig. Kein Lapis (Beta 1.2) |
 | Dungeons | Monsterräume mit Spawner und Truhen. Seit v1.0.14 doppelt so häufig. Inhalt u. a. Schwarzpulver, Faden, Weizen, Brot, Eisen, Eimer, Sattel, Redstone, selten Goldapfel, Schallplatten (v1.0.14) |
 | Bäume | normale Eiche und "Fancy"-Eiche (v1.0.6 wieder da, seltener) |
@@ -108,7 +111,9 @@ Lapis, Sandstein, Notenblock, Werfer, farbige Wolle (Beta 1.2), Bett (Beta 1.3).
 - **Fahrzeuge:** Boot zerbricht an Land oder bei Kollision mit Land (v1.0.6).
   Sitzhaltung beim Reiten (v1.0.4); seit v1.0.14 sind Booster-Konstruktionen
   möglich, die Ofen-Lore fährt mit Kohle.
-- **Redstone:** Staub kennt nur an oder aus; Fackeln invertieren. Die
+- **Redstone:** Staub kennt nur an oder aus; abgestufte Signalstärke mit
+  sichtbarer Abdunklung erst in Beta 1.3. Fackeln invertieren. Ob Reichweite
+  und Fackel-Burnout schon wie später begrenzt waren, ist nicht belegt. Die
   Eisentür reagiert nur auf Redstone, die Holztür auf Klick.
 - **Lava** setzt Blöcke in Brand (v1.0.15).
 - **Fluide:** Wasser und Lava fließen dynamisch (seit Infdev).
@@ -143,7 +148,10 @@ a1.0.17_04 zutreffen. Wo [TODO.md](../TODO.md) daraus Punkte übernommen hat,
 gilt diese Fassung:
 
 - Kein Lapis, kein Notenblock, keine Farbstoffe, Wolle nur weiß (alles Beta 1.2).
-- Keine Schluchten (Beta 1.8); Flüsse sind nicht belegt.
+- Keine Schluchten (Beta 1.8); Flüsse sind nicht belegt. Kies liegt an
+  Stränden und in Taschen unter Tage, nicht als Schichten in Höhlen.
+- Redstone-Staub ist nur an oder aus, keine 15 Signalstufen.
+- Die Far Lands beginnen bei 12.550.824.
 - Weizen ist anbaubar (seit Indev), nicht nur ein Drop.
 - Schafe lassen Wolle beim Schlagen fallen; sie regenerieren keine Wolle und
   sind nicht scherbar. Kühe droppen nur Leder, Hühner nur Federn.
@@ -176,6 +184,8 @@ Datei übernimmt keinen Text, nur Fakten.
   [Far Lands](https://minecraft.wiki/w/Far_Lands),
   [Monster Room](https://minecraft.wiki/w/Monster_Room),
   [Ravine](https://minecraft.wiki/w/Ravine),
+  [Ocean](https://minecraft.wiki/w/Ocean),
+  [Gravel](https://minecraft.wiki/w/Gravel),
   [Lapis Lazuli Ore](https://minecraft.wiki/w/Lapis_Lazuli_Ore)
 - Blöcke und Items: [Oak Fence](https://minecraft.wiki/w/Oak_Fence),
   [Wool](https://minecraft.wiki/w/Wool),
@@ -183,7 +193,8 @@ Datei übernimmt keinen Text, nur Fakten.
   [Wheat Seeds](https://minecraft.wiki/w/Wheat_Seeds),
   [Apple](https://minecraft.wiki/w/Apple),
   [Egg](https://minecraft.wiki/w/Egg),
-  [Bow](https://minecraft.wiki/w/Bow)
+  [Bow](https://minecraft.wiki/w/Bow),
+  [Redstone Dust](https://minecraft.wiki/w/Redstone_Dust)
 - Mobs und Mechanik: [Pig](https://minecraft.wiki/w/Pig),
   [Cow](https://minecraft.wiki/w/Cow),
   [Zombie](https://minecraft.wiki/w/Zombie),
