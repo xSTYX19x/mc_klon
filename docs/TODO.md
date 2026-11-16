@@ -2161,16 +2161,16 @@ loading screen, where throughput legitimately outranks frame time.
   - *Akzeptanz:* Voxel-Schritte pro hinzugefügter Sektion sinken um mindestens
     50 %; der `lighting`-Bucket im Stall-Report sinkt; Vergleichstests
     bitgleich; eine entfernte Fackel ist innerhalb eines Frame-Budgets dunkel.
-- **Persistente Heightmaps pro Spalte; Skylight-Seed ohne Vollscan** (neu
-  2026-09-28)
+- **Persistente Heightmaps pro Spalte** (neu 2026-09-28)
   - *Ist:* Es gibt keine gepflegte Heightmap (die Suche nach
     `heightmap|highest` findet nur Worldgen). `build_skylight_seed_columns_
-    for_region` (`world/mod.rs:1925-1964`) iteriert pro Lighting-Task über
-    **alle** geladenen Chunks (`for (&coord, chunk) in &world.chunks`,
-    `:1935`) und scannt jede passende Sektion komplett
-    (`build_snapshot_sky_blocker_top`). `terrain_height_at` scannt die Spalte
-    bei jedem Aufruf von oben (`:3345-3354`). Bei RD 16 sind über 10 000
-    Sektionen geladen.
+    for_region` (`world/mod.rs:2120`) läuft seit 2026-11-16 nur noch die
+    Region-Spalten von oben ab und hört auf, sobald alle 256 Säulen einen
+    Blocker haben (Kosten unabhängig von der Sichtweite, siehe
+    `skylight_seed_region_report`), scannt dabei aber jede Sektion bis zur
+    Oberfläche voxelweise (`build_snapshot_sky_blocker_top`).
+    `terrain_height_at` scannt die Spalte bei jedem Aufruf von oben
+    (`:3547`).
   - *Ziel:* O(1)-Abfrage "höchster lichtblockierender Block" und "höchster
     fester Block" pro (x, z) — für Skylight-Seeds, Niederschlag, Schnee-Tick,
     Spawning und Random-Tick-Auswahl.
@@ -2179,21 +2179,18 @@ loading screen, where throughput legitimately outranks frame time.
     Übertragung: `ColumnHeightmaps { sky_blocker: [i16; 256], surface:
     [i16; 256] }` in einer Map neben `World.chunks`, gepflegt über das
     Welt-Änderungsjournal.
-  - *Vorgehen:* 1) Sofort: in `build_skylight_seed_columns_for_region` statt
-    über alle Chunks über die benötigten Spalten × Sektions-Y-Bereich mit
-    direktem `get` iterieren (16 Lookups pro Spalte). 2) Heightmap-Typ
-    einführen und beim Einfügen einer Sektion sowie bei Block-Änderungen
-    pflegen. 3) Skylight-Seed, `terrain_height_at`, Winter-Tick und
-    Niederschlag darauf umstellen. 4) Optional speichern (getaggter Block im
-    Column-Trailer).
+  - *Vorgehen:* 1) Heightmap-Typ einführen und beim Einfügen einer Sektion
+    sowie bei Block-Änderungen pflegen. 2) Skylight-Seed, `terrain_height_at`,
+    Winter-Tick und Niederschlag darauf umstellen. 3) Optional speichern
+    (getaggter Block im Column-Trailer).
   - *Dateien:* `world/mod.rs`, `render/state.rs` (Winter-Tick `:18789`,
     Niederschlag `:19428`).
-  - *Abhängigkeiten:* Schritt 1 keine; ab Schritt 2 Welt-Änderungsjournal.
-  - *Priorität/Aufwand/Impact:* Schritt 1 **P1**, S; Schritte 2-4 **P2**, M;
-    Impact mittel, wächst mit der Sichtweite.
-  - *Akzeptanz:* Der Trace-Scope der Region-Task-Erzeugung ist unabhängig von
-    der Zahl geladener Chunks (Vergleich RD 8 vs. RD 16); das Lichtergebnis ist
-    bitgleich (bestehende Lighting-Tests).
+  - *Abhängigkeiten:* Welt-Änderungsjournal.
+  - *Priorität/Aufwand/Impact:* **P2**, M; Impact mittel.
+  - *Akzeptanz:* `skylight_seed_region_report` und der Trace-Scope
+    `lighting.region_task_create` sinken weiter; das Lichtergebnis ist
+    bitgleich (`region_seed_columns_match_full_scan_reference` und die
+    bestehenden Lighting-Tests).
 - **Worldgen: 2D-Terrain-Noise pro Spalte statt pro Sektion** (neu 2026-09-28)
   - *Ist:* Die Basis-Terrain-Phase ruft `TerrainGenerator::generate_chunk` für
     jede der 16 Sektionen einer Spalte auf (`render/chunkgen_worker.rs:

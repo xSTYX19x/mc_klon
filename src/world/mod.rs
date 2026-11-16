@@ -2142,38 +2142,45 @@ impl LightEngine {
         world: &World,
         region_coords: &[ChunkCoord],
     ) -> HashMap<(i32, i32), SkylightSeedColumn> {
-        let mut needed_columns = HashSet::with_capacity(region_coords.len());
+        let mut skylight_seed_columns = HashMap::with_capacity(region_coords.len());
         for coord in region_coords {
-            needed_columns.insert((coord.x, coord.z));
-        }
-
-        let mut skylight_seed_columns = HashMap::with_capacity(needed_columns.len());
-        for (&coord, chunk) in &world.chunks {
-            if !needed_columns.contains(&(coord.x, coord.z)) {
+            let key = (coord.x, coord.z);
+            if skylight_seed_columns.contains_key(&key) {
                 continue;
             }
-            let entry = skylight_seed_columns
-                .entry((coord.x, coord.z))
-                .or_insert_with(|| SkylightSeedColumn {
-                    top_loaded_chunk_y: coord.y,
+            // Walk only this column, top-down, with direct lookups: cost is per
+            // region column, not per loaded chunk. The first blocker found for
+            // an x/z is the highest, so the walk stops once all 256 are known.
+            let mut column: Option<SkylightSeedColumn> = None;
+            let mut unresolved = CHUNK_SIZE * CHUNK_SIZE;
+            for chunk_y in (world.min_chunk_y()..=world.max_chunk_y()).rev() {
+                let Some(chunk) = world.chunks.get(&ChunkCoord {
+                    x: coord.x,
+                    y: chunk_y,
+                    z: coord.z,
+                }) else {
+                    continue;
+                };
+                let entry = column.get_or_insert(SkylightSeedColumn {
+                    top_loaded_chunk_y: chunk_y,
                     top_blocker_world_y: [i32::MIN; 256],
                 });
-            if coord.y > entry.top_loaded_chunk_y {
-                entry.top_loaded_chunk_y = coord.y;
+                let chunk_base_y = chunk_y * CHUNK_SIZE;
+                for (idx, &local_top) in build_snapshot_sky_blocker_top(&chunk.blocks)
+                    .iter()
+                    .enumerate()
+                {
+                    if local_top >= 0 && entry.top_blocker_world_y[idx] == i32::MIN {
+                        entry.top_blocker_world_y[idx] = chunk_base_y + local_top as i32;
+                        unresolved -= 1;
+                    }
+                }
+                if unresolved == 0 {
+                    break;
+                }
             }
-
-            let chunk_base_y = coord.y * CHUNK_SIZE;
-            for (idx, &local_top) in build_snapshot_sky_blocker_top(&chunk.blocks)
-                .iter()
-                .enumerate()
-            {
-                if local_top < 0 {
-                    continue;
-                }
-                let blocker_world_y = chunk_base_y + local_top as i32;
-                if blocker_world_y > entry.top_blocker_world_y[idx] {
-                    entry.top_blocker_world_y[idx] = blocker_world_y;
-                }
+            if let Some(column) = column {
+                skylight_seed_columns.insert(key, column);
             }
         }
         skylight_seed_columns
