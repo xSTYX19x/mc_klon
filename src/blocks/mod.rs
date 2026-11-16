@@ -63,6 +63,21 @@ pub(crate) const TEX_BROWN_WOOL: &str = "minecraft:textures/block/brown_wool.png
 pub(crate) const TEX_GREEN_WOOL: &str = "minecraft:textures/block/green_wool.png";
 pub(crate) const TEX_RED_WOOL: &str = "minecraft:textures/block/red_wool.png";
 pub(crate) const TEX_BLACK_WOOL: &str = "minecraft:textures/block/black_wool.png";
+pub(crate) const TEX_DIAMOND_ORE: &str = "minecraft:textures/block/diamond_ore.png";
+pub(crate) const TEX_REDSTONE_ORE: &str = "minecraft:textures/block/redstone_ore.png";
+pub(crate) const TEX_DIAMOND_BLOCK: &str = "minecraft:textures/block/diamond_block.png";
+pub(crate) const TEX_CLAY: &str = "minecraft:textures/block/clay.png";
+pub(crate) const TEX_CRAFTING_TABLE_TOP: &str = "minecraft:textures/block/crafting_table_top.png";
+pub(crate) const TEX_CRAFTING_TABLE_SIDE: &str = "minecraft:textures/block/crafting_table_side.png";
+pub(crate) const TEX_CRAFTING_TABLE_FRONT: &str =
+    "minecraft:textures/block/crafting_table_front.png";
+pub(crate) const TEX_FURNACE_TOP: &str = "minecraft:textures/block/furnace_top.png";
+pub(crate) const TEX_FURNACE_SIDE: &str = "minecraft:textures/block/furnace_side.png";
+pub(crate) const TEX_FURNACE_FRONT: &str = "minecraft:textures/block/furnace_front.png";
+pub(crate) const TEX_FURNACE_FRONT_ON: &str = "minecraft:textures/block/furnace_front_on.png";
+pub(crate) const TEX_JUKEBOX_TOP: &str = "minecraft:textures/block/jukebox_top.png";
+pub(crate) const TEX_JUKEBOX_SIDE: &str = "minecraft:textures/block/jukebox_side.png";
+pub(crate) const TEX_SPAWNER: &str = "minecraft:textures/block/spawner.png";
 pub(crate) const CORE_FURNACE_STUB_BLOCK_ENTITY_KEY: &str = "core:furnace_stub";
 pub(crate) const CORE_MISSING_BLOCK_KEY: &str = "core:missing";
 
@@ -378,6 +393,15 @@ enum BlockModelSpec {
         side: TextureKey,
         bottom: TextureKey,
     },
+    /// A full cube with its own texture on every face.
+    CubeFaces {
+        up: TextureKey,
+        down: TextureKey,
+        north: TextureKey,
+        south: TextureKey,
+        east: TextureKey,
+        west: TextureKey,
+    },
     LayerBottomTopSideBottom {
         height_px: u8,
         top: TextureKey,
@@ -526,6 +550,28 @@ impl BlockSpec {
         particle_color: [f32; 3],
     ) -> Self {
         let model = BlockModelSpec::CubeTopSideBottom { top, side, bottom };
+        Self::new(key, display_name, model, particle_color)
+    }
+
+    /// A cube with one `front` face. Blocks have no facing state yet, so the
+    /// front is fixed to south: the side face the inventory preview shows.
+    const fn cube_front(
+        key: &'static str,
+        display_name: &'static str,
+        top: TextureKey,
+        bottom: TextureKey,
+        side: TextureKey,
+        front: TextureKey,
+        particle_color: [f32; 3],
+    ) -> Self {
+        let model = BlockModelSpec::CubeFaces {
+            up: top,
+            down: bottom,
+            north: side,
+            south: front,
+            east: side,
+            west: side,
+        };
         Self::new(key, display_name, model, particle_color)
     }
 
@@ -704,6 +750,29 @@ impl BlockSpec {
                     self.render_layer,
                     cull_group,
                 )
+            }
+            BlockModelSpec::CubeFaces {
+                up,
+                down,
+                north,
+                south,
+                east,
+                west,
+            } => {
+                let mut def = BlockDef::cube_all(
+                    up,
+                    self.solid,
+                    self.breakable,
+                    self.face_occluding,
+                    self.render_layer,
+                    cull_group,
+                );
+                def.textures[Face::Down.as_usize()] = down;
+                def.textures[Face::North.as_usize()] = north;
+                def.textures[Face::South.as_usize()] = south;
+                def.textures[Face::East.as_usize()] = east;
+                def.textures[Face::West.as_usize()] = west;
+                def
             }
             BlockModelSpec::GrassTopSideBottom { top, side, bottom } => BlockDef::grass(
                 top,
@@ -1046,6 +1115,65 @@ blocks! {
         [0.96, 0.97, 1.0],
     )
     .non_occluding(),
+    DiamondOre => BlockSpec::cube(
+        "minecraft:diamond_ore", "Diamond Ore", TEX_DIAMOND_ORE, [0.46, 0.54, 0.54],
+    )
+    .with_creative_order(43),
+    RedstoneOre => BlockSpec::cube(
+        "minecraft:redstone_ore", "Redstone Ore", TEX_REDSTONE_ORE, [0.55, 0.43, 0.43],
+    )
+    .with_creative_order(44),
+    LitRedstoneOre => BlockSpec::cube(
+        "minecraft:lit_redstone_ore", "Redstone Ore (Lit)", TEX_REDSTONE_ORE, [0.55, 0.43, 0.43],
+    )
+    .with_light(9)
+    .with_creative_order(45),
+    DiamondBlock => BlockSpec::cube(
+        "minecraft:diamond_block", "Diamond Block", TEX_DIAMOND_BLOCK, [0.38, 0.93, 0.90],
+    )
+    .with_creative_order(46),
+    Clay => BlockSpec::cube("minecraft:clay", "Clay", TEX_CLAY, [0.63, 0.65, 0.70])
+        .with_creative_order(47),
+    SnowBlock => BlockSpec::cube("minecraft:snow_block", "Snow Block", TEX_SNOW, [0.96, 0.97, 1.0])
+        .with_creative_order(48),
+    // Fronts on two adjacent faces like vanilla's north/west pair, turned so the
+    // inventory preview (south and east faces) shows one front and one side.
+    CraftingTable => BlockSpec::new(
+        "minecraft:crafting_table", "Crafting Table",
+        BlockModelSpec::CubeFaces {
+            up: TEX_CRAFTING_TABLE_TOP,
+            down: TEX_OAK_PLANKS,
+            north: TEX_CRAFTING_TABLE_SIDE,
+            south: TEX_CRAFTING_TABLE_FRONT,
+            east: TEX_CRAFTING_TABLE_SIDE,
+            west: TEX_CRAFTING_TABLE_FRONT,
+        },
+        [0.55, 0.45, 0.30],
+    )
+    .with_creative_order(49),
+    Furnace => BlockSpec::cube_front(
+        "minecraft:furnace", "Furnace", TEX_FURNACE_TOP, TEX_FURNACE_TOP, TEX_FURNACE_SIDE,
+        TEX_FURNACE_FRONT, [0.37, 0.37, 0.37],
+    )
+    .with_creative_order(50),
+    LitFurnace => BlockSpec::cube_front(
+        "minecraft:lit_furnace", "Furnace (Lit)", TEX_FURNACE_TOP, TEX_FURNACE_TOP,
+        TEX_FURNACE_SIDE, TEX_FURNACE_FRONT_ON, [0.37, 0.37, 0.37],
+    )
+    .with_light(13)
+    .with_creative_order(51),
+    Jukebox => BlockSpec::cube_top_side_bottom(
+        "minecraft:jukebox", "Jukebox", TEX_JUKEBOX_TOP, TEX_JUKEBOX_SIDE, TEX_JUKEBOX_SIDE,
+        [0.36, 0.24, 0.17],
+    )
+    .with_creative_order(52),
+    Spawner => BlockSpec::cube(
+        "minecraft:spawner", "Monster Spawner", TEX_SPAWNER, [0.14, 0.17, 0.24],
+    )
+    .with_layer(RenderLayer::Cutout)
+    .with_cull(CullGroupSpec::None)
+    .non_occluding()
+    .with_creative_order(53),
 }
 
 #[inline(always)]
@@ -2150,8 +2278,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        BlockId, Face, FaceCoverage, OcclusionShape, block_spec_for, grass_random_tick,
-        sapling_random_tick, sapling_set_stage,
+        BlockId, BlockRegistry, CLASSIC_PALETTE, Face, FaceCoverage, OcclusionShape, RenderLayer,
+        TEX_CRAFTING_TABLE_FRONT, TEX_FURNACE_FRONT, TEX_FURNACE_FRONT_ON, block_spec_for,
+        grass_random_tick, sapling_random_tick, sapling_set_stage,
     };
     use crate::world::{CHUNK_SIZE, Chunk, ChunkCoord, World};
 
@@ -2218,6 +2347,47 @@ mod tests {
                 block
             );
         }
+    }
+
+    /// The plain a1.0.17 cubes: layer, light, fronts, and their palette slots.
+    #[test]
+    fn plain_alpha_cubes_render_as_declared() {
+        let opaque = [
+            BlockId::DiamondOre,
+            BlockId::RedstoneOre,
+            BlockId::LitRedstoneOre,
+            BlockId::DiamondBlock,
+            BlockId::Clay,
+            BlockId::SnowBlock,
+            BlockId::CraftingTable,
+            BlockId::Furnace,
+            BlockId::LitFurnace,
+            BlockId::Jukebox,
+        ];
+        for block in opaque {
+            assert_eq!(block_spec_for(block).render_layer, RenderLayer::Opaque);
+            assert_eq!(block.occlusion_shape(), OcclusionShape::FullCube);
+            assert!(block.is_solid() && block.blocks_skylight(), "{block:?}");
+        }
+        assert_eq!(BlockId::LitRedstoneOre.emitted_light(), 9);
+        assert_eq!(BlockId::LitFurnace.emitted_light(), 13);
+        assert_eq!(BlockId::RedstoneOre.emitted_light(), 0);
+
+        // Cutout and see-through like glass, but still a solid block.
+        let spawner = BlockId::Spawner;
+        assert_eq!(block_spec_for(spawner).render_layer, RenderLayer::Cutout);
+        assert_eq!(spawner.occlusion_shape(), OcclusionShape::Decorative);
+        assert!(spawner.is_solid() && !spawner.blocks_skylight());
+
+        let registry = BlockRegistry::get();
+        let front = |block| registry.texture_key_for(block, Face::South);
+        assert_eq!(front(BlockId::Furnace), TEX_FURNACE_FRONT);
+        assert_eq!(front(BlockId::LitFurnace), TEX_FURNACE_FRONT_ON);
+        assert_eq!(front(BlockId::CraftingTable), TEX_CRAFTING_TABLE_FRONT);
+
+        let mut appended = opaque.to_vec();
+        appended.push(spawner);
+        assert_eq!(&CLASSIC_PALETTE[43..], appended.as_slice());
     }
 
     #[test]
@@ -2330,6 +2500,7 @@ mod interaction_shape_tests {
             BlockModelSpec::None => false,
             BlockModelSpec::CubeAll { .. }
             | BlockModelSpec::CubeTopSideBottom { .. }
+            | BlockModelSpec::CubeFaces { .. }
             | BlockModelSpec::GrassTopSideBottom { .. }
             // A liquid *source* fills the cell; flowing levels render lower, but
             // their height lives in block data, which a per-spec shape cannot

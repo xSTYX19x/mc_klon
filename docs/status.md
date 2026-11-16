@@ -51,6 +51,7 @@ That direction is now active in the code:
 
 - every block is declared once in the `blocks!` macro (`src/blocks/mod.rs`), which generates `BlockId`, the spec table, and `BLOCK_COUNT`; runtime ids follow declaration order and only grow by appending
 - block specs are built from defaults (`BlockSpec::cube` / `cube_top_side_bottom` / `plant` plus `with_*` modifiers), so an ordinary new block is a single entry
+- full cubes can carry a texture per face (`CubeFaces`); the furnace keeps a fixed south front (`BlockSpec::cube_front`) until blocks have a facing state
 - the creative palette is sorted from each block's `creative_order` at compile time
 - `BlockRegistry::get()` is a static view over the table; nothing is rebuilt per saved or loaded column
 

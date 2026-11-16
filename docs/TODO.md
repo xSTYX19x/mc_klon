@@ -670,13 +670,12 @@ isolierter, kleiner Change.
 
 ### Blöcke (Inhalt)
 
-Heute registriert: 51 IDs (`blocks!`, `blocks/mod.rs`). Fehlend gegenüber
+Heute registriert: 62 IDs (`blocks!`, `blocks/mod.rs`). Fehlend gegenüber
 der Vorlage. Der Blocktextur-Bestand deckt fast alles ab
 (`assets/minecraft/textures/block/`, 2113 Dateien inkl. Normal-/Specular-
-Varianten): `torch`, `ladder`, `clay`, `cactus_*`, `sugar_cane`, `diamond_ore`,
-`redstone_ore`, `lapis_ore`, `crafting_table_*`, `furnace_*`, `jukebox_*`,
-`note_block`, `spawner`, `rail`, `lever`, `redstone_dust_*`, `oak_door_*` sind
-alle vorhanden — für diese Blöcke fehlt also nur die `BlockSpec`-Zeile. Die
+Varianten): `torch`, `ladder`, `cactus_*`, `sugar_cane`, `lapis_ore`,
+`note_block`, `rail`, `lever`, `redstone_dust_*`, `oak_door_*` sind
+alle vorhanden — für diese Blöcke fehlt also nur der `blocks!`-Eintrag. Die
 **Kiste** hat im modernen Layout keine Blocktextur, sondern eine Entity-Textur;
 `textures/entity/chest/` liegt inzwischen vor (`normal`, `normal_left`,
 `normal_right`, `trapped*`, `ender`), das Kistenmodell muss also als
@@ -687,20 +686,8 @@ Planken bzw. Stein — beim Modellbau bewusst so umsetzen.
 **Ohne neue Blockform (billig, je ein Eintrag im Makro `blocks!` in
 `blocks/mod.rs`; `with_creative_order` reiht ihn in die Palette ein):**
 
-- Diamanterz, Redstone-Erz, Diamantblock. (Lapis gehört nicht zu a1.0.17,
-  er kam mit Beta 1.2.) Erz-Seite: neue Einträge in
-  den vier Tabellen in `worldgen/ores.rs` (`FLATISH_/CLASSIC_FLATTER_/
-  RD161348_LIKE_/HILLY_ORE_TABLE`, `ores.rs:183-216`) — der Pass ist bereits
-  datengetrieben, es kommen nur Zeilen dazu (auch hier feste Arraylänge,
-  heute `[OreFeatureConfig; 3]`). Achtung: der Test
-  `ore_density_stays_within_tolerance_across_presets` (Toleranz 1.6x) gilt auch
-  für neue Erze, die Höhenbänder müssen also pro Preset an der Terrain-Hülle
-  ausgerichtet werden — genau wie bei Kohle beschrieben in `docs/planning/worldgen.md`.
-- Tonblock (Clay), Schneeblock (der heutige `BlockId::Snow` ist die 2px-**Decke**,
-  nicht der Vollblock), Werkbank, Ofen (an/aus als zwei Texturen-Sätze),
-  Jukebox, Kiste. (Der Notenblock kam erst mit Beta 1.2.)
-- Redstone-Erz mit Leucht-Zustand: `emitted_light` ist in `BlockSpec` schon da
-  (heute nur Lava = 15, `blocks/mod.rs:912,936`), also nur ein zweiter Spec.
+- Kiste — braucht allerdings das Entity-artige Modell von oben, ist also kein
+  reiner Tabelleneintrag. (Notenblock und Lapis kamen erst mit Beta 1.2.)
 
 **Mit neuer Blockform (hängt an der Block-State-Voraussetzung oben):**
 
@@ -769,6 +756,45 @@ Planken bzw. Stein — beim Modellbau bewusst so umsetzen.
   aber derzeit ungenutzt (Compiler-Warnung `never used`) — beim Clippy-Aufräumen
   nicht löschen.
 - Obsidian ist vorhanden, muss aber explosionsresistent sein, sobald TNT lebt.
+- Redstone-Erz umschalten: beide Zustände gibt es seit 2026-11-16 als eigene
+  Blöcke (`RedstoneOre`, `LitRedstoneOre` mit Licht 9). Offen ist der Wechsel:
+  Anklicken oder Betreten macht das Erz leuchtend, ein Random-Tick schaltet es
+  zurück. Hängt an den Interaktions-Hooks ("Survival-Gameplay / Interaktion")
+  und "Architektur / Block-Verhalten". Mit der Block-State-Schicht können
+  beide zu einem Block mit `lit`-Property werden (alter Name als Alias).
+- **Monster-Spawner: Block-Entity und Spawn-Logik** (neu 2026-11-16)
+  - *Ist:* Seit 2026-11-16 gibt es den Block (`BlockId::Spawner`,
+    `minecraft:spawner`): ein Cutout-Würfel, der wie Glas keine Nachbarflächen
+    verdeckt und Licht durchlässt, fest und abbaubar, in der Creative-Palette.
+    Er hat keine Block-Entity und spawnt nichts; der Dungeon-Pass, der ihn
+    setzen soll, fehlt ebenfalls (Worldgen "Dungeons").
+  - *Ziel:* Spawner wie in der Vorlage: ein Mob-Typ pro Spawner (Zombie,
+    Skelett, Spinne; im Dungeon zufällig), der Spawner erzeugt Mobs in seiner
+    Nähe, solange ein Spieler nah genug ist; im Käfig dreht sich eine kleine
+    Figur des Mobs.
+  - *Vorbild:* Alpha `TileEntityMobSpawner` bzw. Vanilla `BaseSpawner`:
+    Verzögerungszähler, mehrere Spawn-Versuche pro Zyklus in einem Würfel um
+    den Block, aktiv nur mit Spieler in der Nähe, Obergrenze gleichartiger
+    Mobs ringsum. Die Zahlen (Vanilla: Spieler in 16 Blöcken, bis zu 4 Mobs
+    pro Zyklus, Pause 200-799 Ticks, höchstens 6 gleichartige in der Nähe)
+    vor der Umsetzung gegen die Referenz prüfen.
+  - *Vorgehen:* 1) Block-Entity-Typ `spawner` mit Mob-Typ und Verzögerung
+    (`world/block_entity_types.rs`, wie der Ofen-Stub) und
+    `with_block_entity` am `blocks!`-Eintrag. 2) Tick im
+    `BlockEntitiesSystem`: Spielerabstand prüfen, Verzögerung herunterzählen,
+    Spawn-Versuche über das Entity-Fundament. 3) Mob-Typ und Verzögerung über
+    Column-Payload v3 speichern. 4) Mini-Figur im Käfig über den
+    Entity-Renderer. 5) Der Dungeon-Pass setzt Spawner mit zufälligem Mob-Typ.
+  - *Dateien:* `blocks/mod.rs`, `world/block_entity_types.rs`,
+    `world/block_entities_system.rs`, `storage/chunk_codec.rs` (v3),
+    Worldgen-Dungeon-Pass.
+  - *Abhängigkeiten:* Entity-Fundament ("Entities & Mobs"), Column-Payload v3
+    ("Storage").
+  - *Priorität/Aufwand/Impact:* **P3**, M, mittel (spielrelevant erst mit
+    Dungeons).
+  - *Akzeptanz:* Ein gesetzter Zombie-Spawner erzeugt in Spielernähe Zombies,
+    bei weit entferntem Spieler keine; Mob-Typ und Verzögerung überleben
+    Speichern und Laden.
 
 ### Items, Inventar & Crafting
 
@@ -818,7 +844,7 @@ Inhalt danach, in der Reihenfolge der Abhängigkeit:
   `durability`) gehören in die `ITEM_SPECS`-Tabelle; die *Wirkung* (Abbauzeit,
   Verschleiß) steht unter "Survival-Gameplay", weil sie nur dort greift.
 - Drops beim Abbau (inkl. Setzling 1/20 aus Laub, Ton→4 Tonbällchen,
-  Kies→Feuerstein-Chance). Äpfel fallen in der Vorlage nicht aus Laub (erst
+  Kies→Feuerstein-Chance; Bücherregal droppt nichts). Äpfel fallen in der Vorlage nicht aus Laub (erst
   Java 1.1), und Laub zerfällt nicht. Ohne Entity-System zunächst
   direkt ins Inventar; die Item-Entity kommt am Entity-Punkt.
 - Crafting: 2×2 im Inventar, 3×3 an der Werkbank. Rezepte als deklarative
@@ -830,6 +856,10 @@ Inhalt danach, in der Reihenfolge der Abhängigkeit:
   *Korrektur 2026-09-28:* der Stub hängt heute testweise an **Obsidian**
   (`blocks/mod.rs:979`) und zählt nur einen Zähler hoch
   (`world/block_entity_types.rs:58-89`); beim Anlegen des Ofens umhängen.
+  Den Block gibt es seit 2026-11-16 als `Furnace` und `LitFurnace` (Licht 13)
+  mit fester Front nach Süden (`BlockSpec::cube_front`); dazu gehören das
+  Umschalten zwischen beiden beim Brennen und, mit `Facing4` aus der
+  Block-State-Schicht, die Ausrichtung zum Spieler beim Platzieren.
 - Rüstung (Leder/Eisen/Gold/Diamant, 4 Slots), Bogen + Pfeile.
 - Nahrung: Apfel, Goldapfel, Brot, rohes/gebratenes Schwein, Pilzsuppe. In dieser Ära heilt
   Essen **sofort** und es gibt keine Hungerleiste. `Player::food_level`
@@ -1629,7 +1659,16 @@ Alles hier gehört in die dokumentierte Phasenreihenfolge aus
   in die vier Preset-Tabellen in
   `worldgen/ores.rs`. Deckt den bereits offenen Punkt "add more ore families
   once replacement/height targets are defined" oben inhaltlich ab: die
-  Vorlage liefert die fehlende Zielvorgabe
+  Vorlage liefert die fehlende Zielvorgabe. Die Blöcke gibt es seit
+  2026-11-16 (`BlockId::DiamondOre`, `BlockId::RedstoneOre`); der Pass ist
+  datengetrieben, es kommen nur Zeilen in `FLATISH_/CLASSIC_FLATTER_/
+  RD161348_LIKE_/HILLY_ORE_TABLE` dazu (feste Arraylänge, heute
+  `[OreFeatureConfig; 3]`). Der Test
+  `ore_density_stays_within_tolerance_across_presets` (Toleranz 1.6x) gilt
+  auch für die neuen Erze, die Höhenbänder müssen also pro Preset an der
+  Terrain-Hülle ausgerichtet werden, wie bei Kohle in
+  `docs/planning/worldgen.md` beschrieben. `LitRedstoneOre` setzt der
+  Worldgen nie
 - **Meere: Wasserfüllung bis `sea_level`** (neu 2026-09-28)
   - *Ist:* Es gibt **keinen** Meeres-/Ozean-Füllschritt: `sea_level` begrenzt
     nur Lava-Seen und Quellstarts (`render/chunkgen_worker.rs:396`,
