@@ -116,3 +116,161 @@ impl SimSystem for RandomTicksSystem {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blocks::BlockId;
+    use crate::world::{BlockChange, Chunk, ChunkBlocks};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    const VOXELS: usize = (CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE) as usize;
+
+    /// The full-sampling loop as it was before sections without random-ticking
+    /// blocks were skipped: every loaded section draws its samples.
+    fn reference_fixed_tick(world: &mut World, ticks_per_chunk: u32, tick_index: u64) {
+        let registry = BlockRegistry::new();
+        let mut coords: Vec<ChunkCoord> = world.chunks.keys().copied().collect();
+        coords.sort_unstable_by_key(|c| (c.x, c.y, c.z));
+        let world_seed = world.seed();
+        for coord in coords {
+            let mut rng = Rng64::new(RandomTicksSystem::chunk_tick_seed(
+                world_seed, coord, tick_index,
+            ));
+            for _ in 0..ticks_per_chunk {
+                let local_x = (rng.next_u32() % CHUNK_SIZE as u32) as i32;
+                let local_y = (rng.next_u32() % CHUNK_SIZE as u32) as i32;
+                let local_z = (rng.next_u32() % CHUNK_SIZE as u32) as i32;
+                let pos = IVec3::new(
+                    coord.x * CHUNK_SIZE + local_x,
+                    coord.y * CHUNK_SIZE + local_y,
+                    coord.z * CHUNK_SIZE + local_z,
+                );
+                let state = world.get_block(pos);
+                if let Some(random_tick) = registry.random_tick_for(state) {
+                    random_tick(world, pos, state, tick_index);
+                }
+            }
+        }
+    }
+
+    /// Stone everywhere, and one section (0, 4, 0) with a grass/dirt layer
+    /// under open air plus grass buried under stone. Only that section has
+    /// random-ticking blocks, and nothing it does reaches another section, so
+    /// the result cannot depend on the order sections are visited in.
+    fn one_live_section_world() -> World {
+        let mut world = World::new();
+        let data = Arc::new(vec![0u8; VOXELS]);
+        let light = Arc::new(vec![0u8; VOXELS]);
+        for cx in -2..=2 {
+            for cz in -2..=2 {
+                for cy in 0..4 {
+                    world.chunks.insert(
+                        ChunkCoord {
+                            x: cx,
+                            y: cy,
+                            z: cz,
+                        },
+                        Chunk::from_parts(
+                            ChunkBlocks::Uniform(BlockId::Stone),
+                            Arc::clone(&data),
+                            Arc::clone(&light),
+                            0,
+                        ),
+                    );
+                }
+            }
+        }
+        let mut live = vec![BlockId::Air; VOXELS];
+        for z in 0..CHUNK_SIZE {
+            for x in 0..CHUNK_SIZE {
+                for y in 0..8 {
+                    live[Chunk::index(x, y, z)] = BlockId::Stone;
+                }
+                live[Chunk::index(x, 8, z)] = if (x + z) % 3 == 0 {
+                    BlockId::Grass
+                } else {
+                    BlockId::Dirt
+                };
+            }
+        }
+        for x in 2..6 {
+            live[Chunk::index(x, 6, 2)] = BlockId::Grass;
+        }
+        world.chunks.insert(
+            ChunkCoord { x: 0, y: 4, z: 0 },
+            Chunk::from_parts(ChunkBlocks::compact(live), data, light, 0),
+        );
+        world
+    }
+
+    #[test]
+    fn skipping_matches_full_sampling_reference() {
+        let is_active = |_: i32, _: i32| true;
+        let mut system_world = one_live_section_world();
+        let mut reference_world = one_live_section_world();
+        let mut system = RandomTicksSystem::new(64);
+        let (mut got, mut want) = (Vec::<BlockChange>::new(), Vec::<BlockChange>::new());
+        for tick in 0..60 {
+            system.fixed_tick(
+                &mut system_world,
+                0.05,
+                tick,
+                ActiveSimColumns {
+                    is_active: &is_active,
+                },
+            );
+            reference_fixed_tick(&mut reference_world, 64, tick);
+        }
+        system_world.drain_block_changes(&mut got);
+        reference_world.drain_block_changes(&mut want);
+        assert!(!want.is_empty(), "the reference changed nothing");
+        assert_eq!(got, want);
+    }
+
+    /// Before/after numbers for `docs/TODO.md` "Random Ticks: Sektionen ohne
+    /// tickbare Blöcke überspringen". Run with
+    /// `cargo test --release random_tick_cost_report -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing report, run manually in release"]
+    fn random_tick_cost_report() {
+        let mut world = World::new();
+        for cx in -2..=2 {
+            for cz in -2..=2 {
+                world.ensure_column_generated(cx * CHUNK_SIZE, cz * CHUNK_SIZE);
+            }
+        }
+        let sections = world.chunks.len();
+        let is_active = |_: i32, _: i32| true;
+        let mut journal = Vec::new();
+        for (speed, ticks) in [(3u32, 2000u64), (1000, 20)] {
+            let mut system = RandomTicksSystem::new(speed);
+            let (mut sampled, mut callbacks, mut changes) = (0usize, 0usize, 0usize);
+            let start = Instant::now();
+            for tick in 0..ticks {
+                system.fixed_tick(
+                    &mut world,
+                    0.05,
+                    tick,
+                    ActiveSimColumns {
+                        is_active: &is_active,
+                    },
+                );
+                sampled += system.sampled_last_tick;
+                callbacks += system.callbacks_last_tick;
+                world.drain_block_changes(&mut journal);
+                changes += journal.len();
+                journal.clear();
+            }
+            let per_tick_ms = start.elapsed().as_secs_f64() * 1000.0 / ticks as f64;
+            println!(
+                "speed {speed:4}: {sections} sections, {per_tick_ms:8.3} ms per tick, \
+                 {} samples, {} callbacks, {:.2} changes per tick",
+                sampled as u64 / ticks,
+                callbacks as u64 / ticks,
+                changes as f64 / ticks as f64
+            );
+        }
+    }
+}
