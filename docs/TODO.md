@@ -71,10 +71,12 @@ nächsten billiger macht:
     (c) Lighting-Klassifikation und Fluid-Notify laufen pro Position
     (`process_pending_block_edit_side_effects`, höchstens 8 Edits bzw. 1,5 ms
     pro Frame); ein Baum sind ~60 Einzel-Edits. Gemessen auf 152 Sektionen
-    Terrain: Random-Tick-Speed 3 erzeugt ~0,8 Änderungen pro Tick, Speed 1000
-    ~58 pro Tick — weit über dem Durchsatz, die Queue wächst dann. Spieler-Edits
-    haben deshalb eine eigene, vorrangige Queue
-    (`pending_player_block_edits`).
+    Terrain (ohne Spalten-Pässe): Random-Tick-Speed 3 erzeugt ~0,8 Änderungen
+    pro Tick, Speed 1000 ~58 pro Tick — weit über dem Durchsatz, die Queue
+    wächst dann. Es ist fast nur einmaliges Einpendeln frisch generierter
+    Oberfläche (siehe Worldgen "Oberfläche im Gleichgewicht mit den
+    Gras-Regeln generieren"). Spieler-Edits haben deshalb eine eigene,
+    vorrangige Queue (`pending_player_block_edits`).
   - *Ziel:* Genau ein Weg, auf dem Block-Änderungen Nebenwirkungen auslösen,
     egal ob Spieler, Sim-System, Explosion, Befehl oder Entity sie verursacht,
     und der auch viele Änderungen auf einmal billig verarbeitet.
@@ -165,8 +167,11 @@ nächsten billiger macht:
     mit Signatur `fn(&mut World, IVec3, BlockState, …)`. 2) `FluidScheduler`
     zu einem generischen `TickScheduler<K>` verallgemeinern und eine Instanz
     für Blöcke anlegen; die Fluids behalten ihre. 3) Ein
-    `BlockUpdatesSystem: SimSystem` leert pro Tick das Welt-Journal
-    (Punkt oben), ruft für die 6 Nachbarn jeder Änderung `on_neighbor_changed`
+    `BlockUpdatesSystem: SimSystem` verarbeitet pro Tick die Änderungen aus
+    dem Welt-Journal (Punkt oben; das Journal leert seit 2026-11-16 `State`
+    nach jedem Sim-System, `apply_world_block_changes` — das System braucht
+    also die Batch von `State` oder einen eigenen Lesezeiger in `World`),
+    ruft für die 6 Nachbarn jeder Änderung `on_neighbor_changed`
     auf (Tiefenlimit gegen Kettenreaktionen, Vanilla: 512) und arbeitet fällige
     Scheduled Ticks mit Budget ab. 4) Sand-Check aus `State` hierher umziehen
     und mit Kies zusammenführen (`falls: bool` in `BlockSpec`). 5) Pruning nach
@@ -1522,6 +1527,52 @@ Aus der Vorlage ausdrücklich **nicht** auf die Liste genommen:
   - *Akzeptanz:* Die Doku nennt alle 8 Phasen und den richtigen Default.
 
 ### Medium priority
+- **Oberfläche im Gleichgewicht mit den Gras-Regeln generieren** (neu
+  2026-11-16)
+  - *Ist:* Gemessen mit der vollen Spalten-Pipeline
+    (`generate_streaming_column_for_test`, 25 Spalten) liegt über 16 %
+    (ClassicFlatter: 1 165 von 7 332) bzw. 26 % (Hilly: 2 220 von 8 392) aller
+    Grasblöcke ein Block, der Himmelslicht blockiert: meist Gras (1 042 /
+    1 304) oder Erde (12 / 856), dazu Eichenstamm und Laub (Baumfüße,
+    tiefes Laub) und Sand (Ufer). Wahrscheinliche Hauptursache:
+    `WorldgenPipeline::generate_chunk` setzt feste Voxel nach dem
+    interpolierten Dichte-Gitter (`density_cache.sample`,
+    `worldgen/pipeline.rs:146`), `top_y` aber nach der exakten Heightmap
+    (`:157-199`). Wo die Interpolation darüber hinausragt, bekommt der Überhang
+    Erde (`surface_rules.rs`: `y >= top_y - dirt_depth`) über dem Gras auf
+    `top_y`, und `apply_surface_dirt_to_grass_in_column`
+    (`render/chunkgen_worker.rs:961`) macht die neue oberste Erde zu Gras →
+    Gras auf Gras. Bäume setzen Stämme auf Gras, ohne es umzuwandeln.
+    `grass_random_tick` (`blocks/mod.rs:2422`) wandelt all das in den ersten
+    Minuten nach dem Laden in Erde um; seit dem Welt-Änderungsjournal kostet
+    jede solche Änderung einen Edit in der Pipeline und macht die Spalte
+    save-dirty. Jede besuchte Spalte wird so einmal ohne sichtbaren Grund
+    neu gemesht und gespeichert. Offene Erde neben Gras ist vernachlässigbar
+    (11 bzw. 0 in 25 Spalten). Hinweis: `World::ensure_column_generated` läuft
+    ohne die Spalten-Pässe (Promotion, Ufer, Bäume) und eignet sich für solche
+    Messungen nicht.
+  - *Ziel:* Eine frisch generierte Spalte enthält kein Gras, das die
+    Gras-Regel sofort zurücksetzen würde; Random Ticks erzeugen auf
+    unberührtem Terrain keine Änderungen.
+  - *Vorbild:* Vanilla wandelt Gras unter Baumstämmen bei der Platzierung in
+    Erde um; Surface-Rules arbeiten auf der tatsächlichen Oberfläche des
+    Dichtefelds.
+  - *Vorgehen:* 1) Surface-Rule auf den obersten tatsächlich festen Voxel
+    beziehen (`top_local_per_column` aus der Solid-Maske existiert schon,
+    `worldgen/pipeline.rs:133-153`) oder Gras nur setzen, wo der Voxel darüber
+    nicht fest ist. 2) Abschließender Spalten-Pass nach Bäumen, Blumen und
+    Winter: Gras unter einem Himmelslicht-Blocker oder Fluid wird Erde (genau
+    die Regel aus `grass_random_tick`; `apply_post_fixes_to_chunk` macht das
+    heute nur für Wasser). 3) Test über alle Presets.
+  - *Dateien:* `worldgen/pipeline.rs`, `worldgen/surface_rules.rs`,
+    `render/chunkgen_worker.rs`.
+  - *Abhängigkeiten:* keine.
+  - *Priorität/Aufwand/Impact:* **P2**, S, mittel (spart pro besuchter Spalte
+    einen Remesh und einen Speichervorgang; Grasseiten an Terrainstufen werden
+    gleich korrekt generiert).
+  - *Akzeptanz:* Für alle Presets 0 verschüttete Grasblöcke in 25 Spalten
+    der vollen Pipeline; 20 Random Ticks mit Speed 1000 auf einem frisch
+    generierten Bereich erzeugen keine `Grass → Dirt`-Änderung.
 - **Nahtsichere `HiddenOnly`-Prüfung für Erze** (neu formuliert 2026-09-28;
   bisher High: "add neighbor-aware exposed-air checks so `HiddenOnly` ores are
   trustworthy at chunk borders")
@@ -1963,6 +2014,39 @@ looks like a win. The startup burst path stays exempt: it runs behind the
 loading screen, where throughput legitimately outranks frame time.
 
 ### Other performance work
+
+- **Random Ticks: Sektionen ohne tickbare Blöcke überspringen** (neu
+  2026-11-16)
+  - *Ist:* `RandomTicksSystem::fixed_tick` (`world/random_ticks_system.rs:74`)
+    zieht in **jeder** geladenen Sektion der aktiven Spalten
+    `ticks_per_chunk` zufällige Positionen, auch in reinen Stein- oder
+    Luftsektionen, und baut die aktive Sektionsliste jeden Tick durch Filtern
+    aller `world.chunks` neu auf. Gemessen auf 152 Sektionen generierter
+    Welt, Speed 1000: 152 000 Stichproben pro Tick, nur 1 359 treffen einen
+    Block mit Random Tick (unter 1 %); das bloße Ziehen und Nachschlagen kostet
+    68,7 von 71,4 ms pro Tick (Debug), Release 4,5 ms. Speed 3: 0,23 ms (Debug)
+    bzw. 0,02 ms (Release). Im Spiel bemerkt bei Speed 1000 als Ruckeln, das
+    beim offenen Inventar verschwindet, weil dann die Simulation pausiert
+    (`gameplay_active`, `app/mod.rs:3860`).
+  - *Ziel:* Kosten proportional zu den Sektionen mit tickbaren Blöcken.
+  - *Vorbild:* Vanilla `LevelChunkSection.isRandomlyTicking()` mit
+    `tickingBlockCount`, gepflegt in `setBlockState` und `recalcBlockCounts`.
+    Direkt übertragbar.
+  - *Vorgehen:* 1) `Chunk` zählt zufällig tickende Blöcke neben
+    `filled_voxel_count`/`solid_voxel_count` (`world/chunk.rs:13-14`),
+    gepflegt in `Chunk::set` und `recompute_cached_block_classification`;
+    dafür eine schnelle `BlockId::has_random_tick()`-Abfrage aus `BlockSpec`.
+    2) `RandomTicksSystem` überspringt Sektionen mit Zähler 0. Das Ergebnis
+    bleibt bitgleich, weil der RNG pro Sektion geseedet wird
+    (`chunk_tick_seed`). 3) Optional die aktive Sektionsliste inkrementell
+    pflegen statt jeden Tick alle Chunks zu filtern.
+  - *Dateien:* `world/chunk.rs`, `world/random_ticks_system.rs`,
+    `blocks/mod.rs`.
+  - *Abhängigkeiten:* keine.
+  - *Priorität/Aufwand/Impact:* **P2**, S; hoch bei hohem Tick-Speed oder
+    großer Sim-Distanz, sonst gering.
+  - *Akzeptanz:* Gleiche Szene, Speed 1000: ms pro Tick sinken um mindestens
+    80 %; die Journal-Einträge über 20 Ticks sind identisch zu vorher.
 
 - finish the streaming-lag hunt — the open half of the reported symptom. Measured after the fixes in `docs/performance/audit-2026-08.md`: streaming frames are median **10.6 ms / p90 53.1 ms**, and `state.process_dirty_chunk_meshes` alone is **mean 12.9 ms**, ~60 % of a 21 ms frame. Chunk apply is no longer the cost (104 ms → 0.51 ms per applied chunk). The p90 spikes are what feels laggy, and they never cross the 200 ms stall threshold, so no stall report ever contained them. Open: where the remaining ~9 ms/frame inside `process_dirty_chunk_meshes` goes. The `gpu.csv` breakdown columns answer this from one normal play session — read them before changing anything else here
 - document reproducible startup and streaming benchmark scenes as a baseline
