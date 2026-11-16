@@ -61,7 +61,14 @@ fn push_cross_plant(
         [x + 1.0, y + 1.0, z + 1.0],
         [x + 0.0, y + 1.0, z + 0.0],
     ];
-    push_double_sided_quad(quad_a, [uv0, uv1, uv2, uv3], tex_layer, light, vertices, indices);
+    push_double_sided_quad(
+        quad_a,
+        [uv0, uv1, uv2, uv3],
+        tex_layer,
+        light,
+        vertices,
+        indices,
+    );
 
     let quad_b = [
         [x + 1.0, y + 0.0, z + 0.0],
@@ -69,7 +76,14 @@ fn push_cross_plant(
         [x + 0.0, y + 1.0, z + 1.0],
         [x + 1.0, y + 1.0, z + 0.0],
     ];
-    push_double_sided_quad(quad_b, [uv0, uv1, uv2, uv3], tex_layer, light, vertices, indices);
+    push_double_sided_quad(
+        quad_b,
+        [uv0, uv1, uv2, uv3],
+        tex_layer,
+        light,
+        vertices,
+        indices,
+    );
 }
 
 fn push_double_sided_quad(

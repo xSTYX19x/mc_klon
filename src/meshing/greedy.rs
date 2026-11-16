@@ -2133,7 +2133,14 @@ mod simd_uv_tests {
         let mut simd_mesh = super::super::WorldCpuMeshData::default();
 
         let light = 0x93;
-        push_textured_quad_scalar(&mut scalar_mesh, positions, uvs, tex_layer, tint_kind, light);
+        push_textured_quad_scalar(
+            &mut scalar_mesh,
+            positions,
+            uvs,
+            tex_layer,
+            tint_kind,
+            light,
+        );
         push_textured_quad_simd(&mut simd_mesh, positions, uvs, tex_layer, tint_kind, light);
 
         // Compare vertices
