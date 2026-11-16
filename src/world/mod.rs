@@ -42,6 +42,7 @@ pub(crate) struct World {
     preset: WorldgenPreset,
     generator: Box<dyn ChunkGenerator + Send + Sync>,
     pending_block_entity_block_changes: Vec<BlockEntityBlockChange>,
+    block_changes: Vec<BlockChange>,
     ticking_areas: Vec<TickingArea>,
     next_ticking_area_id: u32,
     manifest: WorldManifest,
@@ -659,6 +660,105 @@ mod tests {
 }
 
 #[cfg(test)]
+mod block_change_journal_tests {
+    use super::{BlockChange, ChunkCoord, SetBlockError, World};
+    use crate::blocks::BlockId;
+    use glam::IVec3;
+
+    fn drained(world: &mut World) -> Vec<BlockChange> {
+        let mut out = Vec::new();
+        world.drain_block_changes(&mut out);
+        out
+    }
+
+    #[test]
+    fn setters_journal_every_real_change_and_nothing_else() {
+        let mut world = World::new();
+        let pos = IVec3::new(3, 4, 5);
+
+        world.set_block(pos, BlockId::Stone).unwrap();
+        assert_eq!(
+            drained(&mut world),
+            vec![BlockChange {
+                pos,
+                old: BlockId::Air,
+                new: BlockId::Stone,
+                old_data: 0,
+                new_data: 0,
+            }]
+        );
+
+        // Rewriting the same block and data is not a change.
+        world.set_block(pos, BlockId::Stone).unwrap();
+        world
+            .set_block_and_data_loaded_only(pos, BlockId::Stone, 0)
+            .unwrap();
+        assert!(drained(&mut world).is_empty());
+
+        // A data-only write is a change (fluid level, sapling stage).
+        world
+            .set_block_and_data_loaded_only(pos, BlockId::Stone, 7)
+            .unwrap();
+        let data_only = drained(&mut world);
+        assert_eq!(data_only.len(), 1);
+        assert_eq!((data_only[0].old_data, data_only[0].new_data), (0, 7));
+        assert_eq!(data_only[0].old, data_only[0].new);
+
+        // Clearing the last block also drops the now-empty chunk; still one
+        // change, carrying the old data.
+        world.set_block(pos, BlockId::Air).unwrap();
+        assert!(world.get_chunk(ChunkCoord { x: 0, y: 0, z: 0 }).is_none());
+        assert_eq!(
+            drained(&mut world),
+            vec![BlockChange {
+                pos,
+                old: BlockId::Stone,
+                new: BlockId::Air,
+                old_data: 7,
+                new_data: 0,
+            }]
+        );
+
+        // Failed or no-op writes leave nothing behind.
+        assert_eq!(
+            world.set_block_and_data_loaded_only(pos, BlockId::Stone, 0),
+            Err(SetBlockError::ChunkNotLoaded)
+        );
+        world.set_block(pos, BlockId::Air).unwrap();
+        assert!(
+            world
+                .set_block(IVec3::new(0, -1, 0), BlockId::Stone)
+                .is_err()
+        );
+        assert!(drained(&mut world).is_empty());
+    }
+
+    #[test]
+    fn journal_keeps_order_across_setters() {
+        let mut world = World::new();
+        let a = IVec3::new(1, 1, 1);
+        let b = IVec3::new(2, 1, 1);
+        world.set_block(a, BlockId::Dirt).unwrap();
+        world
+            .set_block_and_data_loaded_only(b, BlockId::Grass, 0)
+            .unwrap();
+        world.set_block(a, BlockId::Stone).unwrap();
+        let order: Vec<(IVec3, BlockId, BlockId)> = drained(&mut world)
+            .into_iter()
+            .map(|c| (c.pos, c.old, c.new))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (a, BlockId::Air, BlockId::Dirt),
+                (b, BlockId::Air, BlockId::Grass),
+                (a, BlockId::Dirt, BlockId::Stone),
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
 mod skylight_seed_tests {
     use super::{
         CHUNK_SIZE, Chunk, ChunkBlocks, ChunkCoord, LightEngine, SkylightSeedColumn, World,
@@ -885,6 +985,19 @@ pub(crate) struct BlockEntityBlockChange {
     pub(crate) pos: IVec3,
     pub(crate) old_block: BlockId,
     pub(crate) new_block: BlockId,
+}
+
+/// One entry of the world change journal: every successful `set_block*` that
+/// actually changed a voxel (block or data). The frame thread drains it and
+/// runs the side effects (remesh, light, fluid notify, save-dirty) through one
+/// pipeline, whoever made the change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BlockChange {
+    pub(crate) pos: IVec3,
+    pub(crate) old: BlockId,
+    pub(crate) new: BlockId,
+    pub(crate) old_data: u8,
+    pub(crate) new_data: u8,
 }
 
 #[derive(Clone)]
@@ -2905,6 +3018,7 @@ impl World {
             preset,
             generator,
             pending_block_entity_block_changes: Vec::new(),
+            block_changes: Vec::new(),
             ticking_areas: Vec::new(),
             next_ticking_area_id: 1,
             manifest,
@@ -3455,10 +3569,7 @@ impl World {
 
         let chunk_coord = Self::world_to_chunk_coord(world_pos);
         let local = Self::world_to_local(world_pos);
-        let old_block = self
-            .chunks
-            .get(&chunk_coord)
-            .map_or(BlockId::Air, |chunk| chunk.get(local.x, local.y, local.z));
+        let (old_block, old_data) = self.block_and_data_in(chunk_coord, local);
 
         if id == BlockId::Air {
             let mut remove_chunk = false;
@@ -3470,15 +3581,7 @@ impl World {
             if remove_chunk {
                 self.chunks.remove(&chunk_coord);
             }
-            if old_block != id && (block_has_block_entity(old_block) || block_has_block_entity(id))
-            {
-                self.pending_block_entity_block_changes
-                    .push(BlockEntityBlockChange {
-                        pos: world_pos,
-                        old_block,
-                        new_block: id,
-                    });
-            }
+            self.record_block_change(world_pos, old_block, old_data, id, 0);
             return Ok(());
         }
 
@@ -3488,14 +3591,7 @@ impl World {
             .or_insert_with(Chunk::new_empty);
         chunk.set(local.x, local.y, local.z, id);
         chunk.set_data(local.x, local.y, local.z, data);
-        if old_block != id && (block_has_block_entity(old_block) || block_has_block_entity(id)) {
-            self.pending_block_entity_block_changes
-                .push(BlockEntityBlockChange {
-                    pos: world_pos,
-                    old_block,
-                    new_block: id,
-                });
-        }
+        self.record_block_change(world_pos, old_block, old_data, id, data);
         Ok(())
     }
 
@@ -3515,10 +3611,7 @@ impl World {
         }
 
         let local = Self::world_to_local(world_pos);
-        let old_block = self
-            .chunks
-            .get(&chunk_coord)
-            .map_or(BlockId::Air, |chunk| chunk.get(local.x, local.y, local.z));
+        let (old_block, old_data) = self.block_and_data_in(chunk_coord, local);
 
         if id == BlockId::Air {
             let mut remove_chunk = false;
@@ -3530,15 +3623,7 @@ impl World {
             if remove_chunk {
                 self.chunks.remove(&chunk_coord);
             }
-            if old_block != id && (block_has_block_entity(old_block) || block_has_block_entity(id))
-            {
-                self.pending_block_entity_block_changes
-                    .push(BlockEntityBlockChange {
-                        pos: world_pos,
-                        old_block,
-                        new_block: id,
-                    });
-            }
+            self.record_block_change(world_pos, old_block, old_data, id, 0);
             return Ok(());
         }
 
@@ -3547,15 +3632,56 @@ impl World {
         };
         chunk.set(local.x, local.y, local.z, id);
         chunk.set_data(local.x, local.y, local.z, data);
-        if old_block != id && (block_has_block_entity(old_block) || block_has_block_entity(id)) {
+        self.record_block_change(world_pos, old_block, old_data, id, data);
+        Ok(())
+    }
+
+    fn block_and_data_in(&self, chunk_coord: ChunkCoord, local: LocalCoord) -> (BlockId, u8) {
+        self.chunks
+            .get(&chunk_coord)
+            .map_or((BlockId::Air, 0), |chunk| {
+                (
+                    chunk.get(local.x, local.y, local.z),
+                    chunk.get_data(local.x, local.y, local.z),
+                )
+            })
+    }
+
+    /// Feeds the change journal (only real changes, data included) and the
+    /// block-entity queue (only block swaps touching a block entity).
+    fn record_block_change(
+        &mut self,
+        pos: IVec3,
+        old: BlockId,
+        old_data: u8,
+        new: BlockId,
+        new_data: u8,
+    ) {
+        if old == new && old_data == new_data {
+            return;
+        }
+        self.block_changes.push(BlockChange {
+            pos,
+            old,
+            new,
+            old_data,
+            new_data,
+        });
+        if old != new && (block_has_block_entity(old) || block_has_block_entity(new)) {
             self.pending_block_entity_block_changes
                 .push(BlockEntityBlockChange {
-                    pos: world_pos,
-                    old_block,
-                    new_block: id,
+                    pos,
+                    old_block: old,
+                    new_block: new,
                 });
         }
-        Ok(())
+    }
+
+    /// Moves every journaled change since the last drain into `out`, oldest
+    /// first. Whoever calls a setter must drain before the next producer runs,
+    /// so each batch can be attributed to its source.
+    pub(crate) fn drain_block_changes(&mut self, out: &mut Vec<BlockChange>) {
+        out.append(&mut self.block_changes);
     }
 
     pub(crate) fn drain_block_entity_block_changes(

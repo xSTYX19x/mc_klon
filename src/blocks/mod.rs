@@ -2843,8 +2843,13 @@ pub(crate) fn debug_assert_block_blueprint_integrity(block_registry: &BlockRegis
 mod tests {
     use glam::IVec3;
 
-    use super::{BlockId, Face, FaceCoverage, OcclusionShape, block_spec_for, grass_random_tick};
-    use crate::world::World;
+    use std::collections::HashMap;
+
+    use super::{
+        BlockId, Face, FaceCoverage, OcclusionShape, block_spec_for, grass_random_tick,
+        sapling_random_tick, sapling_set_stage,
+    };
+    use crate::world::{CHUNK_SIZE, Chunk, ChunkCoord, World};
 
     #[test]
     fn stone_slab_occludes_partially_and_stops_skylight() {
@@ -2922,6 +2927,65 @@ mod tests {
         grass_random_tick(&mut world, pos, BlockId::Grass, 0);
 
         assert_eq!(world.get_block(pos), BlockId::Dirt);
+    }
+
+    /// The bug the world change journal fixes: a random tick grew a tree
+    /// straight into `World`, and nothing downstream (mesh, light, save) heard
+    /// of it. Every block the tree placed must now be in the journal.
+    #[test]
+    fn sapling_growth_journals_every_tree_block() {
+        let mut world = World::new();
+        let sapling = IVec3::new(8, 1, 8);
+        let ground = sapling - IVec3::Y;
+        world.set_block(ground, BlockId::Grass).unwrap();
+        world
+            .set_block_and_data(sapling, BlockId::Sapling, sapling_set_stage(0, 1))
+            .unwrap();
+        // Room for the tallest preset, and enough light to grow.
+        world
+            .chunks
+            .insert(ChunkCoord { x: 0, y: 1, z: 0 }, Chunk::new_empty());
+        world.set_light_packed(sapling + IVec3::Y, 0xF0);
+        let mut journal = Vec::new();
+        world.drain_block_changes(&mut journal);
+        journal.clear();
+
+        let mut tick = 0u64;
+        while world.get_block(sapling) == BlockId::Sapling {
+            assert!(tick < 10_000, "the sapling never grew");
+            sapling_random_tick(&mut world, sapling, BlockId::Sapling, tick);
+            tick += 1;
+        }
+        world.drain_block_changes(&mut journal);
+
+        let journaled: HashMap<IVec3, BlockId> = journal
+            .iter()
+            .map(|change| (change.pos, change.new))
+            .collect();
+        let mut tree_blocks = 0usize;
+        for y in 0..2 * CHUNK_SIZE {
+            for z in 0..CHUNK_SIZE {
+                for x in 0..CHUNK_SIZE {
+                    let pos = IVec3::new(x, y, z);
+                    let block = world.get_block(pos);
+                    if matches!(block, BlockId::OakLog | BlockId::OakLeaves) {
+                        tree_blocks += 1;
+                        assert_eq!(
+                            journaled.get(&pos),
+                            Some(&block),
+                            "{block:?} at {pos:?} was placed without a journal entry"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(tree_blocks > 1, "no tree was placed");
+        assert_eq!(journaled.get(&ground), Some(&BlockId::Dirt));
+        assert_eq!(
+            journal.len(),
+            tree_blocks + 1,
+            "journal holds exactly the tree plus the grass turned to dirt"
+        );
     }
 }
 

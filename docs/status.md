@@ -112,6 +112,7 @@ That direction is now active in the code:
 - fixed simulation tick (20 TPS)
 - simulation distance separated from render distance
 - fluids, block entities, and random ticks run through the sim-system path
+- world change journal: every `World::set_block*` change is journaled and drained into the block-edit pipeline (remesh, light, save-dirty), so random-tick changes like grown trees are rendered and saved
 
 ## Runtime Caveats That Are Still Real
 

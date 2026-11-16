@@ -41,8 +41,8 @@ ohne späteren Umbau hineinpassen? Die Punkte stehen dort, wo sie thematisch
 hingehören; diese Liste gibt die **Reihenfolge** vor, weil jeder Schritt den
 nächsten billiger macht:
 
-1. Welt-Änderungsjournal (unten) — behebt einen echten Bug und ist die
-   Voraussetzung für alles, was die Welt außerhalb von Spieler-Edits ändert.
+1. Welt-Änderungsjournal (unten) — Grundgerüst steht seit 2026-11-16; offen
+   sind Batch-Pfad und das Angleichen der Sonderpfade.
 2. Block-Registry per Makro, `BlockId` → `u16` vorbereiten (unten).
 3. Block-State-Datenschicht (→ "Content-Abgleich / Querschnitts-Voraussetzung:
    Block-States").
@@ -56,49 +56,40 @@ nächsten billiger macht:
 9. Biome und Multi-Noise-Terrain (→ "Worldgen / Biome & Multi-Noise-Terrain").
 10. Wetter und Himmelslicht (unten).
 
-- **Welt-Änderungsjournal: jede Block-Änderung läuft durch dieselbe Pipeline**
-  - *Ist:* Die Nebenwirkungen eines Edits (Remesh-Dirty, Licht-Reparatur,
-    Fluid-Notify, Sand-Check, Save-Dirty) hängen an
-    `State::enqueue_pending_block_edit` (`render/state.rs:17464`), das nur
-    Spieler-Edits (`:19192`, `:19356`), der Winter-Tick
-    (`try_apply_environment_block_change`, `:18770-18786`) und Fluid-Positionen
-    (`:18952-18963`) erreichen. `World::set_block*` (`world/mod.rs:3219-3336`)
-    selbst meldet nichts. **Bug:** Random Ticks laufen als `SimSystem` direkt
-    gegen `World` (`world/random_ticks_system.rs:111`) — Gras-Ausbreitung
-    (`blocks/mod.rs:2439`, `:2475`) und Setzlingswachstum
-    (`place_sapling_tree`, `:2699-2716`) ändern Blöcke, ohne dass Mesh, Licht
-    oder Save-Dirty davon erfahren. Ein gewachsener Baum bleibt unsichtbar, bis
-    der Chunk aus anderem Grund neu gemesht wird, und geht beim Entladen
-    verloren, wenn die Spalte nicht aus anderem Grund in `dirty_columns` steht
-    (`render/state.rs:14156`).
+- **Welt-Änderungsjournal: Batch-Pfad und Sonderpfade angleichen**
+  - *Ist:* Seit 2026-11-16 füllen beide `World::set_block*`-Setter ein Journal
+    (`BlockChange`, `World::drain_block_changes`). `State` leert es nach jedem
+    Sim-System, nach dem Winter-Tick und nach Spieler-Edits
+    (`apply_world_block_changes` / `enqueue_world_block_changes` mit
+    `BlockChangeSource`) in die Edit-Pipeline; damit sehen Mesh, Licht und
+    Save-Dirty auch Random-Tick-Änderungen (Bäume, Gras). Noch nicht
+    angeglichen: (a) Fluid-Änderungen laufen weiter über den eigenen
+    Fluid-Mesh-Coalescer, der Sand-Fall über eigene Inline-Nebenwirkungen —
+    beide verwerfen ihre Journal-Einträge (`HandledInline`). (b)
+    `pending_block_entity_block_changes` ist eine zweite Queue neben dem
+    Journal, weil `BlockEntitiesSystem` sie innerhalb des Sim-Ticks leert.
+    (c) Lighting-Klassifikation und Fluid-Notify laufen pro Position
+    (`process_pending_block_edit_side_effects`); ein Baum sind ~60 Einzel-Edits.
   - *Ziel:* Genau ein Weg, auf dem Block-Änderungen Nebenwirkungen auslösen,
-    egal ob Spieler, Sim-System, Explosion, Befehl oder Entity sie verursacht.
+    egal ob Spieler, Sim-System, Explosion, Befehl oder Entity sie verursacht,
+    und der auch viele Änderungen auf einmal billig verarbeitet.
   - *Vorbild:* Vanilla `Level.setBlock` mit Update-Flags (Nachbarn
-    benachrichtigen, neu rendern, dirty markieren). Ohne Client/Server reicht
-    ein Journal, das der Frame-Thread leert. Rust-Übertragung: ein
-    `Vec<BlockChange { pos, old, new, old_data, new_data }>` in `World`, das
-    alle Setter füllen — kein Callback, kein Trait-Objekt.
-  - *Vorgehen:* 1) `World::changes: Vec<BlockChange>` plus
-    `drain_block_changes(&mut Vec<_>)`; alle `set_block*`-Varianten pushen
-    (ersetzt nebenbei `pending_block_entity_block_changes`,
-    `world/mod.rs:3250-3334`). 2) `State` leert das Journal nach
-    `fixed_sim_tick` und nach jedem Spieler-Edit und speist
-    `enqueue_pending_block_edit`. 3) Die direkten Aufrufe an den heutigen
-    Stellen entfallen, damit nichts doppelt läuft. 4) Batch-Pfad für viele
-    Änderungen auf einmal (TNT, `/fill`, Baum): Dirty-Marken koalesziert
-    `pending_block_edit_dirty_chunks` schon pro Chunk (`render/state.rs:5473`,
-    Flush `:16368-16402`); Lighting-Klassifikation und Fluid-Notify laufen aber
-    pro Position (`:17565-17590`) und brauchen für Batches eine Region-Variante.
-  - *Dateien:* `world/mod.rs`, `world/random_ticks_system.rs`,
-    `world/block_entities_system.rs`, `render/state.rs` (Edit-Pipeline
-    `:17464-17647`).
-  - *Abhängigkeiten:* keine. Voraussetzung für Neighbor-Updates/Scheduled
-    Ticks, TNT, Redstone und Entities, die Blöcke ändern.
-  - *Priorität/Aufwand/Impact:* **P1**, M, hoch (Bugfix + Fundament).
-  - *Akzeptanz:* Test ohne GPU: ein Random Tick lässt einen Setzling wachsen →
-    das Journal enthält alle Stamm-/Laubpositionen. Im Spiel: Setzling bei
-    hochgedrehtem `RANDOM_TICK_SPEED` wächst sichtbar, und der Baum ist nach
-    Entladen/Neuladen der Spalte noch da.
+    benachrichtigen, neu rendern, dirty markieren).
+  - *Vorgehen:* 1) Batch-Pfad für viele Änderungen auf einmal (TNT, `/fill`,
+    Baum): Dirty-Marken koalesziert `pending_block_edit_dirty_chunks` schon pro
+    Chunk; Lighting-Klassifikation und Fluid-Notify brauchen eine
+    Region-Variante. 2) Fluids und Sand über denselben Abnehmer führen, mit
+    Flags statt eigener Pfade (z. B. "koaleszierter Remesh" als Option der
+    Pipeline). 3) Block-Entity-Änderungen aus dem Journal ableiten und die
+    zweite Queue streichen.
+  - *Dateien:* `world/mod.rs`, `world/block_entities_system.rs`,
+    `render/state.rs` (Edit-Pipeline, Fluid-Coalescer, `try_drop_sand_block`).
+  - *Abhängigkeiten:* keine. Voraussetzung für TNT, Redstone und Entities, die
+    viele Blöcke ändern.
+  - *Priorität/Aufwand/Impact:* **P2**, M, mittel.
+  - *Akzeptanz:* `/fill` über 10 000 Blöcke erzeugt eine Lighting-Region pro
+    betroffenem Chunk statt 10 000 Einzelreparaturen; Fluid- und Sand-Pfad
+    verwerfen keine Journal-Einträge mehr.
 
 - **Block-Registry per Makro, `BlockId` auf `u16` vorbereiten**
   - *Ist:* Ein neuer Block braucht Handarbeit an vier Stellen: Enum-Variante

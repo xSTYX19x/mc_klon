@@ -105,8 +105,8 @@ use crate::world::raycast::{RAYCAST_MAX_DISTANCE, raycast_world};
 use crate::world::ticking_areas::{self, TickingArea, TickingFlags};
 use crate::world::time::WorldTime;
 use crate::world::{
-    CHUNK_SIZE, Chunk, ChunkCoord, ClassifiedLightingBlockChange, IncrementalLightingResult,
-    IncrementalLightingStepLimits, IncrementalLightingTask, LightLevel,
+    BlockChange, CHUNK_SIZE, Chunk, ChunkCoord, ClassifiedLightingBlockChange,
+    IncrementalLightingResult, IncrementalLightingStepLimits, IncrementalLightingTask, LightLevel,
     LocalizedLightingRepairStats, LocalizedLightingRepairStepLimits, LocalizedLightingRepairTask,
     PrecipitationKind, SetBlockError, WORLD_MAX_Y, World, WorldConfig, WorldEnvironment,
 };
@@ -133,6 +133,22 @@ struct PendingBlockEdit {
     pos: IVec3,
     old: BlockId,
     new: BlockId,
+    /// Break particles belong to the player breaking a block, not to a random
+    /// tick turning grass into dirt.
+    spawn_particles: bool,
+}
+
+/// Who produced a batch of journaled world changes
+/// (`World::drain_block_changes`); decides how the frame thread handles it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockChangeSource {
+    /// Player break/place: edit pipeline, break particles, streaming mining hold.
+    Player,
+    /// Sim systems and environment ticks: edit pipeline only.
+    Simulation,
+    /// Producers that already ran their own side effects (fluid mesh
+    /// coalescer, inline sand drop): the batch is dropped so nothing runs twice.
+    HandledInline,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5470,6 +5486,8 @@ pub(crate) struct State {
     mesh_schedule: HashMap<ChunkCoord, ChunkMeshSchedule>,
     deferred_mesh_until_frame: HashMap<ChunkCoord, u64>,
     pending_block_edits: VecDeque<PendingBlockEdit>,
+    /// Reused buffer for draining `World`'s change journal.
+    world_block_change_scratch: Vec<BlockChange>,
     pending_block_edit_dirty_chunks: HashMap<ChunkCoord, ChunkMeshDirtySet>,
     pending_block_edit_dirty_columns: HashSet<(i32, i32)>,
     pending_block_edit_lighting_batches: HashMap<u64, BlockEditLightingBatch>,
@@ -10416,6 +10434,7 @@ impl State {
             mesh_schedule: HashMap::new(),
             deferred_mesh_until_frame: HashMap::new(),
             pending_block_edits: VecDeque::new(),
+            world_block_change_scratch: Vec::new(),
             pending_block_edit_dirty_chunks: HashMap::new(),
             pending_block_edit_dirty_columns: HashSet::new(),
             pending_block_edit_lighting_batches: HashMap::new(),
@@ -17469,10 +17488,51 @@ impl State {
         }
     }
 
-    fn enqueue_pending_block_edit(&mut self, pos: IVec3, old: BlockId, new: BlockId) {
-        self.pending_block_edits
-            .push_back(PendingBlockEdit { pos, old, new });
-        self.stream_recent_mining_frames = SURFACE_STREAM_MINING_HOLD_FRAMES;
+    /// Drains `World`'s change journal and runs it through the edit pipeline.
+    ///
+    /// Invariant: every `State` path that calls a `World` setter calls this
+    /// (or `enqueue_world_block_changes`) right after, before any other
+    /// producer runs, so each batch is attributed to the code that made it.
+    fn apply_world_block_changes(&mut self, source: BlockChangeSource) {
+        let mut changes = std::mem::take(&mut self.world_block_change_scratch);
+        self.world.drain_block_changes(&mut changes);
+        self.enqueue_world_block_changes(&changes, source);
+        changes.clear();
+        self.world_block_change_scratch = changes;
+    }
+
+    fn enqueue_world_block_changes(&mut self, changes: &[BlockChange], source: BlockChangeSource) {
+        if source == BlockChangeSource::HandledInline {
+            return;
+        }
+        for change in changes {
+            if change.old == change.new {
+                // Data-only (e.g. a sapling's growth stage): nothing to remesh
+                // or relight, but the column must still be saved.
+                self.mark_column_dirty_for_chunk(World::world_to_chunk_coord(change.pos));
+                continue;
+            }
+            self.enqueue_pending_block_edit(change.pos, change.old, change.new, source);
+        }
+    }
+
+    fn enqueue_pending_block_edit(
+        &mut self,
+        pos: IVec3,
+        old: BlockId,
+        new: BlockId,
+        source: BlockChangeSource,
+    ) {
+        let by_player = source == BlockChangeSource::Player;
+        self.pending_block_edits.push_back(PendingBlockEdit {
+            pos,
+            old,
+            new,
+            spawn_particles: by_player,
+        });
+        if by_player {
+            self.stream_recent_mining_frames = SURFACE_STREAM_MINING_HOLD_FRAMES;
+        }
     }
 
     fn enqueue_pending_sand_gravity_check(&mut self, pos: IVec3) {
@@ -17585,8 +17645,9 @@ impl State {
 
             self.enqueue_pending_sand_gravity_check(edit.pos);
 
-            // Spawn particles only for block destruction, not placement.
-            if edit.new == BlockId::Air
+            // Spawn particles only for block destruction by the player.
+            if edit.spawn_particles
+                && edit.new == BlockId::Air
                 && particles_spawned + PARTICLE_SPAWN_COUNT
                     <= BLOCK_EDIT_PARTICLES_MAX_SPAWN_PER_FRAME
             {
@@ -17901,8 +17962,11 @@ impl State {
             let _ = self
                 .world
                 .set_block_and_data_loaded_only(pos, BlockId::Sand, 0);
+            self.apply_world_block_changes(BlockChangeSource::HandledInline);
             return false;
         }
+        // The drop runs its own side effects below.
+        self.apply_world_block_changes(BlockChangeSource::HandledInline);
         self.mark_chunk_user_only_if_unknown(World::world_to_chunk_coord(pos));
         self.mark_chunk_user_only_if_unknown(World::world_to_chunk_coord(landing));
         self.sync_generated_empty_chunk_marker(World::world_to_chunk_coord(pos));
@@ -18783,15 +18847,10 @@ impl State {
         if old_block == new_block {
             return false;
         }
-        if self
-            .world
+        // Side effects run when `fixed_sim_tick` drains the journal.
+        self.world
             .set_block_and_data_loaded_only(pos, new_block, 0)
-            .is_err()
-        {
-            return false;
-        }
-        self.enqueue_pending_block_edit(pos, old_block, new_block);
-        true
+            .is_ok()
     }
 
     fn apply_winter_surface_tick(&mut self, tick_index: u64) {
@@ -18889,6 +18948,10 @@ impl State {
     }
 
     pub(crate) fn fixed_sim_tick(&mut self, tick_dt: f32, tick_index: u64) {
+        // Anything still journaled came from outside a known drain point; it
+        // gets the edit pipeline rather than being dropped with the fluids.
+        let mut sim_changes = std::mem::take(&mut self.world_block_change_scratch);
+        self.world.drain_block_changes(&mut sim_changes);
         let active_set = &self.active_sim_columns;
         let is_active = |x: i32, z: i32| active_set.contains(&ColumnCoord { x, z });
         let active = ActiveSimColumns {
@@ -18923,12 +18986,23 @@ impl State {
                     is_active: active.is_active,
                 },
             );
+            // Fluid changes keep their coalesced mesh path; everything else a
+            // system changed (random ticks, block entities) joins the batch.
+            let journaled_before = sim_changes.len();
+            self.world.drain_block_changes(&mut sim_changes);
+            if self.sim_systems[idx].as_any().is::<FluidsSystem>() {
+                sim_changes.truncate(journaled_before);
+            }
             let elapsed_ms = started.elapsed().as_secs_f32() * 1000.0;
             self.sim_system_last_frame_ms[idx] += elapsed_ms;
             self.sim_system_last_frame_ticks[idx] =
                 self.sim_system_last_frame_ticks[idx].saturating_add(1);
         }
         self.apply_winter_surface_tick(tick_index);
+        self.world.drain_block_changes(&mut sim_changes);
+        self.enqueue_world_block_changes(&sim_changes, BlockChangeSource::Simulation);
+        sim_changes.clear();
+        self.world_block_change_scratch = sim_changes;
     }
 
     pub(crate) fn update_fluid_simulation(&mut self, dt: f32) {
@@ -19197,7 +19271,7 @@ impl State {
         if set_ok {
             self.mark_chunk_user_only_if_unknown(chunk_coord);
             self.sync_generated_empty_chunk_marker(chunk_coord);
-            self.enqueue_pending_block_edit(hit.hit_block_pos, destroyed_block, BlockId::Air);
+            self.apply_world_block_changes(BlockChangeSource::Player);
         }
 
         maybe_log_slow_block_edit(
@@ -19361,7 +19435,7 @@ impl State {
                 );
                 self.mark_chunk_user_only_if_unknown(chunk_coord);
                 self.sync_generated_empty_chunk_marker(chunk_coord);
-                self.enqueue_pending_block_edit(place_pos, target_block, block_to_place);
+                self.apply_world_block_changes(BlockChangeSource::Player);
             }
             Err(SetBlockError::ChunkNotLoaded) => {
                 self.defer_block_edit(DeferredBlockEdit {
