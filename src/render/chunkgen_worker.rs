@@ -2539,7 +2539,8 @@ mod tests {
         CHUNK_SIZE, ColumnAcquireDisposition, ColumnCoordKey, ColumnGenerationDescriptor,
         ColumnGenerationStageTimings, GeneratedColumn, GeneratedColumnCoordinator, WORLD_MAX_Y,
         WinterColumnPassStats, WorldConfig, apply_winter_surface_to_column,
-        build_generated_section_snapshots, generate_streaming_column_for_test,
+        build_generated_section_snapshots, generate_streaming_column_buffer,
+        generate_streaming_column_for_test,
     };
     use crate::blocks::{BlockId, grass_survives_under};
     use crate::world::fluids::{fluid_data_is_source_origin, fluid_data_is_worldgen_static};
@@ -2780,6 +2781,33 @@ mod tests {
         assert_eq!(column.get_block(7, 62, 8), BlockId::Ice);
         assert_eq!(stats.snow_layers, 1);
         assert_eq!(stats.ice_blocks, 1);
+    }
+
+    /// Numbers for `docs/TODO.md` "Worldgen: 2D-Terrain-Noise pro Spalte statt
+    /// pro Sektion". Run with
+    /// `cargo test --release column_generation_cost_report -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing report, run manually in release"]
+    fn column_generation_cost_report() {
+        for preset in [WorldgenPreset::ClassicFlatter, WorldgenPreset::Hilly] {
+            let side = 10;
+            let (mut base_terrain, mut whole) = (Duration::ZERO, Duration::ZERO);
+            for cz in 0..side {
+                for cx in 0..side {
+                    let started = std::time::Instant::now();
+                    let (_, _, timings, _) =
+                        generate_streaming_column_buffer(WorldConfig::default(), preset, cx, cz);
+                    whole += started.elapsed();
+                    base_terrain += timings.base_terrain_fill;
+                }
+            }
+            let columns = f64::from(side * side);
+            println!(
+                "{preset:?}: base_terrain_fill {:.3} ms per column, whole column {:.3} ms",
+                base_terrain.as_secs_f64() * 1000.0 / columns,
+                whole.as_secs_f64() * 1000.0 / columns
+            );
+        }
     }
 
     #[test]
