@@ -16775,10 +16775,18 @@ impl State {
             for &coord in &primary_coords {
                 self.pending_chunk_added_lighting_coords.insert(coord);
             }
-            let Some(task) = self
-                .world
-                .begin_incremental_region_lighting_task(region_coords)
-            else {
+            let task = {
+                let region_chunks = region_coords.len();
+                let _scope = perf_trace::scope("lighting.region_task_create").with_counts(|| {
+                    format!(
+                        "region_chunks={region_chunks} loaded_chunks={}",
+                        self.world.chunks.len()
+                    )
+                });
+                self.world
+                    .begin_incremental_region_lighting_task(region_coords)
+            };
+            let Some(task) = task else {
                 for coord in primary_coords {
                     self.pending_chunk_added_lighting_coords.remove(&coord);
                 }

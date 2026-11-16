@@ -658,6 +658,222 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod skylight_seed_tests {
+    use super::{
+        CHUNK_SIZE, Chunk, ChunkBlocks, ChunkCoord, LightEngine, SkylightSeedColumn, World,
+        build_snapshot_sky_blocker_top, snapshot_chunk_column_index,
+    };
+    use crate::blocks::BlockId;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    const VOXELS: usize = (CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE) as usize;
+
+    /// The pre-2026-11-16 algorithm: scan every loaded chunk and keep those
+    /// in a needed column. Kept as the oracle for the per-column lookup.
+    fn reference_seed_columns(
+        world: &World,
+        region_coords: &[ChunkCoord],
+    ) -> HashMap<(i32, i32), SkylightSeedColumn> {
+        let needed: HashSet<(i32, i32)> = region_coords.iter().map(|c| (c.x, c.z)).collect();
+        let mut out: HashMap<(i32, i32), SkylightSeedColumn> = HashMap::new();
+        for (&coord, chunk) in &world.chunks {
+            if !needed.contains(&(coord.x, coord.z)) {
+                continue;
+            }
+            let entry = out
+                .entry((coord.x, coord.z))
+                .or_insert_with(|| SkylightSeedColumn {
+                    top_loaded_chunk_y: coord.y,
+                    top_blocker_world_y: [i32::MIN; 256],
+                });
+            entry.top_loaded_chunk_y = entry.top_loaded_chunk_y.max(coord.y);
+            for (idx, &local_top) in build_snapshot_sky_blocker_top(&chunk.blocks)
+                .iter()
+                .enumerate()
+            {
+                if local_top >= 0 {
+                    let y = coord.y * CHUNK_SIZE + local_top as i32;
+                    entry.top_blocker_world_y[idx] = entry.top_blocker_world_y[idx].max(y);
+                }
+            }
+        }
+        out
+    }
+
+    fn assert_same_columns(
+        got: &HashMap<(i32, i32), SkylightSeedColumn>,
+        want: &HashMap<(i32, i32), SkylightSeedColumn>,
+    ) {
+        let mut got_keys: Vec<_> = got.keys().copied().collect();
+        let mut want_keys: Vec<_> = want.keys().copied().collect();
+        got_keys.sort_unstable();
+        want_keys.sort_unstable();
+        assert_eq!(got_keys, want_keys, "seeded column sets differ");
+        for key in want_keys {
+            let (g, w) = (&got[&key], &want[&key]);
+            assert_eq!(
+                g.top_loaded_chunk_y, w.top_loaded_chunk_y,
+                "top loaded chunk differs in column {key:?}"
+            );
+            assert_eq!(
+                g.top_blocker_world_y, w.top_blocker_world_y,
+                "top skylight blockers differ in column {key:?}"
+            );
+        }
+    }
+
+    fn chunk_from(blocks: Vec<BlockId>) -> Chunk {
+        Chunk::from_parts(
+            ChunkBlocks::compact(blocks),
+            Arc::new(vec![0; VOXELS]),
+            Arc::new(vec![0; VOXELS]),
+            0,
+        )
+    }
+
+    #[test]
+    fn region_seed_columns_match_full_scan_reference() {
+        let mut world = World::new();
+        for cx in -1..=1 {
+            for cz in -1..=1 {
+                world.ensure_column_generated(cx * CHUNK_SIZE, cz * CHUNK_SIZE);
+            }
+        }
+        // Sections are not always all present: empty air sections are never
+        // stored, and streaming can leave holes. Punch some.
+        for y in 9..=world.max_chunk_y() {
+            world.chunks.remove(&ChunkCoord { x: 0, y, z: 0 });
+        }
+        world.chunks.remove(&ChunkCoord { x: 1, y: 3, z: 0 });
+        for y in world.min_chunk_y()..=world.max_chunk_y() {
+            world.chunks.remove(&ChunkCoord { x: -1, y, z: -1 });
+        }
+
+        // A synthetic column where one x/z column has no blocker until a lone
+        // block two sections further down, so the lookup cannot stop early.
+        let hole = (3, 5);
+        let mut holed = vec![BlockId::Stone; VOXELS];
+        for ly in 0..CHUNK_SIZE {
+            holed[Chunk::index(hole.0, ly, hole.1)] = BlockId::Air;
+        }
+        let mut lone = vec![BlockId::Air; VOXELS];
+        lone[Chunk::index(hole.0, 7, hole.1)] = BlockId::Stone;
+        world.chunks.insert(
+            ChunkCoord { x: 5, y: 6, z: 5 },
+            chunk_from(vec![BlockId::Air; VOXELS]),
+        );
+        world
+            .chunks
+            .insert(ChunkCoord { x: 5, y: 2, z: 5 }, chunk_from(holed));
+        world
+            .chunks
+            .insert(ChunkCoord { x: 5, y: 0, z: 5 }, chunk_from(lone));
+
+        let mut region: Vec<ChunkCoord> = world.chunks.keys().copied().collect();
+        // Production regions only hold loaded chunks, but an unloaded column
+        // must not produce an entry either way.
+        region.push(ChunkCoord { x: -1, y: 4, z: -1 });
+        region.push(ChunkCoord { x: 9, y: 0, z: 9 });
+
+        let got = LightEngine::build_skylight_seed_columns_for_region(&world, &region);
+        assert_same_columns(&got, &reference_seed_columns(&world, &region));
+
+        let synthetic = &got[&(5, 5)];
+        assert_eq!(synthetic.top_loaded_chunk_y, 6);
+        let hole_idx = snapshot_chunk_column_index(hole.0, hole.1);
+        assert_eq!(synthetic.top_blocker_world_y[hole_idx], 7);
+        assert_eq!(
+            synthetic.top_blocker_world_y[0],
+            2 * CHUNK_SIZE + CHUNK_SIZE - 1
+        );
+        assert!(!got.contains_key(&(-1, -1)) && !got.contains_key(&(9, 9)));
+    }
+
+    /// Before/after numbers for `docs/TODO.md` "Persistente Heightmaps",
+    /// step 1: the seed build for one chunk-add region must not scale with
+    /// the number of loaded chunks. Run with
+    /// `cargo test --release skylight_seed_region_report -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing report, run manually in release"]
+    fn skylight_seed_region_report() {
+        let stone = ChunkBlocks::Uniform(BlockId::Stone);
+        let air = ChunkBlocks::Uniform(BlockId::Air);
+        let mut surface_blocks = vec![BlockId::Air; VOXELS];
+        for ly in 0..8 {
+            for lz in 0..CHUNK_SIZE {
+                for lx in 0..CHUNK_SIZE {
+                    surface_blocks[Chunk::index(lx, ly, lz)] = BlockId::Stone;
+                }
+            }
+        }
+        let surface = ChunkBlocks::compact(surface_blocks);
+        let data = Arc::new(vec![0u8; VOXELS]);
+        let light = Arc::new(vec![0u8; VOXELS]);
+
+        let center = ChunkCoord { x: 0, y: 4, z: 0 };
+        let region: Vec<ChunkCoord> = [
+            (0, 0, 0),
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ]
+        .iter()
+        .map(|&(dx, dy, dz)| ChunkCoord {
+            x: center.x + dx,
+            y: center.y + dy,
+            z: center.z + dz,
+        })
+        .collect();
+
+        for view_distance in [8, 16] {
+            let mut world = World::new();
+            for cx in -view_distance..=view_distance {
+                for cz in -view_distance..=view_distance {
+                    for cy in world.min_chunk_y()..=world.max_chunk_y() {
+                        let blocks = match cy {
+                            y if y < 4 => stone.clone(),
+                            4 => surface.clone(),
+                            _ => air.clone(),
+                        };
+                        world.chunks.insert(
+                            ChunkCoord {
+                                x: cx,
+                                y: cy,
+                                z: cz,
+                            },
+                            Chunk::from_parts(blocks, Arc::clone(&data), Arc::clone(&light), 0),
+                        );
+                    }
+                }
+            }
+
+            let rounds = 200u32;
+            let start = Instant::now();
+            let mut columns = 0usize;
+            for _ in 0..rounds {
+                columns +=
+                    LightEngine::build_skylight_seed_columns_for_region(&world, &region).len();
+            }
+            let per_call_us = start.elapsed().as_secs_f64() * 1e6 / f64::from(rounds);
+            assert_eq!(
+                columns,
+                5 * rounds as usize,
+                "chunk-add region spans five columns"
+            );
+            println!(
+                "view distance {view_distance:2}: {:6} loaded chunks, {per_call_us:9.1} us per region seed build",
+                world.chunks.len()
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SetBlockError {
     OutOfBounds,
