@@ -69,7 +69,12 @@ nächsten billiger macht:
     `pending_block_entity_block_changes` ist eine zweite Queue neben dem
     Journal, weil `BlockEntitiesSystem` sie innerhalb des Sim-Ticks leert.
     (c) Lighting-Klassifikation und Fluid-Notify laufen pro Position
-    (`process_pending_block_edit_side_effects`); ein Baum sind ~60 Einzel-Edits.
+    (`process_pending_block_edit_side_effects`, höchstens 8 Edits bzw. 1,5 ms
+    pro Frame); ein Baum sind ~60 Einzel-Edits. Gemessen auf 152 Sektionen
+    Terrain: Random-Tick-Speed 3 erzeugt ~0,8 Änderungen pro Tick, Speed 1000
+    ~58 pro Tick — weit über dem Durchsatz, die Queue wächst dann. Spieler-Edits
+    haben deshalb eine eigene, vorrangige Queue
+    (`pending_player_block_edits`).
   - *Ziel:* Genau ein Weg, auf dem Block-Änderungen Nebenwirkungen auslösen,
     egal ob Spieler, Sim-System, Explosion, Befehl oder Entity sie verursacht,
     und der auch viele Änderungen auf einmal billig verarbeitet.

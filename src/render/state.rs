@@ -5486,6 +5486,10 @@ pub(crate) struct State {
     mesh_schedule: HashMap<ChunkCoord, ChunkMeshSchedule>,
     deferred_mesh_until_frame: HashMap<ChunkCoord, u64>,
     pending_block_edits: VecDeque<PendingBlockEdit>,
+    /// Player edits jump the queue: a burst of simulation edits (a grown
+    /// tree, fast grass spread) must not delay the block the player just
+    /// placed or broke. Drained before `pending_block_edits`.
+    pending_player_block_edits: VecDeque<PendingBlockEdit>,
     /// Reused buffer for draining `World`'s change journal.
     world_block_change_scratch: Vec<BlockChange>,
     pending_block_edit_dirty_chunks: HashMap<ChunkCoord, ChunkMeshDirtySet>,
@@ -6106,6 +6110,7 @@ impl State {
         self.mesh_schedule.clear();
         self.deferred_mesh_until_frame.clear();
         self.pending_block_edits.clear();
+        self.pending_player_block_edits.clear();
         self.pending_block_edit_dirty_chunks.clear();
         self.pending_block_edit_dirty_columns.clear();
         self.pending_block_edit_lighting_batches.clear();
@@ -10434,6 +10439,7 @@ impl State {
             mesh_schedule: HashMap::new(),
             deferred_mesh_until_frame: HashMap::new(),
             pending_block_edits: VecDeque::new(),
+            pending_player_block_edits: VecDeque::new(),
             world_block_change_scratch: Vec::new(),
             pending_block_edit_dirty_chunks: HashMap::new(),
             pending_block_edit_dirty_columns: HashSet::new(),
@@ -17524,14 +17530,17 @@ impl State {
         source: BlockChangeSource,
     ) {
         let by_player = source == BlockChangeSource::Player;
-        self.pending_block_edits.push_back(PendingBlockEdit {
+        let edit = PendingBlockEdit {
             pos,
             old,
             new,
             spawn_particles: by_player,
-        });
+        };
         if by_player {
+            self.pending_player_block_edits.push_back(edit);
             self.stream_recent_mining_frames = SURFACE_STREAM_MINING_HOLD_FRAMES;
+        } else {
+            self.pending_block_edits.push_back(edit);
         }
     }
 
@@ -17620,12 +17629,17 @@ impl State {
             BLOCK_EDIT_SIDEFX_MAX_EDITS_PER_FRAME,
         );
         let mut lighting_geometry_only = 0usize;
-        let mut edits_remaining_before = self.pending_block_edits.len();
+        let mut edits_remaining_before =
+            self.pending_player_block_edits.len() + self.pending_block_edits.len();
         let mut sand_remaining_before = self.pending_sand_gravity_checks.len();
 
         while edits_processed < BLOCK_EDIT_SIDEFX_MAX_EDITS_PER_FRAME && started.elapsed() < budget
         {
-            let Some(edit) = self.pending_block_edits.pop_front() else {
+            let Some(edit) = self
+                .pending_player_block_edits
+                .pop_front()
+                .or_else(|| self.pending_block_edits.pop_front())
+            else {
                 break;
             };
 
@@ -17696,7 +17710,7 @@ impl State {
                 "edits_proc={} edits_q_before={} edits_q_after={} fluids={} particles_spawned={} particle_events={} sand_checks_proc={} sand_q_before={} sand_q_after={} sand_steps={} sand_scanned={} sand_dropped={} light_repairs={} light_geom_only={} dirty_chunks_flush={} dirty_cols_flush={} dirty_marks_flushed={}",
                 edits_processed,
                 edits_remaining_before + edits_processed,
-                self.pending_block_edits.len(),
+                self.pending_player_block_edits.len() + self.pending_block_edits.len(),
                 fluid_notifies,
                 particles_spawned,
                 particle_events,
