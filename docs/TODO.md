@@ -73,10 +73,10 @@ nächsten billiger macht:
     pro Frame); ein Baum sind ~60 Einzel-Edits. Gemessen auf 152 Sektionen
     Terrain (ohne Spalten-Pässe): Random-Tick-Speed 3 erzeugt ~0,8 Änderungen
     pro Tick, Speed 1000 ~58 pro Tick — weit über dem Durchsatz, die Queue
-    wächst dann. Es ist fast nur einmaliges Einpendeln frisch generierter
-    Oberfläche (siehe Worldgen "Oberfläche im Gleichgewicht mit den
-    Gras-Regeln generieren"). Spieler-Edits haben deshalb eine eigene,
-    vorrangige Queue (`pending_player_block_edits`).
+    wächst dann. Es war fast nur einmaliges Einpendeln frisch generierter
+    Oberfläche; seit 2026-11-16 generiert der Worldgen sie schon im
+    Gleichgewicht (`settle_covered_grass_in_column`). Spieler-Edits haben eine
+    eigene, vorrangige Queue (`pending_player_block_edits`).
   - *Ziel:* Genau ein Weg, auf dem Block-Änderungen Nebenwirkungen auslösen,
     egal ob Spieler, Sim-System, Explosion, Befehl oder Entity sie verursacht,
     und der auch viele Änderungen auf einmal billig verarbeitet.
@@ -1511,7 +1511,8 @@ Aus der Vorlage ausdrücklich **nicht** auf die Liste genommen:
     unvollständig: Surface-Rules laufen *innerhalb* der Terrain-Phase
     (`worldgen/pipeline.rs:203-234`), Phase 5 enthält eine Dirt→Gras-Promotion
     und eine Sand-Bereinigung (`chunkgen_worker.rs:961`, `:1171`), es gibt eine
-    Winterphase 8 (`:1849-1853`) und **keine Meeresfüllung** (siehe
+    Winterphase zwischen Foliage und dem (dort schon eingetragenen)
+    abschließenden Gras-Ausgleich und **keine Meeresfüllung** (siehe
     a1.0.17-Abgleich unten). Preset-Parameter stehen nur im Code
     (`worldgen/terrain.rs:40-124`).
   - *Ziel:* Ein Contributor findet Phasen, Presets und deren Unterschiede an
@@ -1524,55 +1525,9 @@ Aus der Vorlage ausdrücklich **nicht** auf die Liste genommen:
   - *Dateien:* `docs/planning/worldgen.md`, `README.md`, `worldgen/terrain.rs`.
   - *Abhängigkeiten:* keine.
   - *Priorität/Aufwand/Impact:* **P2**, S, niedrig.
-  - *Akzeptanz:* Die Doku nennt alle 8 Phasen und den richtigen Default.
+  - *Akzeptanz:* Die Doku nennt alle 9 Phasen und den richtigen Default.
 
 ### Medium priority
-- **Oberfläche im Gleichgewicht mit den Gras-Regeln generieren** (neu
-  2026-11-16)
-  - *Ist:* Gemessen mit der vollen Spalten-Pipeline
-    (`generate_streaming_column_for_test`, 25 Spalten) liegt über 16 %
-    (ClassicFlatter: 1 165 von 7 332) bzw. 26 % (Hilly: 2 220 von 8 392) aller
-    Grasblöcke ein Block, der Himmelslicht blockiert: meist Gras (1 042 /
-    1 304) oder Erde (12 / 856), dazu Eichenstamm und Laub (Baumfüße,
-    tiefes Laub) und Sand (Ufer). Wahrscheinliche Hauptursache:
-    `WorldgenPipeline::generate_chunk` setzt feste Voxel nach dem
-    interpolierten Dichte-Gitter (`density_cache.sample`,
-    `worldgen/pipeline.rs:146`), `top_y` aber nach der exakten Heightmap
-    (`:157-199`). Wo die Interpolation darüber hinausragt, bekommt der Überhang
-    Erde (`surface_rules.rs`: `y >= top_y - dirt_depth`) über dem Gras auf
-    `top_y`, und `apply_surface_dirt_to_grass_in_column`
-    (`render/chunkgen_worker.rs:961`) macht die neue oberste Erde zu Gras →
-    Gras auf Gras. Bäume setzen Stämme auf Gras, ohne es umzuwandeln.
-    `grass_random_tick` (`blocks/mod.rs:2422`) wandelt all das in den ersten
-    Minuten nach dem Laden in Erde um; seit dem Welt-Änderungsjournal kostet
-    jede solche Änderung einen Edit in der Pipeline und macht die Spalte
-    save-dirty. Jede besuchte Spalte wird so einmal ohne sichtbaren Grund
-    neu gemesht und gespeichert. Offene Erde neben Gras ist vernachlässigbar
-    (11 bzw. 0 in 25 Spalten). Hinweis: `World::ensure_column_generated` läuft
-    ohne die Spalten-Pässe (Promotion, Ufer, Bäume) und eignet sich für solche
-    Messungen nicht.
-  - *Ziel:* Eine frisch generierte Spalte enthält kein Gras, das die
-    Gras-Regel sofort zurücksetzen würde; Random Ticks erzeugen auf
-    unberührtem Terrain keine Änderungen.
-  - *Vorbild:* Vanilla wandelt Gras unter Baumstämmen bei der Platzierung in
-    Erde um; Surface-Rules arbeiten auf der tatsächlichen Oberfläche des
-    Dichtefelds.
-  - *Vorgehen:* 1) Surface-Rule auf den obersten tatsächlich festen Voxel
-    beziehen (`top_local_per_column` aus der Solid-Maske existiert schon,
-    `worldgen/pipeline.rs:133-153`) oder Gras nur setzen, wo der Voxel darüber
-    nicht fest ist. 2) Abschließender Spalten-Pass nach Bäumen, Blumen und
-    Winter: Gras unter einem Himmelslicht-Blocker oder Fluid wird Erde (genau
-    die Regel aus `grass_random_tick`; `apply_post_fixes_to_chunk` macht das
-    heute nur für Wasser). 3) Test über alle Presets.
-  - *Dateien:* `worldgen/pipeline.rs`, `worldgen/surface_rules.rs`,
-    `render/chunkgen_worker.rs`.
-  - *Abhängigkeiten:* keine.
-  - *Priorität/Aufwand/Impact:* **P2**, S, mittel (spart pro besuchter Spalte
-    einen Remesh und einen Speichervorgang; Grasseiten an Terrainstufen werden
-    gleich korrekt generiert).
-  - *Akzeptanz:* Für alle Presets 0 verschüttete Grasblöcke in 25 Spalten
-    der vollen Pipeline; 20 Random Ticks mit Speed 1000 auf einem frisch
-    generierten Bereich erzeugen keine `Grass → Dirt`-Änderung.
 - **Nahtsichere `HiddenOnly`-Prüfung für Erze** (neu formuliert 2026-09-28;
   bisher High: "add neighbor-aware exposed-air checks so `HiddenOnly` ores are
   trustworthy at chunk borders")

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, select};
 use glam::IVec3;
 
-use crate::blocks::BlockId;
+use crate::blocks::{BlockId, grass_survives_under};
 use crate::meshing::{CpuMeshData, FULLBRIGHT_LIGHT_PACKED, Vertex};
 use crate::perf::trace as perf_trace;
 use crate::world::config::WorldConfig;
@@ -958,6 +958,27 @@ fn apply_post_fixes_to_chunk(chunk: &mut Chunk) {
     }
 }
 
+/// Last column pass: grass that the grass random tick would turn into dirt
+/// right after loading (covered by a skylight blocker or a fluid) becomes dirt
+/// now. Without it 16-26 % of generated grass was buried — mostly under grass
+/// promoted from density overshoot above the heightmap top, plus tree trunks,
+/// low leaves and shoreline sand — and every visited column got remeshed and
+/// saved once just to settle it.
+fn settle_covered_grass_in_column(column: &mut ColumnBuffer) {
+    for local_z in 0..CHUNK_SIZE {
+        for local_x in 0..CHUNK_SIZE {
+            for y in 1..WORLD_MAX_Y {
+                if column.get_block(local_x, y, local_z) == BlockId::Grass
+                    && !grass_survives_under(column.get_block(local_x, y + 1, local_z))
+                {
+                    column.set_block(local_x, y, local_z, BlockId::Dirt);
+                    column.set_data(local_x, y, local_z, 0);
+                }
+            }
+        }
+    }
+}
+
 fn apply_surface_dirt_to_grass_in_column(column: &mut ColumnBuffer) {
     for local_z in 0..CHUNK_SIZE {
         for local_x in 0..CHUNK_SIZE {
@@ -1851,6 +1872,11 @@ impl StreamingWorldColumnGenerator {
             winter_stats = apply_winter_surface_to_column(out);
             stage_timings.winter_surface = stage_started.elapsed();
         }
+        // 8) Settle grass against the random-tick rule, after every pass that
+        //    can cover it.
+        let stage_started = Instant::now();
+        settle_covered_grass_in_column(out);
+        stage_timings.grass_settle = stage_started.elapsed();
         (shoreline_sand_by_chunk, stage_timings, winter_stats)
     }
 }
@@ -1865,13 +1891,14 @@ struct ColumnGenerationStageTimings {
     trees: Duration,
     foliage: Duration,
     winter_surface: Duration,
+    grass_settle: Duration,
     section_snapshot: Duration,
 }
 
 impl ColumnGenerationStageTimings {
     fn instrumentation_fields(self) -> String {
         format!(
-            "base_ms={:.3} carvers_ms={:.3} ores_ms={:.3} fluid_ms={:.3} shoreline_ms={:.3} trees_ms={:.3} foliage_ms={:.3} winter_ms={:.3} snapshot_ms={:.3}",
+            "base_ms={:.3} carvers_ms={:.3} ores_ms={:.3} fluid_ms={:.3} shoreline_ms={:.3} trees_ms={:.3} foliage_ms={:.3} winter_ms={:.3} grass_settle_ms={:.3} snapshot_ms={:.3}",
             self.base_terrain_fill.as_secs_f64() * 1000.0,
             self.carvers.as_secs_f64() * 1000.0,
             self.ores.as_secs_f64() * 1000.0,
@@ -1880,6 +1907,7 @@ impl ColumnGenerationStageTimings {
             self.trees.as_secs_f64() * 1000.0,
             self.foliage.as_secs_f64() * 1000.0,
             self.winter_surface.as_secs_f64() * 1000.0,
+            self.grass_settle.as_secs_f64() * 1000.0,
             self.section_snapshot.as_secs_f64() * 1000.0,
         )
     }
@@ -2505,7 +2533,7 @@ mod tests {
         WinterColumnPassStats, WorldConfig, apply_winter_surface_to_column,
         build_generated_section_snapshots, generate_streaming_column_for_test,
     };
-    use crate::blocks::BlockId;
+    use crate::blocks::{BlockId, grass_survives_under};
     use crate::world::WorldEnvironment;
     use crate::world::fluids::{fluid_data_is_source_origin, fluid_data_is_worldgen_static};
     use crate::worldgen::ColumnBuffer;
@@ -2783,6 +2811,59 @@ mod tests {
                 BlockId::Sand,
                 "tree root in column ({cx},{cz}) spawned on sand at ({x},{y},{z})"
             );
+        }
+    }
+
+    /// Generated terrain must already be in the state the grass random tick
+    /// would settle it into: no grass under a skylight blocker or a fluid.
+    /// Before the settle pass 16-26 % of all generated grass was buried, and
+    /// every visited column got remeshed and saved once to settle it.
+    #[test]
+    fn generated_grass_is_never_covered() {
+        let presets = [
+            WorldgenPreset::Flatish,
+            WorldgenPreset::ClassicFlatter,
+            WorldgenPreset::Rd161348Like,
+            WorldgenPreset::Hilly,
+        ];
+        for environment in [WorldEnvironment::Temperate, WorldEnvironment::Winter] {
+            let cfg = WorldConfig {
+                seed: 0x5EED_6A55_0BAD_0001,
+                environment,
+                ..WorldConfig::default()
+            };
+            for preset in presets {
+                let (mut grass, mut under_snow) = (0usize, 0usize);
+                for cz in 0..2 {
+                    for cx in 0..2 {
+                        let column = generate_streaming_column_for_test(cfg, preset, cx, cz);
+                        for y in 1..WORLD_MAX_Y {
+                            for z in 0..CHUNK_SIZE {
+                                for x in 0..CHUNK_SIZE {
+                                    if column.get_block(x, y, z) != BlockId::Grass {
+                                        continue;
+                                    }
+                                    grass += 1;
+                                    let above = column.get_block(x, y + 1, z);
+                                    assert!(
+                                        grass_survives_under(above),
+                                        "{preset:?}/{environment:?}: grass at ({x}, {y}, {z}) \
+                                         in column ({cx}, {cz}) is covered by {above:?}"
+                                    );
+                                    under_snow += usize::from(above == BlockId::Snow);
+                                }
+                            }
+                        }
+                    }
+                }
+                assert!(grass > 0, "{preset:?}/{environment:?}: no grass generated");
+                if matches!(environment, WorldEnvironment::Winter) {
+                    assert!(
+                        under_snow > 0,
+                        "{preset:?}: snow layers must not turn the grass below into dirt"
+                    );
+                }
+            }
         }
     }
 

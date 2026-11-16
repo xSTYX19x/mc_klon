@@ -92,6 +92,7 @@ That direction is now active in the code:
 - carvers (caves/ravines)
 - lakes/springs and shoreline post-processing
 - foliage pass (flowers + mushrooms)
+- final grass settle pass: no generated grass sits under a skylight blocker or fluid, so random ticks do not rewrite fresh terrain after loading
 - ore generation as a dedicated deterministic feature pass after carvers
 - current ore profile is data-driven per ore type:
   - replacement rule

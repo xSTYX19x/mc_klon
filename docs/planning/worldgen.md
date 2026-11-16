@@ -73,6 +73,7 @@ The current target order is:
 5. shoreline/material cleanup
 6. trees
 7. foliage/decorations
+8. grass settle (always last): grass under a skylight blocker or a fluid becomes dirt, using the same rule as the grass random tick (`blocks::grass_survives_under`), so freshly generated terrain causes no random-tick edits after loading
 
 If future passes are added, they should fit into this ordered pipeline instead of bypassing it.
 

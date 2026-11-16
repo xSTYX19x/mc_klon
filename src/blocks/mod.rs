@@ -2419,6 +2419,17 @@ impl Default for BlockId {
     }
 }
 
+/// Whether grass stays grass with `above` directly on top of it. Shared by the
+/// grass random tick and worldgen, so freshly generated terrain is already in
+/// the state the random tick would settle it into.
+pub(crate) fn grass_survives_under(above: BlockId) -> bool {
+    !(above.blocks_skylight()
+        || matches!(
+            above,
+            BlockId::WaterStill | BlockId::WaterFlowing | BlockId::LavaStill | BlockId::LavaFlowing
+        ))
+}
+
 fn grass_random_tick(world: &mut World, pos: IVec3, _state: BlockStateId, tick_index: u64) {
     let above = pos + IVec3::Y;
     if !World::in_bounds(above)
@@ -2429,13 +2440,7 @@ fn grass_random_tick(world: &mut World, pos: IVec3, _state: BlockStateId, tick_i
         return;
     }
 
-    let above_block = world.get_block(above);
-    if above_block.blocks_skylight()
-        || matches!(
-            above_block,
-            BlockId::WaterStill | BlockId::WaterFlowing | BlockId::LavaStill | BlockId::LavaFlowing
-        )
-    {
+    if !grass_survives_under(world.get_block(above)) {
         let _ = world.set_block_and_data_loaded_only(pos, BlockId::Dirt, 0);
         return;
     }
