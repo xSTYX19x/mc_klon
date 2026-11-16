@@ -1665,7 +1665,10 @@ Alles hier gehört in die dokumentierte Phasenreihenfolge aus
     `worldgen/carvers/caves.rs:411`, `worldgen/carvers/ravine.rs:307`).
     3) Ufer-Pass (`chunkgen_worker.rs:1046`) auf echte Küsten anwenden und die
     Kiesstrände oben dort andocken. 4) Fluid-Bootstrap für große statische
-    Wasserflächen beim Laden prüfen.
+    Wasserflächen beim Laden prüfen (seit 2026-11-16 überspringt er ruhende
+    statische Zellen; das Meerwasser muss dafür mit
+    `fluid_data_make_static(0, false)` entstehen, sonst plant er jede Zelle
+    ein).
   - *Dateien:* `worldgen/pipeline.rs`, `render/chunkgen_worker.rs`,
     `worldgen/carvers/*`.
   - *Abhängigkeiten:* keine; im Multi-Noise-Preset durch Aquifere ersetzt.
@@ -1995,44 +1998,37 @@ loading screen, where throughput legitimately outranks frame time.
   - *Akzeptanz:* `sim.fixed_tick.random_ticks` ist bei Sichtweite 8 und 32
     gleich teuer; die Journal-Einträge bleiben identisch.
 
-- **Fluid-Bootstrap beim Spalten-Eintritt ohne Vollscan** (neu 2026-11-16)
-  - *Ist:* Im laufenden Betrieb sind Fluids schon ereignisgesteuert wie bei
-    Vanilla: Eine Blockänderung markiert ihre 18 Nachbarn
-    (`notify_fluid_on_block_change` → `mark_transforming_with_neighbors`,
-    `world/fluids.rs:526`), Fluid-Zellen laufen über ein Timing-Wheel mit
-    Budget (`FluidSystem::step`, `:1605`), statisches Worldgen-Wasser tickt
-    nie. Teuer ist nur der Bootstrap, wenn eine Spalte in die Sim-Distanz
-    kommt (`FluidsSystem::fixed_tick`, 2 Spalten pro Tick):
-    `bootstrap_column_from_world` (`world/fluids.rs:1515`) iteriert über
-    **alle** geladenen Chunks, um die Sektionen der Spalte zu finden, scannt
-    jeden Voxel und schreibt jede Fluid-Zelle per
-    `normalize_fluid_state_and_schedule` neu, auch wenn sich nichts ändert.
-    `Chunk::set` ruft dabei `make_flat_mut()` vor dem Vergleich auf
-    (`world/chunk.rs`), jede kompakte Wasser-Sektion wird also flach
-    (~679 B → 4 KiB). Gemessen bei ~34 000 geladenen Chunks (≈ RD 32) auf
-    reinen Steinspalten: 2,3 ms pro Spalte (Debug), 0,11 ms (Release), also
-    bis ~4,6 ms pro Tick beim Bewegen.
-  - *Ziel:* Bootstrap-Kosten proportional zu den Fluid-Zellen der Spalte;
-    keine Schreibzugriffe ohne Änderung.
-  - *Vorbild:* Vanilla scannt beim Laden nicht: ausstehende Fluid-Ticks werden
-    mit dem Chunk gespeichert (`fluid_ticks`) und beim Laden wieder
-    eingeplant.
-  - *Vorgehen:* 1) Spalten-Sektionen per direktem `chunks.get` über den
-    Sektions-Y-Bereich holen (wie beim Skylight-Seed). 2) `Chunk::set`:
-    erst vergleichen, dann `make_flat_mut()`; `normalize_fluid_state_and_
-    schedule` schreibt nur bei echter Änderung. 3) Sektionen ohne Fluids
-    überspringen (Zähler pro Sektion wie `has_random_ticking_blocks`, oder
-    die schon vom Chunkgen berechneten `GeneratedFluidBootstrapCell`s
-    nutzen). 4) Langfristig ausstehende Fluid-Ticks im Column-Payload v3
-    speichern statt gespeicherte Spalten neu zu bootstrappen.
+- **Ausstehende Fluid-Ticks speichern statt Spalten neu zu bootstrappen**
+  (neu 2026-11-16)
+  - *Ist:* Fluids laufen ereignisgesteuert wie bei Vanilla (18-Nachbar-
+    Markierung bei Blockänderungen, Timing-Wheel, statisches Worldgen-Wasser
+    tickt nie). Kommt eine Spalte in die Sim-Distanz, sucht
+    `bootstrap_column_from_world` (`world/fluids.rs`) seit 2026-11-16 per
+    direktem Lookup nur ihre Sektionen, überspringt Sektionen ohne Fluids
+    (Palette, `ChunkBlocks::may_contain`) und schon ruhende statische Zellen;
+    `Chunk::set`/`set_data` lassen kompakte Daten bei Schreibzugriffen ohne
+    Änderung in Ruhe. Gemessen (`fluid_bootstrap_cost_report`, Spalte mit
+    statischem See): Release 0,35/0,44 → 0,011/0,013 ms pro Spalte bei RD
+    8/32, Debug 6,6/7,0 → 0,45/0,40 ms; See-Sektionen bleiben kompakt. Offen:
+    Fließendes Wasser einer gespeicherten Spalte verliert beim Entladen seine
+    eingeplanten Ticks und wird beim Wiedereintritt durch den Bootstrap neu
+    eingeplant (alle nicht ruhenden Zellen mit Verzögerung 1).
+  - *Ziel:* Eine Spalte setzt nach dem Laden genau dort fort, wo sie beim
+    Entladen stand.
+  - *Vorbild:* Vanilla speichert ausstehende Fluid-Ticks mit dem Chunk
+    (`fluid_ticks`) und plant sie beim Laden wieder ein.
+  - *Vorgehen:* 1) Fällige Einträge der `FluidScheduler` pro Spalte beim
+    Entladen sammeln (relative Fälligkeit). 2) Als getaggten Block im
+    Column-Payload v3 speichern. 3) Beim Laden einplanen und den Bootstrap für
+    Spalten mit gespeicherten Ticks überspringen.
   - *Dateien:* `world/fluids.rs`, `world/fluids_system.rs`,
-    `world/chunk.rs`, `render/chunkgen_worker.rs`.
-  - *Abhängigkeiten:* Schritt 4 hängt an "Storage: Column-Payload v3".
-  - *Priorität/Aufwand/Impact:* **P2**, S (Schritte 1-3) bis M, mittel
-    (Ruckler beim Bewegen, Speicher).
-  - *Akzeptanz:* Bootstrap pro Spalte gleich teuer bei RD 8 und RD 32; eine
-    Spalte mit statischem See bleibt nach dem Bootstrap kompakt gespeichert;
-    die Fluid-Tests bleiben grün.
+    `storage/chunk_codec.rs`.
+  - *Abhängigkeiten:* "Storage: Column-Payload v3".
+  - *Priorität/Aufwand/Impact:* **P3**, M, niedrig (Korrektheit fließender
+    Fluids über Entladen hinweg; die Kosten sind schon behoben).
+  - *Akzeptanz:* Ein Wasserfall, dessen Spalte entladen und wieder geladen
+    wird, fließt ohne Sprung weiter; der Bootstrap plant für solche Spalten
+    nichts neu ein.
 
 - **F3: Bucket "fluid" misst den ganzen Sim-Tick** (neu 2026-11-16)
   - *Ist:* `PerfCat::Fluids` ("fluid" in der F3-Zeitleiste) umschließt

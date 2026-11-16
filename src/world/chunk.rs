@@ -143,10 +143,10 @@ impl Chunk {
     pub(crate) fn set(&mut self, x: i32, y: i32, z: i32, id: BlockId) {
         if Self::in_bounds(x, y, z) {
             let i = Self::index(x, y, z);
-            let blocks = self.blocks.make_flat_mut();
-            let old = blocks[i];
+            // Compare first: a no-op write must not flatten compact storage.
+            let old = self.blocks.get(i);
             if old != id {
-                blocks[i] = id;
+                self.blocks.make_flat_mut()[i] = id;
                 let old_filled = old.is_voxel_filled() as i32;
                 let new_filled = id.is_voxel_filled() as i32;
                 let old_solid = old.is_solid() as i32;
@@ -178,9 +178,9 @@ impl Chunk {
     pub(crate) fn set_data(&mut self, x: i32, y: i32, z: i32, data: u8) {
         if Self::in_bounds(x, y, z) {
             let i = Self::index(x, y, z);
-            let block_data = Arc::make_mut(&mut self.block_data);
-            if block_data[i] != data {
-                block_data[i] = data;
+            // Compare first: a no-op write must not clone shared data.
+            if self.block_data[i] != data {
+                Arc::make_mut(&mut self.block_data)[i] = data;
                 self.revision = self.revision.wrapping_add(1);
             }
         }
@@ -380,6 +380,17 @@ impl ChunkBlocks {
         Self::Flat(Arc::new(blocks))
     }
 
+    /// Whether any voxel may hold a block matching `pred`. Exact for uniform
+    /// and paletted storage (the palette is exactly the blocks present);
+    /// always `true` for flat storage, which would need a full scan.
+    pub(crate) fn may_contain(&self, pred: impl Fn(BlockId) -> bool) -> bool {
+        match self {
+            Self::Uniform(block) => pred(*block),
+            Self::Paletted(paletted) => paletted.palette.iter().any(|&block| pred(block)),
+            Self::Flat(_) => true,
+        }
+    }
+
     #[inline(always)]
     pub(crate) fn get(&self, index: usize) -> BlockId {
         match self {
@@ -503,6 +514,32 @@ mod block_storage_tests {
 
     fn flat_section(fill: BlockId) -> Vec<BlockId> {
         vec![fill; Chunk::BLOCK_COUNT]
+    }
+
+    /// Writing back what is already there must not flatten compact storage or
+    /// clone shared block data: the fluid bootstrap does that for every static
+    /// water cell, and used to turn each lake section into a 4 KiB flat array.
+    #[test]
+    fn no_op_writes_keep_compact_storage_and_shared_data() {
+        let mut blocks = flat_section(BlockId::Stone);
+        blocks[42] = BlockId::Dirt;
+        let data = Arc::new(vec![0u8; Chunk::BLOCK_COUNT]);
+        let mut chunk = Chunk::from_parts(
+            ChunkBlocks::compact(blocks),
+            Arc::clone(&data),
+            Arc::new(vec![0u8; Chunk::BLOCK_COUNT]),
+            0,
+        );
+        chunk.set(0, 0, 0, BlockId::Stone);
+        chunk.set_data(0, 0, 0, 0);
+        assert!(matches!(chunk.blocks, ChunkBlocks::Paletted(_)));
+        assert!(Arc::ptr_eq(&chunk.block_data, &data));
+        assert_eq!(chunk.revision, 0, "a no-op write is not a change");
+
+        chunk.set(0, 0, 0, BlockId::Dirt);
+        assert!(matches!(chunk.blocks, ChunkBlocks::Flat(_)));
+        assert_eq!(chunk.get(0, 0, 0), BlockId::Dirt);
+        assert_eq!(chunk.revision, 1);
     }
 
     #[test]

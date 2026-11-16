@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::blocks::BlockId;
 
-use super::{CHUNK_SIZE, SetBlockError, World};
+use super::{CHUNK_SIZE, Chunk, ChunkCoord, SetBlockError, World};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FluidKind {
@@ -1479,25 +1479,8 @@ impl FluidSystem {
         self.global_tick = 0;
 
         let mut fluid_positions = Vec::with_capacity(1024);
-        for (coord, chunk) in &world.chunks {
-            let chunk_x0 = coord.x * CHUNK_SIZE;
-            let chunk_y0 = coord.y * CHUNK_SIZE;
-            let chunk_z0 = coord.z * CHUNK_SIZE;
-            for local_y in 0..CHUNK_SIZE {
-                for local_z in 0..CHUNK_SIZE {
-                    for local_x in 0..CHUNK_SIZE {
-                        let block = chunk.get(local_x, local_y, local_z);
-                        if fluid_kind(block).is_none() {
-                            continue;
-                        }
-                        fluid_positions.push(IVec3::new(
-                            chunk_x0 + local_x,
-                            chunk_y0 + local_y,
-                            chunk_z0 + local_z,
-                        ));
-                    }
-                }
-            }
+        for (&coord, chunk) in &world.chunks {
+            Self::collect_unsettled_fluid_positions(coord, chunk, &mut fluid_positions);
         }
 
         for pos in fluid_positions {
@@ -1521,28 +1504,19 @@ impl FluidSystem {
         let mut fluid_positions = Vec::with_capacity(256);
         let mut has_loaded_chunks_in_column = false;
 
-        for (coord, chunk) in &world.chunks {
-            if coord.x != col_x || coord.z != col_z {
+        // Direct lookups over the column's section range, so the cost no
+        // longer grows with the number of loaded chunks.
+        for chunk_y in world.min_chunk_y()..=world.max_chunk_y() {
+            let coord = ChunkCoord {
+                x: col_x,
+                y: chunk_y,
+                z: col_z,
+            };
+            let Some(chunk) = world.chunks.get(&coord) else {
                 continue;
-            }
+            };
             has_loaded_chunks_in_column = true;
-            let chunk_x0 = coord.x * CHUNK_SIZE;
-            let chunk_y0 = coord.y * CHUNK_SIZE;
-            let chunk_z0 = coord.z * CHUNK_SIZE;
-            for local_y in 0..CHUNK_SIZE {
-                for local_z in 0..CHUNK_SIZE {
-                    for local_x in 0..CHUNK_SIZE {
-                        if fluid_kind(chunk.get(local_x, local_y, local_z)).is_none() {
-                            continue;
-                        }
-                        fluid_positions.push(IVec3::new(
-                            chunk_x0 + local_x,
-                            chunk_y0 + local_y,
-                            chunk_z0 + local_z,
-                        ));
-                    }
-                }
-            }
+            Self::collect_unsettled_fluid_positions(coord, chunk, &mut fluid_positions);
         }
 
         if !has_loaded_chunks_in_column {
@@ -1551,6 +1525,40 @@ impl FluidSystem {
 
         for pos in fluid_positions {
             self.normalize_fluid_state_and_schedule(world, pos, 1);
+        }
+    }
+
+    /// Pushes every fluid cell of `chunk` that bootstrap or rebuild must
+    /// normalize. Sections without fluids are skipped via their palette, and
+    /// settled worldgen-static cells are skipped because normalizing them
+    /// would write the same block and data back and schedule nothing.
+    fn collect_unsettled_fluid_positions(coord: ChunkCoord, chunk: &Chunk, out: &mut Vec<IVec3>) {
+        if !chunk
+            .blocks
+            .may_contain(|block| fluid_kind(block).is_some())
+        {
+            return;
+        }
+        let settled_static = fluid_data_make_static(0, false);
+        for local_y in 0..CHUNK_SIZE {
+            for local_z in 0..CHUNK_SIZE {
+                for local_x in 0..CHUNK_SIZE {
+                    let block = chunk.get(local_x, local_y, local_z);
+                    let Some(kind) = fluid_kind(block) else {
+                        continue;
+                    };
+                    if block == make_still(kind)
+                        && chunk.get_data(local_x, local_y, local_z) == settled_static
+                    {
+                        continue;
+                    }
+                    out.push(IVec3::new(
+                        coord.x * CHUNK_SIZE + local_x,
+                        coord.y * CHUNK_SIZE + local_y,
+                        coord.z * CHUNK_SIZE + local_z,
+                    ));
+                }
+            }
         }
     }
 
@@ -2402,6 +2410,22 @@ mod bootstrap_tests {
         assert_eq!(
             got, want,
             "bootstrap wrote different blocks than the reference"
+        );
+    }
+
+    #[test]
+    fn bootstrap_leaves_static_lake_sections_compact() {
+        let mut world = bootstrap_world();
+        let mut fluids = FluidSystem::new();
+        fluids.bootstrap_column_from_world(&mut world, 0, 0);
+        let lake = &world.chunks[&ChunkCoord { x: 0, y: 3, z: 0 }];
+        assert!(
+            matches!(lake.blocks, ChunkBlocks::Paletted(_)),
+            "a settled static lake must not be rewritten into flat storage"
+        );
+        assert_eq!(
+            lake.revision, 0,
+            "a settled static lake must not be touched"
         );
     }
 
