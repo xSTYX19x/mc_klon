@@ -7,7 +7,6 @@ use crate::world::{CHUNK_SIZE, ChunkCoord, World};
 
 pub(crate) struct RandomTicksSystem {
     pub(crate) ticks_per_chunk: u32,
-    block_registry: BlockRegistry,
     active_chunks: Vec<ChunkCoord>,
     sampled_last_tick: usize,
     callbacks_last_tick: usize,
@@ -17,7 +16,6 @@ impl RandomTicksSystem {
     pub(crate) fn new(ticks_per_chunk: u32) -> Self {
         Self {
             ticks_per_chunk,
-            block_registry: BlockRegistry::new(),
             active_chunks: Vec::new(),
             sampled_last_tick: 0,
             callbacks_last_tick: 0,
@@ -119,7 +117,7 @@ impl SimSystem for RandomTicksSystem {
                     IVec3::new(chunk_x0 + local_x, chunk_y0 + local_y, chunk_z0 + local_z);
 
                 let state = world.get_block(world_pos);
-                if let Some(random_tick) = self.block_registry.random_tick_for(state) {
+                if let Some(random_tick) = BlockRegistry::get().random_tick_for(state) {
                     random_tick(world, world_pos, state, tick_index);
                     self.callbacks_last_tick += 1;
                 }
@@ -142,7 +140,7 @@ mod tests {
     /// The full-sampling loop as it was before sections without random-ticking
     /// blocks were skipped: every loaded section draws its samples.
     fn reference_fixed_tick(world: &mut World, ticks_per_chunk: u32, tick_index: u64) {
-        let registry = BlockRegistry::new();
+        let registry = BlockRegistry::get();
         let mut coords: Vec<ChunkCoord> = world.chunks.keys().copied().collect();
         coords.sort_unstable_by_key(|c| (c.x, c.y, c.z));
         let world_seed = world.seed();

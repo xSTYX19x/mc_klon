@@ -301,7 +301,7 @@ pub(crate) fn encode_column(world: &World, cx: i32, cz: i32) -> io::Result<Vec<u
         ));
     }
 
-    let block_registry = BlockRegistry::new();
+    let block_registry = BlockRegistry::get();
     // The encoder works on slices, so paletted sections are decoded once per
     // saved column. Decoding is done up front because `section_inputs` borrows
     // from it. Saving is background work, not a frame-path cost.
@@ -335,12 +335,12 @@ pub(crate) fn encode_column(world: &World, cx: i32, cz: i32) -> io::Result<Vec<u
         min_section_y,
         max_section_y,
         section_inputs,
-        &block_registry,
+        block_registry,
     )
 }
 
 pub(crate) fn encode_column_snapshot(snapshot: &ColumnSaveSnapshot) -> io::Result<Vec<u8>> {
-    let block_registry = BlockRegistry::new();
+    let block_registry = BlockRegistry::get();
     // Same decode-up-front reason as `encode_column`: the inputs borrow slices.
     let decoded: Vec<(i32, Vec<BlockId>, &[u8])> = snapshot
         .sections
@@ -370,7 +370,7 @@ pub(crate) fn encode_column_snapshot(snapshot: &ColumnSaveSnapshot) -> io::Resul
         snapshot.min_section_y,
         snapshot.max_section_y,
         section_inputs,
-        &block_registry,
+        block_registry,
     )
 }
 
@@ -669,7 +669,7 @@ pub(crate) fn decode_chunk_from_section_blob(
     section: &SectionBlob,
 ) -> io::Result<Option<Chunk>> {
     validate_column_for_world(world, column)?;
-    let block_registry = BlockRegistry::new();
+    let block_registry = BlockRegistry::get();
     let data_bytes = section.data.decode_values()?;
     let mut any_non_air = false;
     let blocks = match &section.blocks {
@@ -2053,7 +2053,7 @@ mod v2_size_report {
             ("rd161348_like", WorldgenPreset::Rd161348Like),
             ("hilly", WorldgenPreset::Hilly),
         ];
-        let reg = BlockRegistry::new();
+        let reg = BlockRegistry::get();
 
         let mut all = Breakdown::default();
         let mut all_raw_z = 0usize;
@@ -2093,7 +2093,7 @@ mod v2_size_report {
 
                     agg.add(&breakdown(&blob));
                     raw_z += zlib_len(&bytes);
-                    compact_z += zlib_len(&compact_id_palette_bytes(&bytes, &blob, &reg));
+                    compact_z += zlib_len(&compact_id_palette_bytes(&bytes, &blob, reg));
                     colpal_z += zlib_len(&column_palette_bytes(&bytes, &blob));
                     columns += 1;
                 }
@@ -2171,7 +2171,7 @@ mod v2_size_report {
                 let blob = decode_column(&bytes).expect("decode built column");
                 built_agg.add(&breakdown(&blob));
                 built_raw_z += zlib_len(&bytes);
-                built_compact_z += zlib_len(&compact_id_palette_bytes(&bytes, &blob, &reg));
+                built_compact_z += zlib_len(&compact_id_palette_bytes(&bytes, &blob, reg));
                 built_colpal_z += zlib_len(&column_palette_bytes(&bytes, &blob));
             }
         }

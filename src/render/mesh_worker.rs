@@ -205,14 +205,14 @@ mod tests {
     use crate::world::{Chunk, World};
 
     fn test_texture_lookup() -> BlockTextureLookup {
-        let registry = BlockRegistry::new();
+        let registry = BlockRegistry::get();
         let key_to_layer: HashMap<String, u32> = registry
             .collect_texture_keys()
             .into_iter()
             .enumerate()
             .map(|(i, key)| (key, i as u32 + 1))
             .collect();
-        BlockTextureLookup::new(&registry, &key_to_layer, 0)
+        BlockTextureLookup::new(registry, &key_to_layer, 0)
     }
 
     fn snapshot_for(world: &World, coord: ChunkCoord) -> NeighborhoodSnapshot {

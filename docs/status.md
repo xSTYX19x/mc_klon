@@ -47,6 +47,13 @@ That direction is now active in the code:
 - plant-like decorative blocks use smaller centered selection boxes instead of full-block targeting
 - decorative cross-plants remain non-colliding and non-occluding
 
+### Block Registry
+
+- every block is declared once in the `blocks!` macro (`src/blocks/mod.rs`), which generates `BlockId`, the spec table, and `BLOCK_COUNT`; runtime ids follow declaration order and only grow by appending
+- block specs are built from defaults (`BlockSpec::cube` / `cube_top_side_bottom` / `plant` plus `with_*` modifiers), so an ordinary new block is a single entry
+- the creative palette is sorted from each block's `creative_order` at compile time
+- `BlockRegistry::get()` is a static view over the table; nothing is rebuilt per saved or loaded column
+
 ### Startup / Streaming
 
 - startup enters a loading state before gameplay

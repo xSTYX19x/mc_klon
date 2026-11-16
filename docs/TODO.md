@@ -43,7 +43,8 @@ nächsten billiger macht:
 
 1. Welt-Änderungsjournal (unten) — Grundgerüst steht seit 2026-11-16; offen
    sind Batch-Pfad und das Angleichen der Sonderpfade.
-2. Block-Registry per Makro, `BlockId` → `u16` vorbereiten (unten).
+2. Block-Registry per Makro (unten) — `blocks!` steht seit 2026-11-16; offen
+   ist nur `BlockId` → `u16`, sobald mehr als ~200 Blöcke absehbar sind.
 3. Block-State-Datenschicht (→ "Content-Abgleich / Querschnitts-Voraussetzung:
    Block-States").
 4. Blockmodelle und Voxel-Shapes (→ "Rendering", erster Punkt).
@@ -98,50 +99,38 @@ nächsten billiger macht:
     betroffenem Chunk statt 10 000 Einzelreparaturen; Fluid- und Sand-Pfad
     verwerfen keine Journal-Einträge mehr.
 
-- **Block-Registry per Makro, `BlockId` auf `u16` vorbereiten**
-  - *Ist:* Ein neuer Block braucht Handarbeit an vier Stellen: Enum-Variante
-    mit explizitem Diskriminanten (`blocks/mod.rs:83-137`, `#[repr(u8)]`),
-    Zeile in `BLOCK_SPECS: [BlockSpec; 51]` (`:700`), Eintrag in
-    `CLASSIC_PALETTE_ORDER: [BlockId; 43]` (`:139`), und beide Array-Längen
-    müssen mitwachsen. `repr(u8)` deckelt die Registry bei **256 Blocktypen**;
-    mehrere Tabellen hängen an dieser Zahl (`by_block: [BlockTextureInfo; 256]`,
-    `:2199`; `runtime_to_manifest_lut: [u32; 256]`, `world/manifest.rs:129`).
-    Der Vanilla-Umfang liegt bei über 1000 Blocktypen. Daneben baut
-    `BlockRegistry::new()` bei jedem Aufruf eine `HashMap<BlockId, BlockDef>`
-    (`blocks/mod.rs:2071-2085`) — auch pro gespeicherter/geladener Spalte
-    (`storage/chunk_codec.rs:304`, `:343`, `:672`) und einmal im
-    `RandomTicksSystem`, das `defs` gar nicht liest
-    (`world/random_ticks_system.rs:20`). Positiv: das Speicherformat speichert
-    Blocknamen, nicht IDs (`chunk_codec.rs:110-117`) — die Laufzeit-ID ist frei
-    änderbar, ohne Saves zu brechen.
-  - *Ziel:* Ein Block = ein Eintrag an genau einer Stelle; Laufzeit-IDs dicht,
-    aus der Deklarationsreihenfolge vergeben; Blockmodelle und
-    Blockstate-Varianten als Dateien (siehe "Rendering").
-  - *Vorbild:* Vanilla `Registry` + `BlockBehaviour.Properties` (Builder);
-    FerriteCore (Property-Tabellen einmal pro Block statt pro State).
-    Rust-Übertragung: ein `macro_rules!`-Makro `blocks! { stone => {…}, … }`,
-    das Enum, `BLOCK_SPECS` und `BLOCK_COUNT` erzeugt. Eine Laufzeit-Registry
-    ist unnötig, weil es kein Laufzeit-Modding gibt.
-  - *Vorgehen:* 1) Makro einführen, das aus einer Liste Enum + Tabelle + Länge
-    generiert; die 51 Einträge umziehen, Diskriminanten bleiben identisch
-    (`debug_assert_block_blueprint_integrity`, `blocks/mod.rs:2785`).
-    2) Palette-Reihenfolge als Feld `creative_order: Option<u16>` statt
-    zweitem Array. 3) `BlockRegistry` auf eine `&'static`-Sicht über die
-    Tabelle reduzieren (keine HashMap, kein `new()` pro Spalte). 4) `repr(u8)`
-    → `repr(u16)` erst, wenn mehr als ~200 Blöcke absehbar sind: kostet 4 KiB
-    mehr pro `ChunkBlocks::Flat`-Sektion (`world/chunk.rs:332-338`) und im
-    Mesher-Halo (`meshing/neighborhood.rs:37-50`); paletted/uniform Sektionen
-    und das Speicherformat bleiben gleich. Vorher den Anteil Flat-Sektionen
-    messen (siehe Performance "Editierte Sektionen wieder kompaktieren").
-  - *Dateien:* `blocks/mod.rs`, `registry/mod.rs`, `world/manifest.rs`,
-    `storage/chunk_codec.rs`, `world/random_ticks_system.rs`; Items
-    (`src/items/`, siehe "Items, Inventar & Crafting") in derselben Bauform.
-  - *Abhängigkeiten:* keine. Vor der Block-State-Schicht und vor den
-    a1.0.17-Blöcken erledigen, damit diese nicht mehr von Hand in feste Arrays
-    müssen.
-  - *Priorität/Aufwand/Impact:* **P2**, M, hoch für das Content-Tempo.
-  - *Akzeptanz:* Neuer Testblock = eine Makrozeile + Textur, kein Edit an
-    Array-Längen; `cargo test` grün; ein Save von vorher lädt unverändert.
+- **Block-Registry per Makro: `BlockId` auf `u16` umstellen**
+  - *Ist:* Seit 2026-11-16 erzeugt das Makro `blocks!` (`blocks/mod.rs`,
+    `macro_rules! blocks`) aus einer Liste `BlockId`, `BLOCK_SPECS` und
+    `BLOCK_COUNT`; Laufzeit-IDs folgen der Deklarationsreihenfolge. Ein
+    gewöhnlicher Block ist ein Eintrag (`BlockSpec::cube(…)` plus
+    `with_*`-Modifikatoren), die Creative-Palette ergibt sich aus
+    `creative_order`, und `BlockRegistry::get()` ist eine statische Sicht auf
+    die Tabelle. Offen: `BlockId` ist weiter `#[repr(u8)]` und deckelt die
+    Registry bei **256 Blocktypen** (Vanilla: über 1000). An dieser Zahl hängen
+    `BlockSpec::id: u8`, `BlockId::to_u8`/`from_u8`,
+    `by_block: [BlockTextureInfo; 256]` (`BlockTextureLookup`),
+    `runtime_to_manifest_lut: [u32; 256]` (`world/manifest.rs`, `IdMapper`) und
+    die Schleifen `0u16..=255` in `WorldManifest::build_from_registry` und den
+    Block-Tests. Das Speicherformat speichert Blocknamen
+    (`EncodedBlocks::NamePaletteBitpacked`); nur Saves ohne Manifest speichern
+    Laufzeit-IDs roh, deshalb werden Blöcke nur angehängt (Test
+    `pre_macro_blocks_keep_their_runtime_ids`).
+  - *Ziel:* Mehr als 256 Blocktypen ohne Umbau; Laufzeit-IDs bleiben dicht.
+  - *Vorbild:* Vanilla `Registry` (dichte Integer-IDs, Namen im Speicherformat).
+  - *Vorgehen:* `repr(u8)` → `repr(u16)` erst, wenn mehr als ~200 Blöcke
+    absehbar sind: kostet 4 KiB mehr pro `ChunkBlocks::Flat`-Sektion
+    (`world/chunk.rs`) und im Mesher-Halo (`meshing/neighborhood.rs`);
+    paletted/uniform Sektionen und das Speicherformat bleiben gleich. Vorher den
+    Anteil Flat-Sektionen messen (siehe Performance "Editierte Sektionen wieder
+    kompaktieren"). Die 256er-Tabellen dabei auf `BLOCK_COUNT` umstellen.
+  - *Dateien:* `blocks/mod.rs`, `world/manifest.rs`, `world/chunk.rs`,
+    `meshing/neighborhood.rs`; Items (siehe "Items, Inventar & Crafting") in
+    derselben Bauform wie `blocks!`.
+  - *Abhängigkeiten:* Messung des Flat-Sektionsanteils (s. o.).
+  - *Priorität/Aufwand/Impact:* **P3**, S, erst ab ~200 Blöcken relevant.
+  - *Akzeptanz:* Ein Testblock mit ID ≥ 256 lässt sich setzen, speichern und
+    laden; `cargo test` grün; ein Save von vorher lädt unverändert.
 
 - **Block-Verhalten: Neighbor-Updates und Scheduled Ticks für Blöcke**
   - *Ist:* Es gibt nur Random Ticks (`RandomTickFn`, `blocks/mod.rs:81`; zwei
@@ -681,7 +670,7 @@ isolierter, kleiner Change.
 
 ### Blöcke (Inhalt)
 
-Heute registriert: 51 IDs (`BlockId`, `blocks/mod.rs:85-137`). Fehlend gegenüber
+Heute registriert: 51 IDs (`blocks!`, `blocks/mod.rs`). Fehlend gegenüber
 der Vorlage. Der Blocktextur-Bestand deckt fast alles ab
 (`assets/minecraft/textures/block/`, 2113 Dateien inkl. Normal-/Specular-
 Varianten): `torch`, `ladder`, `clay`, `cactus_*`, `sugar_cane`, `diamond_ore`,
@@ -695,10 +684,8 @@ Entity-artiges Modell mit eigener Textur gebaut werden, nicht als Würfel aus de
 Blockatlas. **Zaun** und **Knopf** haben keine eigene Textur und leihen sich
 Planken bzw. Stein — beim Modellbau bewusst so umsetzen.
 
-**Ohne neue Blockform (billig, reine Tabellen-Einträge in `BLOCK_SPECS`
-(`blocks/mod.rs:700`) plus `CLASSIC_PALETTE_ORDER` (`:139`)):** beides sind
-Arrays fester Länge (`[BlockSpec; 51]`, `[BlockId; 43]`), die Zahl im Typ muss
-also je Block mitwachsen.
+**Ohne neue Blockform (billig, je ein Eintrag im Makro `blocks!` in
+`blocks/mod.rs`; `with_creative_order` reiht ihn in die Palette ein):**
 
 - Diamanterz, Redstone-Erz, Diamantblock. (Lapis gehört nicht zu a1.0.17,
   er kam mit Beta 1.2.) Erz-Seite: neue Einträge in

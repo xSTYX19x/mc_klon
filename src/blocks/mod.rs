@@ -80,113 +80,70 @@ pub(crate) const TINT_WATER: u32 = 2;
 pub(crate) type BlockStateId = BlockId;
 pub(crate) type RandomTickFn = fn(&mut World, IVec3, BlockStateId, u64);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub(crate) enum BlockId {
-    Air = 0,
-    Grass = 1,
-    Stone = 2,
-    Dirt = 3,
-    Sapling = 4,
-    OakPlanks = 5,
-    Bedrock = 6,
-    WaterStill = 7,
-    WaterFlowing = 8,
-    LavaStill = 9,
-    LavaFlowing = 10,
-    Cobblestone = 11,
-    Obsidian = 12,
-    Sand = 13,
-    Bricks = 14,
-    OakLog = 15,
-    OakLeaves = 16,
-    Glass = 17,
-    StoneSlab = 18,
-    MossyCobblestone = 19,
-    Gravel = 20,
-    Sponge = 21,
-    Dandelion = 22,
-    Poppy = 23,
-    BrownMushroom = 24,
-    RedMushroom = 25,
-    CoalOre = 26,
-    IronOre = 27,
-    GoldOre = 28,
-    IronBlock = 29,
-    GoldBlock = 30,
-    Bookshelf = 31,
-    Tnt = 32,
-    WhiteWool = 33,
-    OrangeWool = 34,
-    MagentaWool = 35,
-    LightBlueWool = 36,
-    YellowWool = 37,
-    LimeWool = 38,
-    PinkWool = 39,
-    GrayWool = 40,
-    LightGrayWool = 41,
-    CyanWool = 42,
-    PurpleWool = 43,
-    BlueWool = 44,
-    BrownWool = 45,
-    GreenWool = 46,
-    RedWool = 47,
-    BlackWool = 48,
-    Ice = 49,
-    Snow = 50,
+/// Declares every block in one place: each `Variant => spec` entry becomes a
+/// `BlockId` variant and the matching `BLOCK_SPECS` row, and `BLOCK_COUNT`
+/// follows from the list. The runtime id is the entry's position.
+///
+/// Only ever append: pre-manifest saves store runtime ids raw
+/// (`WorldManifest::build_from_registry` keeps them as manifest ids), so moving
+/// an entry renumbers blocks in those worlds.
+macro_rules! blocks {
+    ($($variant:ident => $spec:expr,)+) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        #[repr(u8)]
+        pub(crate) enum BlockId {
+            $($variant,)+
+        }
+
+        pub(crate) const BLOCK_COUNT: usize = [$(BlockId::$variant),+].len();
+
+        const BLOCK_SPECS: [BlockSpec; BLOCK_COUNT] =
+            [$($spec.with_variant(BlockId::$variant),)+];
+    };
 }
 
-pub(crate) const CLASSIC_PALETTE_ORDER: [BlockId; 43] = [
-    // Row 1
-    BlockId::Stone,
-    BlockId::Cobblestone,
-    BlockId::Bricks,
-    BlockId::Dirt,
-    BlockId::Grass,
-    BlockId::OakPlanks,
-    BlockId::OakLog,
-    BlockId::OakLeaves,
-    BlockId::Glass,
-    BlockId::StoneSlab,
-    // Row 2
-    BlockId::MossyCobblestone,
-    BlockId::Sapling,
-    BlockId::Dandelion,
-    BlockId::Poppy,
-    BlockId::BrownMushroom,
-    BlockId::RedMushroom,
-    BlockId::Sand,
-    BlockId::Gravel,
-    BlockId::Sponge,
-    // Rows 3-4
-    BlockId::WhiteWool,
-    BlockId::OrangeWool,
-    BlockId::MagentaWool,
-    BlockId::LightBlueWool,
-    BlockId::YellowWool,
-    BlockId::LimeWool,
-    BlockId::PinkWool,
-    BlockId::GrayWool,
-    BlockId::LightGrayWool,
-    BlockId::CyanWool,
-    BlockId::PurpleWool,
-    BlockId::BlueWool,
-    BlockId::BrownWool,
-    BlockId::GreenWool,
-    BlockId::RedWool,
-    BlockId::BlackWool,
-    // Row 5
-    BlockId::GoldOre,
-    BlockId::IronOre,
-    BlockId::CoalOre,
-    BlockId::GoldBlock,
-    BlockId::IronBlock,
-    BlockId::Bookshelf,
-    BlockId::Tnt,
-    BlockId::Obsidian,
-];
+/// The creative inventory palette: every block with a `creative_order`, sorted
+/// by it at compile time.
+pub(crate) const CLASSIC_PALETTE: &[BlockId] = &CREATIVE_PALETTE;
 
-pub(crate) const CLASSIC_PALETTE: &[BlockId] = &CLASSIC_PALETTE_ORDER;
+const CREATIVE_PALETTE_LEN: usize = {
+    let mut len = 0;
+    let mut i = 0;
+    while i < BLOCK_COUNT {
+        if BLOCK_SPECS[i].creative_order.is_some() {
+            len += 1;
+        }
+        i += 1;
+    }
+    len
+};
+
+const CREATIVE_PALETTE: [BlockId; CREATIVE_PALETTE_LEN] = {
+    // Insertion sort; two blocks claiming the same slot fail the build.
+    let mut blocks = [BlockId::Air; CREATIVE_PALETTE_LEN];
+    let mut orders = [0u16; CREATIVE_PALETTE_LEN];
+    let mut len = 0;
+    let mut i = 0;
+    while i < BLOCK_COUNT {
+        if let Some(order) = BLOCK_SPECS[i].creative_order {
+            let mut slot = len;
+            while slot > 0 && orders[slot - 1] > order {
+                orders[slot] = orders[slot - 1];
+                blocks[slot] = blocks[slot - 1];
+                slot -= 1;
+            }
+            assert!(
+                slot == 0 || orders[slot - 1] != order,
+                "two blocks share a creative_order"
+            );
+            orders[slot] = order;
+            blocks[slot] = BLOCK_SPECS[i].variant;
+            len += 1;
+        }
+        i += 1;
+    }
+    blocks
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Face {
@@ -512,6 +469,146 @@ struct BlockSpec {
     face_tint: FaceTintSpec,
     block_entity: Option<&'static str>,
     random_tick: Option<RandomTickFn>,
+    /// Position in the creative palette (`CLASSIC_PALETTE`); `None` keeps the
+    /// block out of it.
+    creative_order: Option<u16>,
+}
+
+/// Builders for `blocks!` entries. `new` is the common case — a solid, opaque,
+/// breakable full block that culls against itself — and every deviation is a
+/// modifier, so an ordinary block is one line.
+impl BlockSpec {
+    const fn new(
+        key: &'static str,
+        display_name: &'static str,
+        model: BlockModelSpec,
+        particle_color: [f32; 3],
+    ) -> Self {
+        Self {
+            // Placeholders; `blocks!` sets both via `with_variant`.
+            id: 0,
+            variant: BlockId::Air,
+            key,
+            key_aliases: &[],
+            display_name,
+            model,
+            render_layer: RenderLayer::Opaque,
+            cull_group: CullGroupSpec::SelfBlock,
+            face_occluding: true,
+            solid: true,
+            skylight: SkylightSpec::FromShape,
+            breakable: true,
+            emitted_light: 0,
+            particle_color,
+            face_tint: FaceTintSpec::None,
+            block_entity: None,
+            random_tick: None,
+            creative_order: None,
+        }
+    }
+
+    const fn cube(
+        key: &'static str,
+        display_name: &'static str,
+        all: TextureKey,
+        particle_color: [f32; 3],
+    ) -> Self {
+        let model = BlockModelSpec::CubeAll { all };
+        Self::new(key, display_name, model, particle_color)
+    }
+
+    const fn cube_top_side_bottom(
+        key: &'static str,
+        display_name: &'static str,
+        top: TextureKey,
+        side: TextureKey,
+        bottom: TextureKey,
+        particle_color: [f32; 3],
+    ) -> Self {
+        let model = BlockModelSpec::CubeTopSideBottom { top, side, bottom };
+        Self::new(key, display_name, model, particle_color)
+    }
+
+    /// A cross-shaped plant: cutout, walk-through, occludes nothing.
+    const fn plant(
+        key: &'static str,
+        display_name: &'static str,
+        texture: TextureKey,
+        particle_color: [f32; 3],
+    ) -> Self {
+        let model = BlockModelSpec::PlantCross { texture };
+        Self::new(key, display_name, model, particle_color)
+            .with_layer(RenderLayer::Cutout)
+            .with_cull(CullGroupSpec::None)
+            .non_occluding()
+            .non_solid()
+    }
+
+    const fn with_variant(mut self, variant: BlockId) -> Self {
+        self.id = variant as u8;
+        self.variant = variant;
+        self
+    }
+
+    const fn with_aliases(mut self, key_aliases: &'static [&'static str]) -> Self {
+        self.key_aliases = key_aliases;
+        self
+    }
+
+    const fn with_layer(mut self, render_layer: RenderLayer) -> Self {
+        self.render_layer = render_layer;
+        self
+    }
+
+    const fn with_cull(mut self, cull_group: CullGroupSpec) -> Self {
+        self.cull_group = cull_group;
+        self
+    }
+
+    const fn non_occluding(mut self) -> Self {
+        self.face_occluding = false;
+        self
+    }
+
+    const fn non_solid(mut self) -> Self {
+        self.solid = false;
+        self
+    }
+
+    const fn with_skylight(mut self, skylight: SkylightSpec) -> Self {
+        self.skylight = skylight;
+        self
+    }
+
+    const fn unbreakable(mut self) -> Self {
+        self.breakable = false;
+        self
+    }
+
+    const fn with_light(mut self, emitted_light: u8) -> Self {
+        self.emitted_light = emitted_light;
+        self
+    }
+
+    const fn with_tint_all(mut self, tint_kind: u32) -> Self {
+        self.face_tint = FaceTintSpec::All(tint_kind);
+        self
+    }
+
+    const fn with_block_entity(mut self, key: &'static str) -> Self {
+        self.block_entity = Some(key);
+        self
+    }
+
+    const fn with_random_tick(mut self, callback: RandomTickFn) -> Self {
+        self.random_tick = Some(callback);
+        self
+    }
+
+    const fn with_creative_order(mut self, order: u16) -> Self {
+        self.creative_order = Some(order);
+        self
+    }
 }
 
 impl BlockSpec {
@@ -682,1081 +779,274 @@ impl BlockSpec {
     }
 }
 
-const AIR_KEY_ALIASES: [&str; 1] = ["core:air"];
-const GRASS_KEY_ALIASES: [&str; 1] = ["core:grass"];
-const STONE_KEY_ALIASES: [&str; 1] = ["core:stone"];
-const DIRT_KEY_ALIASES: [&str; 1] = ["core:dirt"];
-const SAPLING_KEY_ALIASES: [&str; 1] = ["core:sapling"];
-const OAK_PLANKS_KEY_ALIASES: [&str; 1] = ["core:oak_planks"];
-const BEDROCK_KEY_ALIASES: [&str; 1] = ["core:bedrock"];
-const WATER_STILL_KEY_ALIASES: [&str; 1] = ["core:water_still"];
-const WATER_FLOWING_KEY_ALIASES: [&str; 1] = ["core:water_flowing"];
-const LAVA_STILL_KEY_ALIASES: [&str; 1] = ["core:lava_still"];
-const LAVA_FLOWING_KEY_ALIASES: [&str; 1] = ["core:lava_flowing"];
-const COBBLESTONE_KEY_ALIASES: [&str; 1] = ["core:cobblestone"];
-const OBSIDIAN_KEY_ALIASES: [&str; 1] = ["core:obsidian"];
-const SAND_KEY_ALIASES: [&str; 1] = ["core:sand"];
-
-const BLOCK_SPECS: [BlockSpec; 51] = [
-    BlockSpec {
-        id: 0,
-        variant: BlockId::Air,
-        key: "minecraft:air",
-        key_aliases: &AIR_KEY_ALIASES,
-        display_name: "Air",
-        model: BlockModelSpec::None,
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::None,
-        face_occluding: false,
-        solid: false,
-        skylight: SkylightSpec::FromShape,
-        breakable: false,
-        emitted_light: 0,
-        particle_color: [0.0, 0.0, 0.0],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 1,
-        variant: BlockId::Grass,
-        key: "minecraft:grass_block",
-        key_aliases: &GRASS_KEY_ALIASES,
-        display_name: "Grass",
-        model: BlockModelSpec::GrassTopSideBottom {
+blocks! {
+    Air => BlockSpec::new("minecraft:air", "Air", BlockModelSpec::None, [0.0, 0.0, 0.0])
+        .with_aliases(&["core:air"])
+        .with_cull(CullGroupSpec::None)
+        .non_occluding()
+        .non_solid()
+        .unbreakable(),
+    Grass => BlockSpec::new(
+        "minecraft:grass_block", "Grass",
+        BlockModelSpec::GrassTopSideBottom {
             top: TEX_GRASS_TOP,
             side: TEX_GRASS_SIDE,
             bottom: TEX_DIRT,
         },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.35, 0.75, 0.25],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: Some(grass_random_tick),
-    },
-    BlockSpec {
-        id: 2,
-        variant: BlockId::Stone,
-        key: "minecraft:stone",
-        key_aliases: &STONE_KEY_ALIASES,
-        display_name: "Stone",
-        model: BlockModelSpec::CubeTopSideBottom {
-            top: TEX_STONE,
-            side: TEX_STONE,
-            bottom: TEX_STONE,
-        },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.55, 0.55, 0.58],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 3,
-        variant: BlockId::Dirt,
-        key: "minecraft:dirt",
-        key_aliases: &DIRT_KEY_ALIASES,
-        display_name: "Dirt",
-        model: BlockModelSpec::CubeAll { all: TEX_DIRT },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.49, 0.34, 0.20],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 4,
-        variant: BlockId::Sapling,
-        key: "minecraft:oak_sapling",
-        key_aliases: &SAPLING_KEY_ALIASES,
-        display_name: "Sapling",
-        model: BlockModelSpec::PlantCross {
-            texture: TEX_SAPLING,
-        },
-        render_layer: RenderLayer::Cutout,
-        cull_group: CullGroupSpec::None,
-        face_occluding: false,
-        solid: false,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.28, 0.88, 0.36],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: Some(sapling_random_tick),
-    },
-    BlockSpec {
-        id: 5,
-        variant: BlockId::OakPlanks,
-        key: "minecraft:oak_planks",
-        key_aliases: &OAK_PLANKS_KEY_ALIASES,
-        display_name: "Oak Planks",
-        model: BlockModelSpec::CubeAll {
-            all: TEX_OAK_PLANKS,
-        },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.68, 0.56, 0.34],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 6,
-        variant: BlockId::Bedrock,
-        key: "minecraft:bedrock",
-        key_aliases: &BEDROCK_KEY_ALIASES,
-        display_name: "Bedrock",
-        model: BlockModelSpec::CubeAll { all: TEX_BEDROCK },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: false,
-        emitted_light: 0,
-        particle_color: [0.32, 0.32, 0.34],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 7,
-        variant: BlockId::WaterStill,
-        key: "minecraft:water",
-        key_aliases: &WATER_STILL_KEY_ALIASES,
-        display_name: "Water (Still)",
-        model: BlockModelSpec::LiquidTopSideBottom {
+        [0.35, 0.75, 0.25],
+    )
+    .with_aliases(&["core:grass"])
+    .with_random_tick(grass_random_tick)
+    .with_creative_order(4),
+    Stone => BlockSpec::cube_top_side_bottom(
+        "minecraft:stone", "Stone", TEX_STONE, TEX_STONE, TEX_STONE, [0.55, 0.55, 0.58],
+    )
+    .with_aliases(&["core:stone"])
+    .with_creative_order(0),
+    Dirt => BlockSpec::cube("minecraft:dirt", "Dirt", TEX_DIRT, [0.49, 0.34, 0.20])
+        .with_aliases(&["core:dirt"])
+        .with_creative_order(3),
+    Sapling => BlockSpec::plant("minecraft:oak_sapling", "Sapling", TEX_SAPLING, [0.28, 0.88, 0.36])
+        .with_aliases(&["core:sapling"])
+        .with_random_tick(sapling_random_tick)
+        .with_creative_order(11),
+    OakPlanks => BlockSpec::cube(
+        "minecraft:oak_planks", "Oak Planks", TEX_OAK_PLANKS, [0.68, 0.56, 0.34],
+    )
+    .with_aliases(&["core:oak_planks"])
+    .with_creative_order(5),
+    Bedrock => BlockSpec::cube("minecraft:bedrock", "Bedrock", TEX_BEDROCK, [0.32, 0.32, 0.34])
+        .with_aliases(&["core:bedrock"])
+        .unbreakable(),
+    WaterStill => BlockSpec::new(
+        "minecraft:water", "Water (Still)",
+        BlockModelSpec::LiquidTopSideBottom {
             kind: FluidKind::Water,
             top: TEX_WATER_STILL,
             side: TEX_WATER_STILL,
             bottom: TEX_WATER_STILL,
         },
-        render_layer: RenderLayer::Transparent,
-        cull_group: CullGroupSpec::Water,
-        face_occluding: false,
-        solid: false,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.26, 0.48, 0.95],
-        face_tint: FaceTintSpec::All(TINT_WATER),
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 8,
-        variant: BlockId::WaterFlowing,
-        key: "minecraft:flowing_water",
-        key_aliases: &WATER_FLOWING_KEY_ALIASES,
-        display_name: "Water (Flowing)",
-        model: BlockModelSpec::LiquidTopSideBottom {
+        [0.26, 0.48, 0.95],
+    )
+    .with_aliases(&["core:water_still"])
+    .with_layer(RenderLayer::Transparent)
+    .with_cull(CullGroupSpec::Water)
+    .non_occluding()
+    .non_solid()
+    .with_tint_all(TINT_WATER),
+    WaterFlowing => BlockSpec::new(
+        "minecraft:flowing_water", "Water (Flowing)",
+        BlockModelSpec::LiquidTopSideBottom {
             kind: FluidKind::Water,
             top: TEX_WATER_STILL,
             side: TEX_WATER_FLOW,
             bottom: TEX_WATER_STILL,
         },
-        render_layer: RenderLayer::Transparent,
-        cull_group: CullGroupSpec::Water,
-        face_occluding: false,
-        solid: false,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.26, 0.48, 0.95],
-        face_tint: FaceTintSpec::All(TINT_WATER),
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 9,
-        variant: BlockId::LavaStill,
-        key: "minecraft:lava",
-        key_aliases: &LAVA_STILL_KEY_ALIASES,
-        display_name: "Lava (Still)",
-        model: BlockModelSpec::LiquidTopSideBottom {
+        [0.26, 0.48, 0.95],
+    )
+    .with_aliases(&["core:water_flowing"])
+    .with_layer(RenderLayer::Transparent)
+    .with_cull(CullGroupSpec::Water)
+    .non_occluding()
+    .non_solid()
+    .with_tint_all(TINT_WATER),
+    LavaStill => BlockSpec::new(
+        "minecraft:lava", "Lava (Still)",
+        BlockModelSpec::LiquidTopSideBottom {
             kind: FluidKind::Lava,
             top: TEX_LAVA_STILL,
             side: TEX_LAVA_STILL,
             bottom: TEX_LAVA_STILL,
         },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::Lava,
-        face_occluding: false,
-        solid: false,
-        skylight: SkylightSpec::FromShape,
-        breakable: false,
-        emitted_light: 15,
-        particle_color: [0.94, 0.44, 0.10],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 10,
-        variant: BlockId::LavaFlowing,
-        key: "minecraft:flowing_lava",
-        key_aliases: &LAVA_FLOWING_KEY_ALIASES,
-        display_name: "Lava (Flowing)",
-        model: BlockModelSpec::LiquidTopSideBottom {
+        [0.94, 0.44, 0.10],
+    )
+    .with_aliases(&["core:lava_still"])
+    .with_cull(CullGroupSpec::Lava)
+    .non_occluding()
+    .non_solid()
+    .unbreakable()
+    .with_light(15),
+    LavaFlowing => BlockSpec::new(
+        "minecraft:flowing_lava", "Lava (Flowing)",
+        BlockModelSpec::LiquidTopSideBottom {
             kind: FluidKind::Lava,
             top: TEX_LAVA_STILL,
             side: TEX_LAVA_FLOW,
             bottom: TEX_LAVA_STILL,
         },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::Lava,
-        face_occluding: false,
-        solid: false,
-        skylight: SkylightSpec::FromShape,
-        breakable: false,
-        emitted_light: 15,
-        particle_color: [0.94, 0.44, 0.10],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 11,
-        variant: BlockId::Cobblestone,
-        key: "minecraft:cobblestone",
-        key_aliases: &COBBLESTONE_KEY_ALIASES,
-        display_name: "Cobblestone",
-        model: BlockModelSpec::CubeAll {
-            all: TEX_COBBLESTONE,
-        },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.48, 0.48, 0.50],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 12,
-        variant: BlockId::Obsidian,
-        key: "minecraft:obsidian",
-        key_aliases: &OBSIDIAN_KEY_ALIASES,
-        display_name: "Obsidian",
-        model: BlockModelSpec::CubeAll { all: TEX_OBSIDIAN },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.16, 0.10, 0.22],
-        face_tint: FaceTintSpec::None,
-        block_entity: Some(CORE_FURNACE_STUB_BLOCK_ENTITY_KEY),
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 13,
-        variant: BlockId::Sand,
-        key: "minecraft:sand",
-        key_aliases: &SAND_KEY_ALIASES,
-        display_name: "Sand",
-        model: BlockModelSpec::CubeAll { all: TEX_SAND },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.85, 0.80, 0.55],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 14,
-        variant: BlockId::Bricks,
-        key: "minecraft:bricks",
-        key_aliases: &[],
-        display_name: "Bricks",
-        model: BlockModelSpec::CubeAll { all: TEX_BRICKS },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.66, 0.31, 0.25],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 15,
-        variant: BlockId::OakLog,
-        key: "minecraft:oak_log",
-        key_aliases: &[],
-        display_name: "Oak Log",
-        model: BlockModelSpec::CubeTopSideBottom {
-            top: TEX_OAK_LOG_TOP,
-            side: TEX_OAK_LOG_SIDE,
-            bottom: TEX_OAK_LOG_TOP,
-        },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.55, 0.42, 0.26],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 16,
-        variant: BlockId::OakLeaves,
-        key: "minecraft:oak_leaves",
-        key_aliases: &[],
-        display_name: "Oak Leaves",
-        model: BlockModelSpec::CubeAll {
-            all: TEX_OAK_LEAVES,
-        },
-        render_layer: RenderLayer::Cutout,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: false,
-        solid: true,
-        skylight: SkylightSpec::Blocks,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.24, 0.56, 0.22],
-        face_tint: FaceTintSpec::All(TINT_GRASS_TOP),
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 17,
-        variant: BlockId::Glass,
-        key: "minecraft:glass",
-        key_aliases: &[],
-        display_name: "Glass",
-        model: BlockModelSpec::CubeAll { all: TEX_GLASS },
-        render_layer: RenderLayer::Transparent,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: false,
-        solid: true,
-        skylight: SkylightSpec::Transmits,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.82, 0.90, 0.92],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 18,
-        variant: BlockId::StoneSlab,
-        key: "minecraft:stone_slab",
-        key_aliases: &[],
-        display_name: "Stone Slab",
-        model: BlockModelSpec::SlabBottomTopSideBottom {
+        [0.94, 0.44, 0.10],
+    )
+    .with_aliases(&["core:lava_flowing"])
+    .with_cull(CullGroupSpec::Lava)
+    .non_occluding()
+    .non_solid()
+    .unbreakable()
+    .with_light(15),
+    Cobblestone => BlockSpec::cube(
+        "minecraft:cobblestone", "Cobblestone", TEX_COBBLESTONE, [0.48, 0.48, 0.50],
+    )
+    .with_aliases(&["core:cobblestone"])
+    .with_creative_order(1),
+    Obsidian => BlockSpec::cube("minecraft:obsidian", "Obsidian", TEX_OBSIDIAN, [0.16, 0.10, 0.22])
+        .with_aliases(&["core:obsidian"])
+        .with_block_entity(CORE_FURNACE_STUB_BLOCK_ENTITY_KEY)
+        .with_creative_order(42),
+    Sand => BlockSpec::cube("minecraft:sand", "Sand", TEX_SAND, [0.85, 0.80, 0.55])
+        .with_aliases(&["core:sand"])
+        .with_creative_order(16),
+    Bricks => BlockSpec::cube("minecraft:bricks", "Bricks", TEX_BRICKS, [0.66, 0.31, 0.25])
+        .with_creative_order(2),
+    OakLog => BlockSpec::cube_top_side_bottom(
+        "minecraft:oak_log", "Oak Log", TEX_OAK_LOG_TOP, TEX_OAK_LOG_SIDE, TEX_OAK_LOG_TOP,
+        [0.55, 0.42, 0.26],
+    )
+    .with_creative_order(6),
+    OakLeaves => BlockSpec::cube(
+        "minecraft:oak_leaves", "Oak Leaves", TEX_OAK_LEAVES, [0.24, 0.56, 0.22],
+    )
+    .with_layer(RenderLayer::Cutout)
+    .non_occluding()
+    .with_skylight(SkylightSpec::Blocks)
+    .with_tint_all(TINT_GRASS_TOP)
+    .with_creative_order(7),
+    Glass => BlockSpec::cube("minecraft:glass", "Glass", TEX_GLASS, [0.82, 0.90, 0.92])
+        .with_layer(RenderLayer::Transparent)
+        .non_occluding()
+        .with_skylight(SkylightSpec::Transmits)
+        .with_creative_order(8),
+    StoneSlab => BlockSpec::new(
+        "minecraft:stone_slab", "Stone Slab",
+        BlockModelSpec::SlabBottomTopSideBottom {
             top: TEX_STONE_SLAB_TOP,
             side: TEX_STONE_SLAB_SIDE,
             bottom: TEX_STONE_SLAB_TOP,
         },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.70, 0.70, 0.70],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 19,
-        variant: BlockId::MossyCobblestone,
-        key: "minecraft:mossy_cobblestone",
-        key_aliases: &[],
-        display_name: "Mossy Cobblestone",
-        model: BlockModelSpec::CubeAll {
-            all: TEX_MOSSY_COBBLESTONE,
-        },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.41, 0.47, 0.35],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 20,
-        variant: BlockId::Gravel,
-        key: "minecraft:gravel",
-        key_aliases: &[],
-        display_name: "Gravel",
-        model: BlockModelSpec::CubeAll { all: TEX_GRAVEL },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.55, 0.54, 0.52],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 21,
-        variant: BlockId::Sponge,
-        key: "minecraft:sponge",
-        key_aliases: &[],
-        display_name: "Sponge",
-        model: BlockModelSpec::CubeAll { all: TEX_SPONGE },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.86, 0.80, 0.27],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 22,
-        variant: BlockId::Dandelion,
-        key: "minecraft:dandelion",
-        key_aliases: &[],
-        display_name: "Dandelion",
-        model: BlockModelSpec::PlantCross {
-            texture: TEX_DANDELION,
-        },
-        render_layer: RenderLayer::Cutout,
-        cull_group: CullGroupSpec::None,
-        face_occluding: false,
-        solid: false,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.97, 0.84, 0.12],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 23,
-        variant: BlockId::Poppy,
-        key: "minecraft:poppy",
-        key_aliases: &[],
-        display_name: "Poppy",
-        model: BlockModelSpec::PlantCross { texture: TEX_POPPY },
-        render_layer: RenderLayer::Cutout,
-        cull_group: CullGroupSpec::None,
-        face_occluding: false,
-        solid: false,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.82, 0.18, 0.19],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 24,
-        variant: BlockId::BrownMushroom,
-        key: "minecraft:brown_mushroom",
-        key_aliases: &[],
-        display_name: "Brown Mushroom",
-        model: BlockModelSpec::PlantCross {
-            texture: TEX_BROWN_MUSHROOM,
-        },
-        render_layer: RenderLayer::Cutout,
-        cull_group: CullGroupSpec::None,
-        face_occluding: false,
-        solid: false,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.52, 0.36, 0.25],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 25,
-        variant: BlockId::RedMushroom,
-        key: "minecraft:red_mushroom",
-        key_aliases: &[],
-        display_name: "Red Mushroom",
-        model: BlockModelSpec::PlantCross {
-            texture: TEX_RED_MUSHROOM,
-        },
-        render_layer: RenderLayer::Cutout,
-        cull_group: CullGroupSpec::None,
-        face_occluding: false,
-        solid: false,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.80, 0.23, 0.21],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 26,
-        variant: BlockId::CoalOre,
-        key: "minecraft:coal_ore",
-        key_aliases: &[],
-        display_name: "Coal Ore",
-        model: BlockModelSpec::CubeAll { all: TEX_COAL_ORE },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.43, 0.43, 0.43],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 27,
-        variant: BlockId::IronOre,
-        key: "minecraft:iron_ore",
-        key_aliases: &[],
-        display_name: "Iron Ore",
-        model: BlockModelSpec::CubeAll { all: TEX_IRON_ORE },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.73, 0.62, 0.52],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 28,
-        variant: BlockId::GoldOre,
-        key: "minecraft:gold_ore",
-        key_aliases: &[],
-        display_name: "Gold Ore",
-        model: BlockModelSpec::CubeAll { all: TEX_GOLD_ORE },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.82, 0.71, 0.32],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 29,
-        variant: BlockId::IronBlock,
-        key: "minecraft:iron_block",
-        key_aliases: &[],
-        display_name: "Iron Block",
-        model: BlockModelSpec::CubeAll {
-            all: TEX_IRON_BLOCK,
-        },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.88, 0.88, 0.90],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 30,
-        variant: BlockId::GoldBlock,
-        key: "minecraft:gold_block",
-        key_aliases: &[],
-        display_name: "Gold Block",
-        model: BlockModelSpec::CubeAll {
-            all: TEX_GOLD_BLOCK,
-        },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.96, 0.84, 0.27],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 31,
-        variant: BlockId::Bookshelf,
-        key: "minecraft:bookshelf",
-        key_aliases: &[],
-        display_name: "Bookshelf",
-        model: BlockModelSpec::CubeTopSideBottom {
-            top: TEX_OAK_PLANKS,
-            side: TEX_BOOKSHELF_SIDE,
-            bottom: TEX_OAK_PLANKS,
-        },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.61, 0.43, 0.28],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 32,
-        variant: BlockId::Tnt,
-        key: "minecraft:tnt",
-        key_aliases: &[],
-        display_name: "TNT",
-        model: BlockModelSpec::CubeTopSideBottom {
-            top: TEX_TNT_TOP,
-            side: TEX_TNT_SIDE,
-            bottom: TEX_TNT_BOTTOM,
-        },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.83, 0.28, 0.24],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 33,
-        variant: BlockId::WhiteWool,
-        key: "minecraft:white_wool",
-        key_aliases: &[],
-        display_name: "White Wool",
-        model: BlockModelSpec::CubeAll {
-            all: TEX_WHITE_WOOL,
-        },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.93, 0.93, 0.93],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 34,
-        variant: BlockId::OrangeWool,
-        key: "minecraft:orange_wool",
-        key_aliases: &[],
-        display_name: "Orange Wool",
-        model: BlockModelSpec::CubeAll {
-            all: TEX_ORANGE_WOOL,
-        },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.86, 0.50, 0.20],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 35,
-        variant: BlockId::MagentaWool,
-        key: "minecraft:magenta_wool",
-        key_aliases: &[],
-        display_name: "Magenta Wool",
-        model: BlockModelSpec::CubeAll {
-            all: TEX_MAGENTA_WOOL,
-        },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.75, 0.35, 0.73],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 36,
-        variant: BlockId::LightBlueWool,
-        key: "minecraft:light_blue_wool",
-        key_aliases: &[],
-        display_name: "Light Blue Wool",
-        model: BlockModelSpec::CubeAll {
-            all: TEX_LIGHT_BLUE_WOOL,
-        },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.45, 0.62, 0.86],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 37,
-        variant: BlockId::YellowWool,
-        key: "minecraft:yellow_wool",
-        key_aliases: &[],
-        display_name: "Yellow Wool",
-        model: BlockModelSpec::CubeAll {
-            all: TEX_YELLOW_WOOL,
-        },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.90, 0.84, 0.25],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 38,
-        variant: BlockId::LimeWool,
-        key: "minecraft:lime_wool",
-        key_aliases: &[],
-        display_name: "Lime Wool",
-        model: BlockModelSpec::CubeAll { all: TEX_LIME_WOOL },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.50, 0.78, 0.28],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 39,
-        variant: BlockId::PinkWool,
-        key: "minecraft:pink_wool",
-        key_aliases: &[],
-        display_name: "Pink Wool",
-        model: BlockModelSpec::CubeAll { all: TEX_PINK_WOOL },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.94, 0.60, 0.70],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 40,
-        variant: BlockId::GrayWool,
-        key: "minecraft:gray_wool",
-        key_aliases: &[],
-        display_name: "Gray Wool",
-        model: BlockModelSpec::CubeAll { all: TEX_GRAY_WOOL },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.33, 0.36, 0.38],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 41,
-        variant: BlockId::LightGrayWool,
-        key: "minecraft:light_gray_wool",
-        key_aliases: &[],
-        display_name: "Light Gray Wool",
-        model: BlockModelSpec::CubeAll {
-            all: TEX_LIGHT_GRAY_WOOL,
-        },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.61, 0.61, 0.61],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 42,
-        variant: BlockId::CyanWool,
-        key: "minecraft:cyan_wool",
-        key_aliases: &[],
-        display_name: "Cyan Wool",
-        model: BlockModelSpec::CubeAll { all: TEX_CYAN_WOOL },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.27, 0.56, 0.61],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 43,
-        variant: BlockId::PurpleWool,
-        key: "minecraft:purple_wool",
-        key_aliases: &[],
-        display_name: "Purple Wool",
-        model: BlockModelSpec::CubeAll {
-            all: TEX_PURPLE_WOOL,
-        },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.50, 0.31, 0.70],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 44,
-        variant: BlockId::BlueWool,
-        key: "minecraft:blue_wool",
-        key_aliases: &[],
-        display_name: "Blue Wool",
-        model: BlockModelSpec::CubeAll { all: TEX_BLUE_WOOL },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.26, 0.33, 0.69],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 45,
-        variant: BlockId::BrownWool,
-        key: "minecraft:brown_wool",
-        key_aliases: &[],
-        display_name: "Brown Wool",
-        model: BlockModelSpec::CubeAll {
-            all: TEX_BROWN_WOOL,
-        },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.46, 0.33, 0.22],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 46,
-        variant: BlockId::GreenWool,
-        key: "minecraft:green_wool",
-        key_aliases: &[],
-        display_name: "Green Wool",
-        model: BlockModelSpec::CubeAll {
-            all: TEX_GREEN_WOOL,
-        },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.37, 0.52, 0.19],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 47,
-        variant: BlockId::RedWool,
-        key: "minecraft:red_wool",
-        key_aliases: &[],
-        display_name: "Red Wool",
-        model: BlockModelSpec::CubeAll { all: TEX_RED_WOOL },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.67, 0.23, 0.23],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 48,
-        variant: BlockId::BlackWool,
-        key: "minecraft:black_wool",
-        key_aliases: &[],
-        display_name: "Black Wool",
-        model: BlockModelSpec::CubeAll {
-            all: TEX_BLACK_WOOL,
-        },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: true,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.13, 0.13, 0.13],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 49,
-        variant: BlockId::Ice,
-        key: "minecraft:ice",
-        key_aliases: &[],
-        display_name: "Ice",
-        model: BlockModelSpec::CubeAll { all: TEX_ICE },
-        render_layer: RenderLayer::Transparent,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: false,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.74, 0.86, 0.96],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-    BlockSpec {
-        id: 50,
-        variant: BlockId::Snow,
-        key: "minecraft:snow",
-        key_aliases: &[],
-        display_name: "Snow",
-        model: BlockModelSpec::LayerBottomTopSideBottom {
+        [0.70, 0.70, 0.70],
+    )
+    .with_creative_order(9),
+    MossyCobblestone => BlockSpec::cube(
+        "minecraft:mossy_cobblestone", "Mossy Cobblestone", TEX_MOSSY_COBBLESTONE,
+        [0.41, 0.47, 0.35],
+    )
+    .with_creative_order(10),
+    Gravel => BlockSpec::cube("minecraft:gravel", "Gravel", TEX_GRAVEL, [0.55, 0.54, 0.52])
+        .with_creative_order(17),
+    Sponge => BlockSpec::cube("minecraft:sponge", "Sponge", TEX_SPONGE, [0.86, 0.80, 0.27])
+        .with_creative_order(18),
+    Dandelion => BlockSpec::plant(
+        "minecraft:dandelion", "Dandelion", TEX_DANDELION, [0.97, 0.84, 0.12],
+    )
+    .with_creative_order(12),
+    Poppy => BlockSpec::plant("minecraft:poppy", "Poppy", TEX_POPPY, [0.82, 0.18, 0.19])
+        .with_creative_order(13),
+    BrownMushroom => BlockSpec::plant(
+        "minecraft:brown_mushroom", "Brown Mushroom", TEX_BROWN_MUSHROOM, [0.52, 0.36, 0.25],
+    )
+    .with_creative_order(14),
+    RedMushroom => BlockSpec::plant(
+        "minecraft:red_mushroom", "Red Mushroom", TEX_RED_MUSHROOM, [0.80, 0.23, 0.21],
+    )
+    .with_creative_order(15),
+    CoalOre => BlockSpec::cube("minecraft:coal_ore", "Coal Ore", TEX_COAL_ORE, [0.43, 0.43, 0.43])
+        .with_creative_order(37),
+    IronOre => BlockSpec::cube("minecraft:iron_ore", "Iron Ore", TEX_IRON_ORE, [0.73, 0.62, 0.52])
+        .with_creative_order(36),
+    GoldOre => BlockSpec::cube("minecraft:gold_ore", "Gold Ore", TEX_GOLD_ORE, [0.82, 0.71, 0.32])
+        .with_creative_order(35),
+    IronBlock => BlockSpec::cube(
+        "minecraft:iron_block", "Iron Block", TEX_IRON_BLOCK, [0.88, 0.88, 0.90],
+    )
+    .with_creative_order(39),
+    GoldBlock => BlockSpec::cube(
+        "minecraft:gold_block", "Gold Block", TEX_GOLD_BLOCK, [0.96, 0.84, 0.27],
+    )
+    .with_creative_order(38),
+    Bookshelf => BlockSpec::cube_top_side_bottom(
+        "minecraft:bookshelf", "Bookshelf", TEX_OAK_PLANKS, TEX_BOOKSHELF_SIDE, TEX_OAK_PLANKS,
+        [0.61, 0.43, 0.28],
+    )
+    .with_creative_order(40),
+    Tnt => BlockSpec::cube_top_side_bottom(
+        "minecraft:tnt", "TNT", TEX_TNT_TOP, TEX_TNT_SIDE, TEX_TNT_BOTTOM, [0.83, 0.28, 0.24],
+    )
+    .with_creative_order(41),
+    WhiteWool => BlockSpec::cube(
+        "minecraft:white_wool", "White Wool", TEX_WHITE_WOOL, [0.93, 0.93, 0.93],
+    )
+    .with_creative_order(19),
+    OrangeWool => BlockSpec::cube(
+        "minecraft:orange_wool", "Orange Wool", TEX_ORANGE_WOOL, [0.86, 0.50, 0.20],
+    )
+    .with_creative_order(20),
+    MagentaWool => BlockSpec::cube(
+        "minecraft:magenta_wool", "Magenta Wool", TEX_MAGENTA_WOOL, [0.75, 0.35, 0.73],
+    )
+    .with_creative_order(21),
+    LightBlueWool => BlockSpec::cube(
+        "minecraft:light_blue_wool", "Light Blue Wool", TEX_LIGHT_BLUE_WOOL, [0.45, 0.62, 0.86],
+    )
+    .with_creative_order(22),
+    YellowWool => BlockSpec::cube(
+        "minecraft:yellow_wool", "Yellow Wool", TEX_YELLOW_WOOL, [0.90, 0.84, 0.25],
+    )
+    .with_creative_order(23),
+    LimeWool => BlockSpec::cube(
+        "minecraft:lime_wool", "Lime Wool", TEX_LIME_WOOL, [0.50, 0.78, 0.28],
+    )
+    .with_creative_order(24),
+    PinkWool => BlockSpec::cube(
+        "minecraft:pink_wool", "Pink Wool", TEX_PINK_WOOL, [0.94, 0.60, 0.70],
+    )
+    .with_creative_order(25),
+    GrayWool => BlockSpec::cube(
+        "minecraft:gray_wool", "Gray Wool", TEX_GRAY_WOOL, [0.33, 0.36, 0.38],
+    )
+    .with_creative_order(26),
+    LightGrayWool => BlockSpec::cube(
+        "minecraft:light_gray_wool", "Light Gray Wool", TEX_LIGHT_GRAY_WOOL, [0.61, 0.61, 0.61],
+    )
+    .with_creative_order(27),
+    CyanWool => BlockSpec::cube(
+        "minecraft:cyan_wool", "Cyan Wool", TEX_CYAN_WOOL, [0.27, 0.56, 0.61],
+    )
+    .with_creative_order(28),
+    PurpleWool => BlockSpec::cube(
+        "minecraft:purple_wool", "Purple Wool", TEX_PURPLE_WOOL, [0.50, 0.31, 0.70],
+    )
+    .with_creative_order(29),
+    BlueWool => BlockSpec::cube(
+        "minecraft:blue_wool", "Blue Wool", TEX_BLUE_WOOL, [0.26, 0.33, 0.69],
+    )
+    .with_creative_order(30),
+    BrownWool => BlockSpec::cube(
+        "minecraft:brown_wool", "Brown Wool", TEX_BROWN_WOOL, [0.46, 0.33, 0.22],
+    )
+    .with_creative_order(31),
+    GreenWool => BlockSpec::cube(
+        "minecraft:green_wool", "Green Wool", TEX_GREEN_WOOL, [0.37, 0.52, 0.19],
+    )
+    .with_creative_order(32),
+    RedWool => BlockSpec::cube("minecraft:red_wool", "Red Wool", TEX_RED_WOOL, [0.67, 0.23, 0.23])
+        .with_creative_order(33),
+    BlackWool => BlockSpec::cube(
+        "minecraft:black_wool", "Black Wool", TEX_BLACK_WOOL, [0.13, 0.13, 0.13],
+    )
+    .with_creative_order(34),
+    Ice => BlockSpec::cube("minecraft:ice", "Ice", TEX_ICE, [0.74, 0.86, 0.96])
+        .with_layer(RenderLayer::Transparent)
+        .non_occluding(),
+    Snow => BlockSpec::new(
+        "minecraft:snow", "Snow",
+        BlockModelSpec::LayerBottomTopSideBottom {
             height_px: 2,
             top: TEX_SNOW,
             side: TEX_SNOW,
             bottom: TEX_SNOW,
         },
-        render_layer: RenderLayer::Opaque,
-        cull_group: CullGroupSpec::SelfBlock,
-        face_occluding: false,
-        solid: true,
-        skylight: SkylightSpec::FromShape,
-        breakable: true,
-        emitted_light: 0,
-        particle_color: [0.96, 0.97, 1.0],
-        face_tint: FaceTintSpec::None,
-        block_entity: None,
-        random_tick: None,
-    },
-];
+        [0.96, 0.97, 1.0],
+    )
+    .non_occluding(),
+}
 
 #[inline(always)]
 fn block_spec_for(block: BlockId) -> &'static BlockSpec {
@@ -2065,29 +1355,29 @@ impl BlockTextureLayers {
     }
 }
 
-/// BlockRegistry:
-/// - zentraler Ort für Blockdefinitionen
-/// - jeder Block bekommt Texturen pro Face
+/// Read-only view over `BLOCK_SPECS`. The table is compile-time data, so there
+/// is one registry for the whole process (`BlockRegistry::get`) and nothing to
+/// build per caller.
 pub(crate) struct BlockRegistry {
-    defs: HashMap<BlockId, BlockDef>,
+    specs: &'static [BlockSpec],
 }
 
-impl BlockRegistry {
-    pub(crate) fn new() -> Self {
-        let mut defs = HashMap::with_capacity(BLOCK_SPECS.len());
-        for spec in BLOCK_SPECS {
-            if let Some(def) = spec.block_def() {
-                defs.insert(spec.variant, def);
-            }
-        }
+static BLOCK_REGISTRY: BlockRegistry = BlockRegistry {
+    specs: &BLOCK_SPECS,
+};
 
-        Self { defs }
+impl BlockRegistry {
+    pub(crate) fn get() -> &'static Self {
+        &BLOCK_REGISTRY
+    }
+
+    fn spec(&self, block: BlockId) -> &'static BlockSpec {
+        &self.specs[block.to_u8() as usize]
     }
 
     fn def(&self, block: BlockId) -> BlockDef {
-        *self
-            .defs
-            .get(&block)
+        self.spec(block)
+            .block_def()
             .unwrap_or_else(|| panic!("missing BlockDef registration for {:?}", block))
     }
 
@@ -2108,11 +1398,12 @@ impl BlockRegistry {
     }
 
     pub(crate) fn random_tick_for(&self, block: BlockId) -> Option<RandomTickFn> {
-        block_spec_for(block).random_tick
+        self.spec(block).random_tick
     }
 
     pub(crate) fn registered_block_keys(&self) -> Vec<NamespacedKey> {
-        let mut keys: Vec<NamespacedKey> = BLOCK_SPECS
+        let mut keys: Vec<NamespacedKey> = self
+            .specs
             .iter()
             .filter_map(|spec| NamespacedKey::parse(spec.key))
             .collect();
@@ -2154,7 +1445,7 @@ impl BlockRegistry {
 
     pub(crate) fn collect_texture_keys(&self) -> Vec<String> {
         let mut keys: HashSet<String> = HashSet::new();
-        for def in self.defs.values() {
+        for def in self.specs.iter().filter_map(|spec| spec.block_def()) {
             match def.model {
                 BlockModel::Cube
                 | BlockModel::SlabBottom
@@ -2177,7 +1468,7 @@ impl BlockRegistry {
     }
 
     pub(crate) fn has_def_for(&self, block: BlockId) -> bool {
-        self.defs.contains_key(&block)
+        self.spec(block).block_def().is_some()
     }
 }
 
@@ -2228,7 +1519,11 @@ impl BlockTextureLookup {
             cull_group: CullGroup::None,
         };
         let mut by_block = std::array::from_fn(|_| missing_info);
-        for (&block, &textures) in &block_registry.defs {
+        for spec in block_registry.specs {
+            let Some(textures) = spec.block_def() else {
+                continue;
+            };
+            let block = spec.variant;
             let mut resolve = |key: &'static str| -> u32 {
                 if let Some(layer) = key_to_layer.get(key).copied() {
                     layer
@@ -2936,6 +2231,28 @@ mod tests {
         grass_random_tick(&mut world, pos, BlockId::Grass, 0);
 
         assert_eq!(world.get_block(pos), BlockId::Dirt);
+    }
+
+    /// `blocks!` numbers blocks by position, and pre-manifest saves store those
+    /// numbers raw. Blocks that existed before the macro must keep theirs; new
+    /// blocks are appended and need no entry here.
+    #[test]
+    fn pre_macro_blocks_keep_their_runtime_ids() {
+        let pre_macro_keys = "air grass_block stone dirt oak_sapling oak_planks bedrock water \
+            flowing_water lava flowing_lava cobblestone obsidian sand bricks oak_log oak_leaves \
+            glass stone_slab mossy_cobblestone gravel sponge dandelion poppy brown_mushroom \
+            red_mushroom coal_ore iron_ore gold_ore iron_block gold_block bookshelf tnt \
+            white_wool orange_wool magenta_wool light_blue_wool yellow_wool lime_wool pink_wool \
+            gray_wool light_gray_wool cyan_wool purple_wool blue_wool brown_wool green_wool \
+            red_wool black_wool ice snow";
+        let mut count = 0;
+        for (id, name) in pre_macro_keys.split_whitespace().enumerate() {
+            let block = BlockId::from_u8(id as u8).expect("pre-macro id no longer exists");
+            let key = format!("minecraft:{name}");
+            assert_eq!(block_spec_for(block).key, key, "id {id} moved");
+            count += 1;
+        }
+        assert_eq!(count, 51);
     }
 
     /// The bug the world change journal fixes: a random tick grew a tree

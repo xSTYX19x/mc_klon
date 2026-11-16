@@ -50,8 +50,8 @@ pub(crate) fn migrate_save_v1_to_v2(save_root: &Path) -> io::Result<SaveMigratio
     };
     let world_manifest_path = save_root.join(WORLD_MANIFEST_FILE_NAME);
     let manifest = WorldManifest::load(&world_manifest_path)?;
-    let block_registry = crate::blocks::BlockRegistry::new();
-    let mapper = IdMapper::from_manifest_and_registry(&manifest, &block_registry);
+    let block_registry = crate::blocks::BlockRegistry::get();
+    let mapper = IdMapper::from_manifest_and_registry(&manifest, block_registry);
 
     let mut source_world = World::new();
     source_world.configure_world_config(

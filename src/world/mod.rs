@@ -3008,9 +3008,9 @@ impl World {
     fn new_with_world_config_and_preset(cfg: WorldConfig, preset: WorldgenPreset) -> Self {
         debug_assert_eq!(cfg.chunk_size, CHUNK_SIZE);
         let generator = Box::new(TerrainGenerator::new(cfg, preset));
-        let block_registry = BlockRegistry::new();
-        let manifest = WorldManifest::build_from_registry(&block_registry);
-        let id_mapper = IdMapper::from_manifest_and_registry(&manifest, &block_registry);
+        let block_registry = BlockRegistry::get();
+        let manifest = WorldManifest::build_from_registry(block_registry);
+        let id_mapper = IdMapper::from_manifest_and_registry(&manifest, block_registry);
         Self {
             chunks: HashMap::new(),
             light_engine: LightEngine::default(),

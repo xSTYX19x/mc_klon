@@ -6535,14 +6535,14 @@ impl State {
         Self::load_ticking_areas_into_world(save_root, &mut self.world);
 
         let world_manifest_path = Self::world_manifest_path_for(save_root);
-        let block_registry = BlockRegistry::new();
-        let runtime_manifest = WorldManifest::build_from_registry(&block_registry);
+        let block_registry = BlockRegistry::get();
+        let runtime_manifest = WorldManifest::build_from_registry(block_registry);
         let manifest = if world_manifest_path.exists() {
             WorldManifest::load(&world_manifest_path)?
         } else {
             runtime_manifest.clone()
         };
-        let id_mapper = IdMapper::from_manifest_and_registry(&manifest, &block_registry);
+        let id_mapper = IdMapper::from_manifest_and_registry(&manifest, block_registry);
         let signature_changed = manifest.content_signature != runtime_manifest.content_signature;
         let missing_blocks_count = id_mapper.missing_blocks_count();
         if signature_changed || missing_blocks_count > 0 {
@@ -9171,8 +9171,8 @@ impl State {
         let texture_bind_group_layout = TextureArray::create_bind_group_layout(&device);
 
         // Blockdefinitionen mit Face-spezifischen Texturen.
-        let block_registry = BlockRegistry::new();
-        debug_assert_block_blueprint_integrity(&block_registry);
+        let block_registry = BlockRegistry::get();
+        debug_assert_block_blueprint_integrity(block_registry);
         debug_assert_eq!(
             block_registry.texture_key_for(BlockId::Grass, Face::Up),
             TEX_GRASS_TOP
@@ -9740,7 +9740,7 @@ impl State {
         );
 
         let block_texture_lookup = Arc::new(BlockTextureLookup::new(
-            &block_registry,
+            block_registry,
             &key_to_layer,
             missing_layer,
         ));
@@ -10395,7 +10395,7 @@ impl State {
         Self::load_ticking_areas_into_world(&save_root, &mut world);
 
         let world_manifest_path = Self::world_manifest_path_for(&save_root);
-        let runtime_manifest = WorldManifest::build_from_registry(&block_registry);
+        let runtime_manifest = WorldManifest::build_from_registry(block_registry);
         let manifest = if world_manifest_path.exists() {
             match WorldManifest::load(&world_manifest_path) {
                 Ok(m) => m,
@@ -10413,7 +10413,7 @@ impl State {
             }
             runtime_manifest.clone()
         };
-        let id_mapper = IdMapper::from_manifest_and_registry(&manifest, &block_registry);
+        let id_mapper = IdMapper::from_manifest_and_registry(&manifest, block_registry);
         let signature_changed = manifest.content_signature != runtime_manifest.content_signature;
         let missing_blocks_count = id_mapper.missing_blocks_count();
         if signature_changed || missing_blocks_count > 0 {
@@ -15076,8 +15076,8 @@ impl State {
             );
         }
         let world_manifest_path = self.world_manifest_path();
-        let block_registry = BlockRegistry::new();
-        let manifest = WorldManifest::build_from_registry(&block_registry);
+        let block_registry = BlockRegistry::get();
+        let manifest = WorldManifest::build_from_registry(block_registry);
         if let Err(err) = manifest.save(&world_manifest_path) {
             panic!(
                 "failed to write {} after selecting new world seed/preset (seed={}, preset={:?}): {}",
@@ -15087,7 +15087,7 @@ impl State {
                 err
             );
         }
-        let id_mapper = IdMapper::from_manifest_and_registry(&manifest, &block_registry);
+        let id_mapper = IdMapper::from_manifest_and_registry(&manifest, block_registry);
         self.world.set_manifest_and_mapper(manifest, id_mapper);
         if let Err(err) = self.save_ticking_areas() {
             crate::console_error!(

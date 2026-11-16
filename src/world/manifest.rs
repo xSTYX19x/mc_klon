@@ -308,9 +308,9 @@ mod tests {
 
     #[test]
     fn every_runtime_block_round_trips_through_its_own_manifest() {
-        let reg = BlockRegistry::new();
-        let manifest = WorldManifest::build_from_registry(&reg);
-        let mapper = IdMapper::from_manifest_and_registry(&manifest, &reg);
+        let reg = BlockRegistry::get();
+        let manifest = WorldManifest::build_from_registry(reg);
+        let mapper = IdMapper::from_manifest_and_registry(&manifest, reg);
 
         for raw in 0u16..=255 {
             let Ok(block) = BlockId::from_u8(raw as u8) else {
@@ -329,8 +329,8 @@ mod tests {
     fn manifest_pins_legacy_runtime_ids_to_identical_manifest_ids() {
         // Pre-manifest saves stored raw runtime ids, so slots 0..=255 must keep
         // meaning the same block or every old column decodes to garbage.
-        let reg = BlockRegistry::new();
-        let manifest = WorldManifest::build_from_registry(&reg);
+        let reg = BlockRegistry::get();
+        let manifest = WorldManifest::build_from_registry(reg);
         for raw in 0u16..=255 {
             let Ok(block) = BlockId::from_u8(raw as u8) else {
                 continue;
@@ -346,9 +346,9 @@ mod tests {
 
     #[test]
     fn manifest_build_is_deterministic() {
-        let reg = BlockRegistry::new();
-        let a = WorldManifest::build_from_registry(&reg);
-        let b = WorldManifest::build_from_registry(&reg);
+        let reg = BlockRegistry::get();
+        let a = WorldManifest::build_from_registry(reg);
+        let b = WorldManifest::build_from_registry(reg);
         assert_eq!(a.content_signature, b.content_signature);
         let ids_a: Vec<_> = a.blocks.iter().map(|e| (e.id, e.key.as_str())).collect();
         let ids_b: Vec<_> = b.blocks.iter().map(|e| (e.id, e.key.as_str())).collect();
@@ -359,7 +359,7 @@ mod tests {
     fn saved_ids_are_remapped_by_key_not_by_slot() {
         // The whole point of the manifest: a save whose ids drifted away from
         // the current runtime order must still resolve to the right blocks.
-        let reg = BlockRegistry::new();
+        let reg = BlockRegistry::get();
         let manifest = WorldManifest {
             format_version: 1,
             game_version: "test".to_string(),
@@ -383,7 +383,7 @@ mod tests {
                 },
             ],
         };
-        let mapper = IdMapper::from_manifest_and_registry(&manifest, &reg);
+        let mapper = IdMapper::from_manifest_and_registry(&manifest, reg);
 
         assert_eq!(mapper.decode_manifest_id(40), BlockId::Stone);
         assert_eq!(mapper.decode_manifest_id(41), BlockId::Dirt);
@@ -399,7 +399,7 @@ mod tests {
         // `core:stone` is an accepted alias, so decoding it works. Encoding has
         // to land on the same id, or one save/load cycle turns the block into
         // the missing placeholder.
-        let reg = BlockRegistry::new();
+        let reg = BlockRegistry::get();
         let manifest = WorldManifest {
             format_version: 1,
             game_version: "test".to_string(),
@@ -419,7 +419,7 @@ mod tests {
                 },
             ],
         };
-        let mapper = IdMapper::from_manifest_and_registry(&manifest, &reg);
+        let mapper = IdMapper::from_manifest_and_registry(&manifest, reg);
 
         assert_eq!(mapper.decode_manifest_id(7), BlockId::Stone);
         assert_eq!(mapper.encode_runtime_block(BlockId::Stone), 7);
@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn unknown_saved_keys_degrade_to_missing_and_are_reported() {
-        let reg = BlockRegistry::new();
+        let reg = BlockRegistry::get();
         let manifest = WorldManifest {
             format_version: 1,
             game_version: "test".to_string(),
@@ -447,7 +447,7 @@ mod tests {
                 },
             ],
         };
-        let mapper = IdMapper::from_manifest_and_registry(&manifest, &reg);
+        let mapper = IdMapper::from_manifest_and_registry(&manifest, reg);
 
         let missing_runtime = reg
             .block_for_key(&key(super::CORE_MISSING_BLOCK_KEY))
@@ -479,8 +479,8 @@ mod tests {
     #[test]
     fn manifest_file_round_trips_and_rejects_drifted_headers() {
         let path = temp_manifest_path();
-        let reg = BlockRegistry::new();
-        let manifest = WorldManifest::build_from_registry(&reg);
+        let reg = BlockRegistry::get();
+        let manifest = WorldManifest::build_from_registry(reg);
         manifest.save(&path).unwrap();
 
         let loaded = WorldManifest::load(&path).unwrap();
