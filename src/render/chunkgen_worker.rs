@@ -1919,6 +1919,7 @@ struct GeneratedSectionSnapshot {
     block_data: Arc<Vec<u8>>,
     filled_voxel_count: u16,
     solid_voxel_count: u16,
+    random_ticking_count: u16,
     worldgen_debug: GeneratedWorldgenDebugStats,
     fluid_bootstrap: Arc<Vec<GeneratedFluidBootstrapCell>>,
 }
@@ -1930,6 +1931,7 @@ impl GeneratedSectionSnapshot {
             self.block_data.clone(),
             self.filled_voxel_count,
             self.solid_voxel_count,
+            self.random_ticking_count,
         )
     }
 }
@@ -2083,22 +2085,28 @@ fn build_generated_section_snapshots(
             .get(section_idx)
             .copied()
             .unwrap_or(0);
-        let (filled_voxel_count, solid_voxel_count, worldgen_debug, fluid_bootstrap) =
-            analyze_generated_section_buffers(
-                &blocks,
-                &block_data,
-                shoreline_sand_blocks,
-                ChunkCoord {
-                    x: coord.x,
-                    y: chunk_y,
-                    z: coord.z,
-                },
-            );
+        let (
+            filled_voxel_count,
+            solid_voxel_count,
+            random_ticking_count,
+            worldgen_debug,
+            fluid_bootstrap,
+        ) = analyze_generated_section_buffers(
+            &blocks,
+            &block_data,
+            shoreline_sand_blocks,
+            ChunkCoord {
+                x: coord.x,
+                y: chunk_y,
+                z: coord.z,
+            },
+        );
         sections.push(GeneratedSectionSnapshot {
             blocks: ChunkBlocks::compact(blocks),
             block_data: block_data_arc(block_data),
             filled_voxel_count,
             solid_voxel_count,
+            random_ticking_count,
             worldgen_debug,
             fluid_bootstrap: Arc::new(fluid_bootstrap),
         });
@@ -2534,8 +2542,8 @@ mod tests {
         build_generated_section_snapshots, generate_streaming_column_for_test,
     };
     use crate::blocks::{BlockId, grass_survives_under};
-    use crate::world::WorldEnvironment;
     use crate::world::fluids::{fluid_data_is_source_origin, fluid_data_is_worldgen_static};
+    use crate::world::{Chunk, WorldEnvironment};
     use crate::worldgen::ColumnBuffer;
     use crate::worldgen::WorldgenPreset;
 
@@ -2557,6 +2565,54 @@ mod tests {
                 WinterColumnPassStats::default(),
             ),
             stage_timings: ColumnGenerationStageTimings::default(),
+        }
+    }
+
+    /// Generated sections skip `recompute_cached_block_classification`; their
+    /// random-ticking count must still match what a rescan would find, or
+    /// random ticks would silently skip (or keep sampling) them.
+    #[test]
+    fn generated_sections_carry_their_random_ticking_count() {
+        let descriptor =
+            ColumnGenerationDescriptor::new(WorldConfig::default(), WorldgenPreset::ClassicFlatter);
+        let mut column = ColumnBuffer::new();
+        column.set_block(0, 10, 0, BlockId::Stone);
+        column.set_block(3, 40, 5, BlockId::Grass);
+        column.set_block(9, 70, 9, BlockId::Sapling);
+        let coord = ColumnCoordKey::new(0, 0);
+        let generated = GeneratedColumn {
+            coord,
+            descriptor,
+            min_chunk_y: descriptor.min_chunk_y(),
+            max_chunk_y: descriptor.max_chunk_y(),
+            sections: build_generated_section_snapshots(
+                coord,
+                descriptor,
+                &column,
+                &vec![0; descriptor.section_count()],
+                WinterColumnPassStats::default(),
+            ),
+            stage_timings: ColumnGenerationStageTimings::default(),
+        };
+
+        for (chunk_y, expect_ticking) in [(0, false), (1, false), (2, true), (4, true)] {
+            let (chunk, _, _) = generated.extract_chunk(chunk_y);
+            assert_eq!(
+                chunk.has_random_ticking_blocks(),
+                expect_ticking,
+                "section {chunk_y}"
+            );
+            let rescanned = Chunk::from_parts(
+                chunk.blocks.clone(),
+                chunk.block_data.clone(),
+                chunk.light.clone(),
+                0,
+            );
+            assert_eq!(
+                chunk.has_random_ticking_blocks(),
+                rescanned.has_random_ticking_blocks(),
+                "section {chunk_y} disagrees with a rescan"
+            );
         }
     }
 
@@ -3151,6 +3207,7 @@ fn analyze_generated_section_buffers(
 ) -> (
     u16,
     u16,
+    u16,
     GeneratedWorldgenDebugStats,
     Vec<GeneratedFluidBootstrapCell>,
 ) {
@@ -3165,6 +3222,7 @@ fn analyze_generated_section_buffers(
     let mut out = Vec::with_capacity(32);
     let mut filled_voxel_count = 0u16;
     let mut solid_voxel_count = 0u16;
+    let mut random_ticking_count = 0u16;
     let mut worldgen_water_blocks = 0u32;
     let mut worldgen_water_source_blocks = 0u32;
     let mut winter_snow_blocks = 0u32;
@@ -3180,6 +3238,9 @@ fn analyze_generated_section_buffers(
                 }
                 if block.is_solid() {
                     solid_voxel_count = solid_voxel_count.saturating_add(1);
+                }
+                if block.has_random_tick() {
+                    random_ticking_count = random_ticking_count.saturating_add(1);
                 }
                 if block == BlockId::Snow {
                     winter_snow_blocks = winter_snow_blocks.saturating_add(1);
@@ -3219,6 +3280,7 @@ fn analyze_generated_section_buffers(
     (
         filled_voxel_count,
         solid_voxel_count,
+        random_ticking_count,
         GeneratedWorldgenDebugStats {
             worldgen_water_blocks,
             worldgen_water_source_blocks,

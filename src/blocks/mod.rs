@@ -2381,6 +2381,10 @@ impl BlockId {
         block_spec_for(self).emitted_light
     }
 
+    pub(crate) fn has_random_tick(self) -> bool {
+        block_spec_for(self).random_tick.is_some()
+    }
+
     pub(crate) fn color(self) -> [f32; 3] {
         block_spec_for(self).particle_color
     }

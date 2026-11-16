@@ -1970,38 +1970,30 @@ loading screen, where throughput legitimately outranks frame time.
 
 ### Other performance work
 
-- **Random Ticks: Sektionen ohne tickbare Blöcke überspringen** (neu
+- **Random Ticks: aktive Sektionsliste inkrementell pflegen** (neu
   2026-11-16)
-  - *Ist:* `RandomTicksSystem::fixed_tick` (`world/random_ticks_system.rs:74`)
-    zieht in **jeder** geladenen Sektion der aktiven Spalten
-    `ticks_per_chunk` zufällige Positionen, auch in reinen Stein- oder
-    Luftsektionen, und baut die aktive Sektionsliste jeden Tick durch Filtern
-    aller `world.chunks` neu auf. Gemessen auf 152 Sektionen generierter
-    Welt, Speed 1000: 152 000 Stichproben pro Tick, nur 1 359 treffen einen
-    Block mit Random Tick (unter 1 %); das bloße Ziehen und Nachschlagen kostet
-    68,7 von 71,4 ms pro Tick (Debug), Release 4,5 ms. Speed 3: 0,23 ms (Debug)
-    bzw. 0,02 ms (Release). Im Spiel bemerkt bei Speed 1000 als Ruckeln, das
-    beim offenen Inventar verschwindet, weil dann die Simulation pausiert
-    (`gameplay_active`, `app/mod.rs:3860`).
-  - *Ziel:* Kosten proportional zu den Sektionen mit tickbaren Blöcken.
-  - *Vorbild:* Vanilla `LevelChunkSection.isRandomlyTicking()` mit
-    `tickingBlockCount`, gepflegt in `setBlockState` und `recalcBlockCounts`.
-    Direkt übertragbar.
-  - *Vorgehen:* 1) `Chunk` zählt zufällig tickende Blöcke neben
-    `filled_voxel_count`/`solid_voxel_count` (`world/chunk.rs:13-14`),
-    gepflegt in `Chunk::set` und `recompute_cached_block_classification`;
-    dafür eine schnelle `BlockId::has_random_tick()`-Abfrage aus `BlockSpec`.
-    2) `RandomTicksSystem` überspringt Sektionen mit Zähler 0. Das Ergebnis
-    bleibt bitgleich, weil der RNG pro Sektion geseedet wird
-    (`chunk_tick_seed`). 3) Optional die aktive Sektionsliste inkrementell
-    pflegen statt jeden Tick alle Chunks zu filtern.
-  - *Dateien:* `world/chunk.rs`, `world/random_ticks_system.rs`,
-    `blocks/mod.rs`.
+  - *Ist:* Seit 2026-11-16 überspringt `RandomTicksSystem` Sektionen ohne
+    zufällig tickende Blöcke (Zähler `Chunk::has_random_ticking_blocks`, wie
+    Vanilla `isRandomlyTicking`). Gemessen mit `random_tick_cost_report`
+    (152 Sektionen, Speed 1000): 152 000 → 41 350 Stichproben pro Tick,
+    Release 4,52 → 1,47 ms, Debug 72,6 → 21,1 ms; Callbacks und Änderungen
+    identisch. Der Rest entfällt auf Sektionen mit Gras, die wie bei Vanilla
+    voll beprobt werden. Weiterhin baut `fixed_tick` die aktive Sektionsliste
+    jeden Tick neu auf, indem es **alle** `world.chunks` gegen die aktiven
+    Spalten filtert (`world/random_ticks_system.rs:87-94`) — bei großer
+    Sichtweite Zehntausende Lookups pro Tick, nicht gemessen.
+  - *Ziel:* Kosten pro Tick unabhängig von der Zahl geladener Chunks.
+  - *Vorbild:* Vanilla iteriert nur Chunks innerhalb der Simulationsdistanz.
+  - *Vorgehen:* 1) Messen: Anteil der Listenerzeugung an
+    `sim.fixed_tick.random_ticks` bei Sichtweite 8 vs. 32. 2) Liste aus
+    `on_columns_entered`/`on_columns_exited` pflegen (die Hooks existieren,
+    `sim/mod.rs:20-33`) und nur beim Laden/Entladen von Sektionen anpassen.
+  - *Dateien:* `world/random_ticks_system.rs`, `render/state.rs`
+    (Aktivierung der Sim-Spalten).
   - *Abhängigkeiten:* keine.
-  - *Priorität/Aufwand/Impact:* **P2**, S; hoch bei hohem Tick-Speed oder
-    großer Sim-Distanz, sonst gering.
-  - *Akzeptanz:* Gleiche Szene, Speed 1000: ms pro Tick sinken um mindestens
-    80 %; die Journal-Einträge über 20 Ticks sind identisch zu vorher.
+  - *Priorität/Aufwand/Impact:* **P3**, S; erst nach der Messung entscheiden.
+  - *Akzeptanz:* `sim.fixed_tick.random_ticks` ist bei Sichtweite 8 und 32
+    gleich teuer; die Journal-Einträge bleiben identisch.
 
 - finish the streaming-lag hunt — the open half of the reported symptom. Measured after the fixes in `docs/performance/audit-2026-08.md`: streaming frames are median **10.6 ms / p90 53.1 ms**, and `state.process_dirty_chunk_meshes` alone is **mean 12.9 ms**, ~60 % of a 21 ms frame. Chunk apply is no longer the cost (104 ms → 0.51 ms per applied chunk). The p90 spikes are what feels laggy, and they never cross the 200 ms stall threshold, so no stall report ever contained them. Open: where the remaining ~9 ms/frame inside `process_dirty_chunk_meshes` goes. The `gpu.csv` breakdown columns answer this from one normal play session — read them before changing anything else here
 - document reproducible startup and streaming benchmark scenes as a baseline

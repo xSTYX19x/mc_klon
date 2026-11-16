@@ -12,6 +12,9 @@ pub(crate) struct Chunk {
     pub(crate) revision: u64,
     filled_voxel_count: u16,
     solid_voxel_count: u16,
+    /// Voxels whose block has a random tick (Vanilla `tickingBlockCount`);
+    /// random ticks skip sections where this is 0.
+    random_ticking_count: u16,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -53,6 +56,7 @@ impl Chunk {
             revision: 0,
             filled_voxel_count: 0,
             solid_voxel_count: 0,
+            random_ticking_count: 0,
         }
     }
 
@@ -72,6 +76,7 @@ impl Chunk {
             revision,
             filled_voxel_count: 0,
             solid_voxel_count: 0,
+            random_ticking_count: 0,
         };
         chunk.recompute_cached_block_classification();
         chunk
@@ -93,14 +98,18 @@ impl Chunk {
             revision,
             filled_voxel_count: 0,
             solid_voxel_count: 0,
+            random_ticking_count: 0,
         }
     }
 
+    /// Counts come from the chunkgen worker, which already scanned the
+    /// section (`analyze_generated_section_buffers`).
     pub(crate) fn from_generated_parts(
         blocks: ChunkBlocks,
         block_data: Arc<Vec<u8>>,
         filled_voxel_count: u16,
         solid_voxel_count: u16,
+        random_ticking_count: u16,
     ) -> Self {
         debug_assert_eq!(blocks.len(), Self::BLOCK_COUNT);
         debug_assert_eq!(block_data.len(), Self::BLOCK_COUNT);
@@ -111,6 +120,7 @@ impl Chunk {
             revision: 0,
             filled_voxel_count,
             solid_voxel_count,
+            random_ticking_count,
         }
     }
 
@@ -147,6 +157,11 @@ impl Chunk {
                 self.solid_voxel_count = (self.solid_voxel_count as i32 + new_solid - old_solid)
                     .clamp(0, Self::BLOCK_COUNT as i32)
                     as u16;
+                let old_ticking = old.has_random_tick() as i32;
+                let new_ticking = id.has_random_tick() as i32;
+                self.random_ticking_count =
+                    (self.random_ticking_count as i32 + new_ticking - old_ticking)
+                        .clamp(0, Self::BLOCK_COUNT as i32) as u16;
                 self.revision = self.revision.wrapping_add(1);
             }
         }
@@ -203,9 +218,16 @@ impl Chunk {
         self.solid_voxel_count as usize == Self::BLOCK_COUNT
     }
 
+    /// Whether any voxel has a random tick; sections without one are skipped
+    /// by `RandomTicksSystem`.
+    pub(crate) fn has_random_ticking_blocks(&self) -> bool {
+        self.random_ticking_count > 0
+    }
+
     pub(crate) fn recompute_cached_block_classification(&mut self) {
         let mut filled = 0u16;
         let mut solid = 0u16;
+        let mut ticking = 0u16;
         for block in self.blocks.iter() {
             if block.is_voxel_filled() {
                 filled = filled.saturating_add(1);
@@ -213,9 +235,13 @@ impl Chunk {
             if block.is_solid() {
                 solid = solid.saturating_add(1);
             }
+            if block.has_random_tick() {
+                ticking = ticking.saturating_add(1);
+            }
         }
         self.filled_voxel_count = filled;
         self.solid_voxel_count = solid;
+        self.random_ticking_count = ticking;
     }
 }
 
@@ -477,6 +503,27 @@ mod block_storage_tests {
 
     fn flat_section(fill: BlockId) -> Vec<BlockId> {
         vec![fill; Chunk::BLOCK_COUNT]
+    }
+
+    #[test]
+    fn random_ticking_count_follows_set_and_recompute() {
+        let mut chunk = Chunk::new_empty();
+        assert!(!chunk.has_random_ticking_blocks());
+        chunk.set(1, 2, 3, BlockId::Grass);
+        chunk.set(4, 5, 6, BlockId::Sapling);
+        assert!(chunk.has_random_ticking_blocks());
+        chunk.set(1, 2, 3, BlockId::Dirt);
+        assert!(chunk.has_random_ticking_blocks(), "the sapling still ticks");
+        chunk.set(4, 5, 6, BlockId::Stone);
+        assert!(!chunk.has_random_ticking_blocks());
+
+        let zeros = || Arc::new(vec![0u8; Chunk::BLOCK_COUNT]);
+        let mut blocks = flat_section(BlockId::Stone);
+        blocks[7] = BlockId::Grass;
+        let paletted = Chunk::from_parts(ChunkBlocks::compact(blocks), zeros(), zeros(), 0);
+        assert!(paletted.has_random_ticking_blocks());
+        let stone = Chunk::from_parts(ChunkBlocks::Uniform(BlockId::Stone), zeros(), zeros(), 0);
+        assert!(!stone.has_random_ticking_blocks());
     }
 
     #[test]

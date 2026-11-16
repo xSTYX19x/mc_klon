@@ -95,6 +95,18 @@ impl SimSystem for RandomTicksSystem {
 
         let world_seed = world.seed();
         for coord in self.active_chunks.iter().copied() {
+            // Most sections (stone, air, plain dirt) hold nothing with a random
+            // tick, so drawing samples there only costs time. The count is read
+            // live: a tick in an earlier section can make this one tickable.
+            // Skipping cannot change results, because the RNG is seeded per
+            // section and a section without ticking blocks fires no callback.
+            if !world
+                .chunks
+                .get(&coord)
+                .is_some_and(|chunk| chunk.has_random_ticking_blocks())
+            {
+                continue;
+            }
             let mut rng = Rng64::new(Self::chunk_tick_seed(world_seed, coord, tick_index));
             let chunk_x0 = coord.x * CHUNK_SIZE;
             let chunk_y0 = coord.y * CHUNK_SIZE;
