@@ -66,7 +66,7 @@ use crate::config::render::{
 use crate::config::sim::RANDOM_TICK_SPEED_DEFAULT;
 use crate::meshing::{
     CpuMeshData, FULLBRIGHT_LIGHT_PACKED, MeshLayerMask, Vertex, WorldVertex,
-    face_corner_ao_shades, face_from_normal, face_shade,
+    face_corner_ao_shades, face_from_normal, face_shade, pack_uv,
 };
 use super::lighting_budget::LightingFrameBudget;
 use super::mesh_dispatch::mesh_inflight_job_cap;
@@ -694,6 +694,63 @@ mod lighting_readiness_tests {
         assert!(!lighting_state_defers_remesh(
             ChunkLightingReadiness::Finalized
         ));
+    }
+}
+
+#[cfg(test)]
+mod boundary_ocean_tests {
+    use super::{
+        BOUNDARY_OCEAN_MAX_QUAD_BLOCKS, BOUNDARY_OCEAN_UV_TILE_PER_BLOCK,
+        build_boundary_ocean_ring_mesh,
+    };
+    use crate::meshing::{FULLBRIGHT_LIGHT_PACKED, UV_SCALE};
+
+    /// The ring is drawn by the transparent world pipeline, whose `WorldVertex`
+    /// UVs are unsigned fixed point up to 16.0. Every UV must fit without
+    /// clamping and keep the texture phase of its world position (no seams),
+    /// and the quads must cover exactly the ring.
+    #[test]
+    fn boundary_ocean_ring_fits_world_vertex_and_covers_the_ring() {
+        let (inner, outer, y) = (2048.0_f32, 2560.0_f32, 63.0_f32);
+        let (vertices, indices) = build_boundary_ocean_ring_mesh(7, 2, y, inner, outer);
+        assert_eq!(indices.len() / 6, vertices.len() / 4);
+
+        let mut area = 0.0_f64;
+        for quad in vertices.chunks_exact(4) {
+            let (x0, z0) = (quad[0].position[0], quad[0].position[2]);
+            let (x1, z1) = (quad[2].position[0], quad[2].position[2]);
+            assert!(x1 - x0 <= BOUNDARY_OCEAN_MAX_QUAD_BLOCKS);
+            assert!(z1 - z0 <= BOUNDARY_OCEAN_MAX_QUAD_BLOCKS);
+            area += f64::from((x1 - x0) * (z1 - z0));
+            for vertex in quad {
+                assert_eq!(vertex.position[1], y);
+                assert_eq!(
+                    (
+                        vertex.tex_layer,
+                        vertex.tint_kind,
+                        vertex.shade,
+                        vertex.light_packed
+                    ),
+                    (7, 2, 255, FULLBRIGHT_LIGHT_PACKED as u8)
+                );
+                for (axis, packed) in [(0, vertex.uv[0]), (2, vertex.uv[1])] {
+                    assert!(packed < u16::MAX, "UV clamped at {:?}", vertex.position);
+                    let uv = f32::from(packed) / UV_SCALE;
+                    let phase = (vertex.position[axis] * BOUNDARY_OCEAN_UV_TILE_PER_BLOCK - uv)
+                        .rem_euclid(1.0);
+                    assert!(
+                        !(1e-3..=1.0 - 1e-3).contains(&phase),
+                        "texture seam at {:?}",
+                        vertex.position
+                    );
+                }
+            }
+        }
+        let expected = f64::from((2.0 * outer).powi(2) - (2.0 * inner).powi(2));
+        assert!(
+            (area - expected).abs() < 1.0,
+            "covered {area}, ring is {expected}"
+        );
     }
 }
 
@@ -3112,11 +3169,19 @@ pub(crate) fn build_fullscreen_overlay_mesh(
     (vertices, indices)
 }
 
+/// Longest edge of one ocean quad, in blocks. `WorldVertex` stores UVs as
+/// unsigned fixed point up to 16.0 (`UV_SCALE`); with one texture repeat per 16
+/// blocks and each quad's UVs anchored at most 15 blocks before its corner, 240
+/// blocks keeps every UV in range.
+const BOUNDARY_OCEAN_MAX_QUAD_BLOCKS: f32 = 240.0;
+
 /// One texture tile per 16 blocks, i.e. **one texel per block**.
 ///
 /// That is 16x coarser than a normal block face, so the ring is magnified for
 /// most of its visible depth and only tips into minification far out. Worked
-/// through while chasing a suspected moire artifact (`docs/TODO.md`): at the
+/// through while chasing a suspected moire artifact (`docs/performance/
+/// audit-2026-08.md` §3.1; the black pillars blamed on the ring there were its
+/// vertex layout, see `build_boundary_ocean_ring_mesh`): at the
 /// ring's inner edge (`boundary_radius_chunks * 16`, 2048 blocks by default) a
 /// block projects to well under a pixel, so minification is real — but the
 /// boundary fog is clamped to end at `inner + 512 * 0.55`, which fades the ring
@@ -3125,10 +3190,10 @@ pub(crate) fn build_fullscreen_overlay_mesh(
 /// compresses without bound along the depth axis. Never reproduced; toggle the
 /// ring off with F12 while an artifact is on screen to settle it.
 fn push_ocean_quad(
-    vertices: &mut Vec<Vertex>,
+    vertices: &mut Vec<WorldVertex>,
     indices: &mut Vec<u32>,
     texture_layer: u32,
-    tint: [f32; 3],
+    tint_kind: u8,
     x0: f32,
     z0: f32,
     x1: f32,
@@ -3136,107 +3201,96 @@ fn push_ocean_quad(
     y: f32,
 ) {
     let base = vertices.len() as u32;
-    let uvx0 = x0 * BOUNDARY_OCEAN_UV_TILE_PER_BLOCK;
-    let uvz0 = z0 * BOUNDARY_OCEAN_UV_TILE_PER_BLOCK;
-    let uvx1 = x1 * BOUNDARY_OCEAN_UV_TILE_PER_BLOCK;
-    let uvz1 = z1 * BOUNDARY_OCEAN_UV_TILE_PER_BLOCK;
+    // Anchor the UVs to the texture period just below the quad's corner, so
+    // neighbouring quads join seamlessly and every UV stays non-negative.
+    let period = 1.0 / BOUNDARY_OCEAN_UV_TILE_PER_BLOCK;
+    let origin_x = (x0 / period).floor() * period;
+    let origin_z = (z0 / period).floor() * period;
+    let corner = |x: f32, z: f32| WorldVertex {
+        position: [x, y, z],
+        uv: pack_uv(
+            (x - origin_x) * BOUNDARY_OCEAN_UV_TILE_PER_BLOCK,
+            (z - origin_z) * BOUNDARY_OCEAN_UV_TILE_PER_BLOCK,
+        ),
+        tex_layer: texture_layer,
+        shade: 255,
+        tint_kind,
+        light_packed: FULLBRIGHT_LIGHT_PACKED as u8,
+        _pad: 0,
+    };
     vertices.extend_from_slice(&[
-        Vertex {
-            position: [x0, y, z0],
-            uv: [uvx0, uvz0],
-            tex_layer: texture_layer,
-            color: tint,
-            tint_kind: TINT_NONE,
-            light_packed: FULLBRIGHT_LIGHT_PACKED,
-        },
-        Vertex {
-            position: [x1, y, z0],
-            uv: [uvx1, uvz0],
-            tex_layer: texture_layer,
-            color: tint,
-            tint_kind: TINT_NONE,
-            light_packed: FULLBRIGHT_LIGHT_PACKED,
-        },
-        Vertex {
-            position: [x1, y, z1],
-            uv: [uvx1, uvz1],
-            tex_layer: texture_layer,
-            color: tint,
-            tint_kind: TINT_NONE,
-            light_packed: FULLBRIGHT_LIGHT_PACKED,
-        },
-        Vertex {
-            position: [x0, y, z1],
-            uv: [uvx0, uvz1],
-            tex_layer: texture_layer,
-            color: tint,
-            tint_kind: TINT_NONE,
-            light_packed: FULLBRIGHT_LIGHT_PACKED,
-        },
+        corner(x0, z0),
+        corner(x1, z0),
+        corner(x1, z1),
+        corner(x0, z1),
     ]);
     indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
+/// Covers the rectangle with quads no longer than
+/// `BOUNDARY_OCEAN_MAX_QUAD_BLOCKS` on either side.
+fn push_ocean_rect(
+    vertices: &mut Vec<WorldVertex>,
+    indices: &mut Vec<u32>,
+    texture_layer: u32,
+    tint_kind: u8,
+    [x0, z0, x1, z1]: [f32; 4],
+    y: f32,
+) {
+    let mut quad_z = z0;
+    while quad_z < z1 {
+        let quad_z1 = (quad_z + BOUNDARY_OCEAN_MAX_QUAD_BLOCKS).min(z1);
+        let mut quad_x = x0;
+        while quad_x < x1 {
+            let quad_x1 = (quad_x + BOUNDARY_OCEAN_MAX_QUAD_BLOCKS).min(x1);
+            push_ocean_quad(
+                vertices,
+                indices,
+                texture_layer,
+                tint_kind,
+                quad_x,
+                quad_z,
+                quad_x1,
+                quad_z1,
+                y,
+            );
+            quad_x = quad_x1;
+        }
+        quad_z = quad_z1;
+    }
+}
+
+/// The water plane around a bounded world. It is drawn with the transparent
+/// world pipeline, so it must use the same `WorldVertex` layout as chunk
+/// meshes: the fat `Vertex` it used before the compact layout was read with
+/// the wrong stride and turned into huge black and grey slivers near spawn.
 fn build_boundary_ocean_ring_mesh(
     texture_layer: u32,
+    tint_kind: u8,
     y: f32,
     inner_radius_blocks: f32,
     outer_radius_blocks: f32,
-) -> (Vec<Vertex>, Vec<u32>) {
-    let mut vertices = Vec::with_capacity(16);
-    let mut indices = Vec::with_capacity(24);
-    let tint = [1.0, 1.0, 1.0];
+) -> (Vec<WorldVertex>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
     let inner = inner_radius_blocks.max(0.0);
     let outer = outer_radius_blocks.max(inner + 1.0);
 
-    // North strip
-    push_ocean_quad(
-        &mut vertices,
-        &mut indices,
-        texture_layer,
-        tint,
-        -outer,
-        -outer,
-        outer,
-        -inner,
-        y,
-    );
-    // South strip
-    push_ocean_quad(
-        &mut vertices,
-        &mut indices,
-        texture_layer,
-        tint,
-        -outer,
-        inner,
-        outer,
-        outer,
-        y,
-    );
-    // West strip
-    push_ocean_quad(
-        &mut vertices,
-        &mut indices,
-        texture_layer,
-        tint,
-        -outer,
-        -inner,
-        -inner,
-        inner,
-        y,
-    );
-    // East strip
-    push_ocean_quad(
-        &mut vertices,
-        &mut indices,
-        texture_layer,
-        tint,
-        inner,
-        -inner,
-        outer,
-        inner,
-        y,
-    );
+    for strip in [
+        [-outer, -outer, outer, -inner], // north
+        [-outer, inner, outer, outer],   // south
+        [-outer, -inner, -inner, inner], // west
+        [inner, -inner, outer, inner],   // east
+    ] {
+        push_ocean_rect(
+            &mut vertices,
+            &mut indices,
+            texture_layer,
+            tint_kind,
+            strip,
+            y,
+        );
+    }
 
     (vertices, indices)
 }
@@ -6629,7 +6683,11 @@ impl State {
         let layer = self
             .block_texture_lookup
             .layer_for(BlockId::WaterStill, Face::Up);
-        let (vertices, indices) = build_boundary_ocean_ring_mesh(layer, y, inner, outer);
+        // Same tint as the water inside the world, so the two read as one sea.
+        let tint_kind = self
+            .block_texture_lookup
+            .tint_kind_for(BlockId::WaterStill, Face::Up) as u8;
+        let (vertices, indices) = build_boundary_ocean_ring_mesh(layer, tint_kind, y, inner, outer);
         let vertex_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
