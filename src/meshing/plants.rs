@@ -2,7 +2,7 @@ use crate::blocks::{BlockModel, BlockTextureLookup, Face, TINT_NONE};
 use crate::world::CHUNK_SIZE;
 use crate::world::chunk::Chunk;
 
-use super::{WorldCpuMeshData, WorldVertex, FULLBRIGHT_LIGHT_PACKED, pack_uv};
+use super::{WorldCpuMeshData, WorldVertex, pack_uv};
 
 pub(super) fn append_cross_plants_in_chunk_pooled(
     chunk: &Chunk,
@@ -26,9 +26,12 @@ pub(super) fn append_cross_plants_in_chunk_pooled(
                     y as f32 + chunk_offset[1],
                     z as f32 + chunk_offset[2],
                 ];
+                // A cross plant has no faces against a neighbour, so it is lit
+                // by the light of the cell it stands in.
                 push_cross_plant(
                     base,
                     tex_layer,
+                    chunk.get_light_packed(x, y, z),
                     &mut cutout_mesh.vertices,
                     &mut cutout_mesh.indices,
                 );
@@ -40,6 +43,7 @@ pub(super) fn append_cross_plants_in_chunk_pooled(
 fn push_cross_plant(
     base: [f32; 3],
     tex_layer: u32,
+    light: u8,
     vertices: &mut Vec<WorldVertex>,
     indices: &mut Vec<u32>,
 ) {
@@ -57,7 +61,7 @@ fn push_cross_plant(
         [x + 1.0, y + 1.0, z + 1.0],
         [x + 0.0, y + 1.0, z + 0.0],
     ];
-    push_double_sided_quad(quad_a, [uv0, uv1, uv2, uv3], tex_layer, vertices, indices);
+    push_double_sided_quad(quad_a, [uv0, uv1, uv2, uv3], tex_layer, light, vertices, indices);
 
     let quad_b = [
         [x + 1.0, y + 0.0, z + 0.0],
@@ -65,13 +69,14 @@ fn push_cross_plant(
         [x + 0.0, y + 1.0, z + 1.0],
         [x + 1.0, y + 1.0, z + 0.0],
     ];
-    push_double_sided_quad(quad_b, [uv0, uv1, uv2, uv3], tex_layer, vertices, indices);
+    push_double_sided_quad(quad_b, [uv0, uv1, uv2, uv3], tex_layer, light, vertices, indices);
 }
 
 fn push_double_sided_quad(
     positions: [[f32; 3]; 4],
     uvs: [[f32; 2]; 4],
     tex_layer: u32,
+    light: u8,
     vertices: &mut Vec<WorldVertex>,
     indices: &mut Vec<u32>,
 ) {
@@ -83,7 +88,7 @@ fn push_double_sided_quad(
             tex_layer,
             shade: 255,
             tint_kind: TINT_NONE as u8,
-            light_packed: FULLBRIGHT_LIGHT_PACKED as u8,
+            light_packed: light,
             _pad: 0,
         });
     }

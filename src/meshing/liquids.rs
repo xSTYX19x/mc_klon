@@ -436,6 +436,18 @@ fn liquid_side_v(kind: FluidKind, local_y: f32) -> f32 {
     if kind == FluidKind::Lava { 1.0 - v } else { v }
 }
 
+/// Packed light for one liquid face: per-nibble max of the liquid's own cell
+/// and the cell the face looks into. The own cell keeps a lowered surface under
+/// a ceiling (or a side next to a light-blocking slab) from going black; both
+/// samples stay inside the 6-neighbour halo. `emitted` keeps lava glowing even
+/// before the light engine has seeded its cell.
+#[inline(always)]
+fn liquid_face_light(own: u8, front: u8, emitted: u8) -> u8 {
+    let sky = (own >> 4).max(front >> 4);
+    let block = (own & 0x0F).max(front & 0x0F).max(emitted.min(0x0F));
+    (sky << 4) | block
+}
+
 fn emit_liquid_side(
     mesh: &mut WorldCpuMeshData,
     kind: FluidKind,
@@ -449,6 +461,7 @@ fn emit_liquid_side(
     top_right: f32,
     tex_layer: u32,
     tint_kind: u32,
+    light: u8,
 ) {
     let (positions, uvs) = match face {
         Face::South => (
@@ -509,7 +522,7 @@ fn emit_liquid_side(
         ),
         _ => return,
     };
-    push_textured_quad(mesh, positions, uvs, tex_layer, tint_kind);
+    push_textured_quad(mesh, positions, uvs, tex_layer, tint_kind, light);
 }
 
 pub(super) fn append_liquids_in_chunk_pooled(
@@ -657,8 +670,11 @@ fn append_liquids_in_chunk_with_pool(
                 let wx = x as f32 + chunk_offset[0];
                 let wy = y as f32 + chunk_offset[1];
                 let wz = z as f32 + chunk_offset[2];
+                let own_light = world.get_light_packed(world_pos);
+                let emitted_light = id.emitted_light();
 
                 if !covered {
+                    let above_light = world.get_light_packed(world_pos + IVec3::Y);
                     push_textured_quad(
                         mesh,
                         [
@@ -670,6 +686,7 @@ fn append_liquids_in_chunk_with_pool(
                         [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
                         texture_lookup.layer_for(still_block, Face::Up),
                         texture_lookup.tint_kind_for(still_block, Face::Up),
+                        liquid_face_light(own_light, above_light, emitted_light),
                     );
                 }
 
@@ -732,6 +749,11 @@ fn append_liquids_in_chunk_with_pool(
                         our_right,
                         texture_lookup.layer_for(side_block, face),
                         texture_lookup.tint_kind_for(side_block, face),
+                        liquid_face_light(
+                            own_light,
+                            world.get_light_packed(neighbor_pos),
+                            emitted_light,
+                        ),
                     );
                 }
             }

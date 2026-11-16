@@ -15,7 +15,7 @@ use super::flatten_layered_geometry;
 use super::liquids::fluid_surface_height_at;
 use super::neighborhood::{MeshingNeighborhood, PADDED_CHUNK_STRIDE_Y, PADDED_CHUNK_STRIDE_Z};
 use super::{
-    WorldCpuMeshData, WorldVertex, FULLBRIGHT_LIGHT_PACKED, LayeredChunkGeometry, MeshLayerMask,
+    WorldCpuMeshData, WorldVertex, LayeredChunkGeometry, MeshLayerMask,
     chunk_offset, chunk_world_origin, pack_uv, pack_shade, pack_vertex_light,
 };
 
@@ -1835,13 +1835,13 @@ pub(super) fn push_textured_quad_simd(
     uvs: [[f32; 2]; 4],
     tex_layer: u32,
     tint_kind: u32,
+    light: u8,
 ) {
     let base = mesh.vertices.len() as u32;
 
     mesh.vertices.reserve(4);
     mesh.indices.reserve(6);
 
-    let light = FULLBRIGHT_LIGHT_PACKED as u8;
     let tk = tint_kind as u8;
 
     mesh.vertices.extend_from_slice(&[
@@ -1895,6 +1895,7 @@ pub(super) fn push_textured_quad_scalar(
     uvs: [[f32; 2]; 4],
     tex_layer: u32,
     tint_kind: u32,
+    light: u8,
 ) {
     let base = mesh.vertices.len() as u32;
     for i in 0..4 {
@@ -1904,7 +1905,7 @@ pub(super) fn push_textured_quad_scalar(
             tex_layer,
             shade: 255,
             tint_kind: tint_kind as u8,
-            light_packed: FULLBRIGHT_LIGHT_PACKED as u8,
+            light_packed: light,
             _pad: 0,
         });
     }
@@ -1920,8 +1921,9 @@ pub(super) fn push_textured_quad(
     uvs: [[f32; 2]; 4],
     tex_layer: u32,
     tint_kind: u32,
+    light: u8,
 ) {
-    push_textured_quad_simd(mesh, positions, uvs, tex_layer, tint_kind)
+    push_textured_quad_simd(mesh, positions, uvs, tex_layer, tint_kind, light)
 }
 
 #[cfg(test)]
@@ -2130,8 +2132,9 @@ mod simd_uv_tests {
         let mut scalar_mesh = super::super::WorldCpuMeshData::default();
         let mut simd_mesh = super::super::WorldCpuMeshData::default();
 
-        push_textured_quad_scalar(&mut scalar_mesh, positions, uvs, tex_layer, tint_kind);
-        push_textured_quad_simd(&mut simd_mesh, positions, uvs, tex_layer, tint_kind);
+        let light = 0x93;
+        push_textured_quad_scalar(&mut scalar_mesh, positions, uvs, tex_layer, tint_kind, light);
+        push_textured_quad_simd(&mut simd_mesh, positions, uvs, tex_layer, tint_kind, light);
 
         // Compare vertices
         assert_eq!(scalar_mesh.vertices.len(), simd_mesh.vertices.len());
@@ -2368,6 +2371,81 @@ mod simd_uv_tests {
             ),
             "a lower slab beside a full cube must not be treated like a full side-face blocker"
         );
+    }
+
+    /// Liquids and cross plants used to be baked at full skylight, so water and
+    /// flowers in an unlit cave glowed. They must take the world's light, and
+    /// lava must keep its own glow.
+    #[test]
+    fn liquids_and_plants_take_world_light_instead_of_fullbright() {
+        use crate::blocks::BlockId;
+
+        let mut world = World::new();
+        let water = IVec3::new(4, 4, 4);
+        let lava = IVec3::new(10, 4, 10);
+        let plant = IVec3::new(4, 4, 10);
+        world.set_block(water, BlockId::WaterStill).unwrap();
+        world.set_block(lava, BlockId::LavaStill).unwrap();
+        world.set_block(plant, BlockId::Dandelion).unwrap();
+        // Fresh chunks are unlit; only the cell above the water and the
+        // plant's own cell get light.
+        world.set_light_packed(water + IVec3::Y, 0x93);
+        world.set_light_packed(plant, 0x52);
+
+        let texture_lookup = test_texture_lookup();
+        let coord = ChunkCoord { x: 0, y: 0, z: 0 };
+        let mut scratch = MeshingNeighborhoodScratch::new();
+        let (neighborhood, _) = scratch.build(coord, snapshot_for(&world, coord));
+        let mut pool = crate::meshing::pool::MeshingPool::new();
+        let (dense, _) = build_chunk_mesh_greedy_layered_dense_pooled(
+            &neighborhood,
+            coord,
+            &texture_lookup,
+            &mut pool,
+            MeshLayerMask::ALL,
+        );
+        let world_path = build_chunk_mesh_greedy_layered(&world, coord, &texture_lookup);
+
+        let inside = |quad: &[WorldVertex], cell: IVec3| {
+            quad.iter().all(|v| {
+                (0..3).all(|axis| {
+                    let p = v.position[axis];
+                    p >= cell[axis] as f32 - 1e-4 && p <= cell[axis] as f32 + 1.0 + 1e-4
+                })
+            })
+        };
+
+        for (path, layered) in [("dense", dense), ("world", world_path)] {
+            let (mut water_top, mut water_sides, mut lava_quads, mut plant_quads) = (0, 0, 0, 0);
+            for mesh in [&layered.opaque, &layered.cutout, &layered.transparent] {
+                for quad in mesh.vertices.chunks_exact(4) {
+                    let light = quad[0].light_packed;
+                    assert!(
+                        quad.iter().all(|v| v.light_packed == light),
+                        "{path}: one liquid/plant quad must carry a single light value"
+                    );
+                    if inside(quad, water) {
+                        if quad.iter().all(|v| v.position[1] > water.y as f32 + 1e-3) {
+                            water_top += 1;
+                            assert_eq!(light, 0x93, "{path}: water top takes the light above");
+                        } else {
+                            water_sides += 1;
+                            assert_eq!(light, 0x00, "{path}: water side in the dark must be dark");
+                        }
+                    } else if inside(quad, lava) {
+                        lava_quads += 1;
+                        assert_eq!(light, 0x0F, "{path}: lava keeps its emitted block light");
+                    } else if inside(quad, plant) {
+                        plant_quads += 1;
+                        assert_eq!(light, 0x52, "{path}: a plant takes the light of its cell");
+                    }
+                }
+            }
+            assert_eq!(water_top, 1, "{path}: expected one water surface quad");
+            assert_eq!(water_sides, 4, "{path}: expected four water side quads");
+            assert!(lava_quads > 0, "{path}: lava emitted no quads");
+            assert_eq!(plant_quads, 2, "{path}: expected the two cross-plant quads");
+        }
     }
 }
 

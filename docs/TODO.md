@@ -382,12 +382,8 @@ nächsten billiger macht:
     um mindestens 50 %, ohne Löcher beim schnellen Drehen; `cpu_render_ms`
     sinkt oder bleibt gleich; die Oberflächen-Szene wird nicht langsamer.
 
-- **Mesher-Korrektheit: echtes Licht für Flüssigkeiten/Pflanzen, Halo mit
-  Kanten- und Ecknachbarn**
-  - *Ist:* (a) Flüssigkeits- und Pflanzen-Quads schreiben immer
-    `FULLBRIGHT_LIGHT_PACKED` und `shade: 255` (`meshing/greedy.rs:1844-1854`,
-    `meshing/plants.rs:84-86`) — Wasser, Blumen und Pilze in Höhlen leuchten
-    mit vollem Himmelslicht. (b) Der Mesher-Halo kopiert nur die 6
+- **Mesher-Korrektheit: Halo mit Kanten- und Ecknachbarn**
+  - *Ist:* Der Mesher-Halo kopiert nur die 6
     Flächennachbarn; die 12 Kanten- und 8 Eckregionen bleiben Luft mit
     Default-Licht (`meshing/neighborhood.rs:298-301`; Snapshot mit
     `neighbors: [Option<ChunkSnapshot>; 6]`, `:9-20`, gebaut in
@@ -395,25 +391,25 @@ nächsten billiger macht:
     dadurch Luft statt des verdeckenden Blocks → hellere Linien entlang der
     Kanten. Passend dazu invalidiert ein Edit nie Diagonal-Sektionen
     (`classify_block_edit_mesh_invalidation`, `render/state.rs:15562-15655`).
+    Flüssigkeiten und Pflanzen nehmen seit 2026-11-16 echtes Licht, lesen dafür
+    aber bewusst nur Zellen im 6er-Halo (`liquid_face_light`,
+    `meshing/liquids.rs`); sie tragen weiter `shade: 255`, also keine
+    Richtungsschattierung.
   - *Ziel:* Alle Geometrie folgt demselben Licht-/AO-Modell; keine Artefakte an
     Sektionsgrenzen.
   - *Vorbild:* Vanilla `RenderChunkRegion` bzw. Sodium `WorldSlice` (der Mesher
     bekommt einen 3×3×3-Sektionsblock). Direkt übertragbar: die Snapshots sind
     `Arc`-Klone und kosten fast nichts.
-  - *Vorgehen:* 1) Flüssigkeiten nehmen das Licht der Zelle vor der Fläche
-    (wie `cube_face_vertex_shade_and_light_local_fast`), Lava behält ihr
-    `emitted_light`; Pflanzen nehmen das Licht ihrer eigenen Zelle.
-    2) Snapshot auf 26 Nachbarn erweitern, Halo-Kanten (12 × 16 Zellen) und
-    Ecken (8 Zellen) kopieren. 3) Ein Edit an einer Sektionskante oder -ecke
-    markiert auch die betroffenen Diagonal-Sektionen dirty, wenn sich deren
-    AO-Samples ändern.
-  - *Dateien:* `meshing/greedy.rs`, `meshing/liquids.rs`, `meshing/plants.rs`,
-    `meshing/neighborhood.rs`, `render/state.rs`.
+  - *Vorgehen:* 1) Snapshot auf 26 Nachbarn erweitern, Halo-Kanten
+    (12 × 16 Zellen) und Ecken (8 Zellen) kopieren. 2) Ein Edit an einer
+    Sektionskante oder -ecke markiert auch die betroffenen Diagonal-Sektionen
+    dirty, wenn sich deren AO-Samples ändern.
+  - *Dateien:* `meshing/neighborhood.rs`, `render/state.rs`.
   - *Abhängigkeiten:* keine. Vor "Smooth Lighting" erledigen.
-  - *Priorität/Aufwand/Impact:* **P1** (a: S, b: M), mittel, gut sichtbar.
-  - *Akzeptanz:* Wasser in einer lichtlosen Höhle ist dunkel; eine Blocktreppe
-    über eine Sektionsecke zeigt durchgehende AO ohne helle Kante; die
-    Mesh-Zeit pro Job (`mesh_worker`-Trace) steigt um weniger als 5 %.
+  - *Priorität/Aufwand/Impact:* **P1**, M, mittel, gut sichtbar.
+  - *Akzeptanz:* Eine Blocktreppe über eine Sektionsecke zeigt durchgehende AO
+    ohne helle Kante; die Mesh-Zeit pro Job (`mesh_worker`-Trace) steigt um
+    weniger als 5 %.
 
 - **Smooth Lighting: Lichtverläufe über gemergte Quads — Entscheidung "Licht im
   Vertex" vs. "Licht-Volumen"**

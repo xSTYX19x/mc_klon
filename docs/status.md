@@ -36,6 +36,7 @@ That direction is now active in the code:
   - AO/light sampling based on explicit occlusion shapes
   - partial blocks no longer treated as full blockers by default
   - shader receives stable baked vertex shading/light inputs
+  - liquids and cross plants use world light (own cell / cell in front of the face); lava keeps its emitted block light
 - debug views for depth/culling/AO/lighting
 - 3D preview meshes for block models are reused for UI item previews
 
