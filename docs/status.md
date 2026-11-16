@@ -88,6 +88,7 @@ That direction is now active in the code:
 ### Worldgen
 
 - presets: `Flatish`, `ClassicFlatter`, `Rd161348Like`, `Hilly`
+- new worlds are unbounded: the classic size (Small/Normal/Huge) only sets the area generated before play starts; the boundary-ocean ring and its fog limit exist only in worlds saved with `boundary_ocean`
 - terrain + density + surface rules
 - streaming generates the base terrain per column: the y-independent heightmap is computed once per column and all-air sections are skipped (`WorldgenPipeline::generate_column`)
 - carvers (caves/ravines)

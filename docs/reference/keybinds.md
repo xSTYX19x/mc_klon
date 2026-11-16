@@ -56,7 +56,7 @@ Source of truth:
 | `F9` | Print fluid debug line under crosshair | In-game |
 | `F10` | Toggle rolling perf summary logger (1s) | In-game |
 | `F11` | Toggle precipitation | In-game |
-| `F12` | Toggle boundary-ocean ring | In-game |
+| `F12` | Toggle boundary-ocean ring (only worlds saved with one; new worlds have none) | In-game |
 | `F` | Cycle render distance | In-game |
 | `G` | Cycle simulation distance | In-game |
 

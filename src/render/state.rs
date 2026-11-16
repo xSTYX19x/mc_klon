@@ -700,10 +700,12 @@ mod lighting_readiness_tests {
 #[cfg(test)]
 mod boundary_ocean_tests {
     use super::{
-        BOUNDARY_OCEAN_MAX_QUAD_BLOCKS, BOUNDARY_OCEAN_UV_TILE_PER_BLOCK,
+        BOUNDARY_OCEAN_MAX_QUAD_BLOCKS, BOUNDARY_OCEAN_UV_TILE_PER_BLOCK, State,
         build_boundary_ocean_ring_mesh,
     };
     use crate::meshing::{FULLBRIGHT_LIGHT_PACKED, UV_SCALE};
+    use crate::world::{WorldConfig, WorldEnvironment};
+    use crate::worldgen::ClassicLevelSize;
 
     /// The ring is drawn by the transparent world pipeline, whose `WorldVertex`
     /// UVs are unsigned fixed point up to 16.0. Every UV must fit without
@@ -751,6 +753,29 @@ mod boundary_ocean_tests {
             (area - expected).abs() < 1.0,
             "covered {area}, ring is {expected}"
         );
+    }
+    /// New levels are unbounded: no boundary ocean even when the previous
+    /// world had one, while the classic size still sets the startup area.
+    #[test]
+    fn new_levels_draw_no_boundary_ocean_and_keep_their_size() {
+        let previous = WorldConfig {
+            boundary_ocean: true,
+            boundary_radius_chunks: 16,
+            ..WorldConfig::default()
+        };
+        let cfg = State::new_level_world_config(
+            previous,
+            42,
+            ClassicLevelSize::Small,
+            WorldEnvironment::Winter,
+        );
+        assert!(!cfg.boundary_ocean());
+        assert_eq!(
+            cfg.boundary_radius_chunks(),
+            ClassicLevelSize::Small.boundary_radius_chunks()
+        );
+        assert_eq!(cfg.seed, 42);
+        assert!(matches!(cfg.environment, WorldEnvironment::Winter));
     }
 }
 
@@ -11791,20 +11816,41 @@ impl State {
             .max(0)
     }
 
+    /// World config for a freshly generated level. Worlds are unbounded: the
+    /// classic size only sets how much is generated before play starts
+    /// (`startup_radius_chunks_for`). No boundary ocean either: terrain
+    /// streams past any border, so the ring would lie under the ground and its
+    /// fog would cut the view distance short. Worlds saved with a boundary
+    /// ocean keep it.
+    fn new_level_world_config(
+        mut cfg: WorldConfig,
+        seed: u64,
+        classic_size: ClassicLevelSize,
+        environment: WorldEnvironment,
+    ) -> WorldConfig {
+        cfg.seed = seed;
+        cfg.boundary_ocean = false;
+        cfg.boundary_radius_chunks = classic_size.boundary_radius_chunks();
+        cfg.environment = environment;
+        cfg
+    }
+
+    /// The world size bounds the area generated before play starts, whether
+    /// or not the world draws a boundary ocean.
     fn startup_radius_chunks_for(&self, kind: WorldGenerationKind) -> i32 {
         match kind {
             WorldGenerationKind::StartupLoad => {
                 let cfg = self.world.config();
                 let normal_radius = ClassicLevelSize::Normal.boundary_radius_chunks();
                 let mut radius = self.startup_radius_chunks().min(normal_radius);
-                if cfg.boundary_ocean() && cfg.boundary_radius_chunks() > 0 {
+                if cfg.boundary_radius_chunks() > 0 {
                     radius = radius.min(cfg.boundary_radius_chunks());
                 }
                 radius.max(0)
             }
             WorldGenerationKind::NewWorld => {
                 let cfg = self.world.config();
-                if cfg.boundary_ocean() && cfg.boundary_radius_chunks() > 0 {
+                if cfg.boundary_radius_chunks() > 0 {
                     cfg.boundary_radius_chunks()
                 } else {
                     self.startup_radius_chunks()
@@ -15011,11 +15057,8 @@ impl State {
             new_save_root.display()
         );
 
-        let mut cfg = self.world.config();
-        cfg.seed = seed;
-        cfg.boundary_ocean = true;
-        cfg.boundary_radius_chunks = classic_size.boundary_radius_chunks();
-        cfg.environment = environment;
+        let cfg =
+            Self::new_level_world_config(self.world.config(), seed, classic_size, environment);
         self.world.configure_world_config(cfg, preset);
         self.reset_weather_for_environment();
         self.rebuild_boundary_ocean_mesh();
