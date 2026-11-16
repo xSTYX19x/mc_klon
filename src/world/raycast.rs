@@ -192,7 +192,7 @@ pub(crate) fn raycast_world(
         let block = world.get_block(cell);
         if blocks_raycast_targeting(block) {
             let t_next = t_max.x.min(t_max.y.min(t_max.z));
-            let shape = block.raycast_shape();
+            let shape = world.get_block_state(cell).raycast_shape();
             if let Some((shape_min, shape_max)) = shape.world_bounds(cell) {
                 if let Some((t_hit, shape_hit_normal)) =
                     ray_intersect_aabb(origin, dir, shape_min, shape_max)

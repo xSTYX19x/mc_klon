@@ -148,8 +148,7 @@ pub(crate) fn aabb_collides(world: &World, aabb_min: Vec3, aabb_max: Vec3) -> bo
                     return true;
                 }
 
-                let block = world.get_block(block_pos);
-                let shape = block.collision_shape();
+                let shape = world.get_block_state(block_pos).collision_shape();
                 let Some((block_min, block_max)) = shape.world_bounds(block_pos) else {
                     continue;
                 };

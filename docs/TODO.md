@@ -46,7 +46,8 @@ nächsten billiger macht:
 2. Block-Registry per Makro (unten) — `blocks!` steht seit 2026-11-16; offen
    ist nur `BlockId` → `u16`, sobald mehr als ~200 Blöcke absehbar sind.
 3. Block-State-Datenschicht (→ "Content-Abgleich / Querschnitts-Voraussetzung:
-   Block-States").
+   Block-States") — steht seit 2026-11-16; offen sind Waterlogging und die
+   Formfamilien (Punkt 4).
 4. Blockmodelle und Voxel-Shapes (→ "Rendering", erster Punkt).
 5. Block-Verhalten: Interaktions-Hooks (→ "Survival-Gameplay / Interaktion")
    plus Neighbor-Updates und Scheduled Ticks (unten).
@@ -570,39 +571,32 @@ Formatänderung") bleiben; ergänzt um die Architekturfragen, die er offen ließ
 typisierter State-Wert, abgeleitete vs. gespeicherte Properties,
 Waterlogging, Grenze von 256 Blocktypen.
 
-**Das ist der Blocker für ca. 60 % der Liste unten** (Treppen, Zaun, Tür,
+Die Datenschicht, an der ca. 60 % der Liste unten hängen (Treppen, Zaun, Tür,
 Leiter, Fackel, Schiene, Hebel, Knopf, Druckplatte, Redstone-Staub, Schild,
-Kaktus/Zuckerrohr-/Weizen-Alter, Schneehöhe). Die Form-/Occlusion-Seite steht unter
-"Rendering / Blockmodelle und Voxel-Shapes"; hier steht die Speicher- und
-Contract-Seite, weil daran alle Content-Punkte hängen.
+Kaktus/Zuckerrohr-/Weizen-Alter, Schneehöhe), steht seit 2026-11-16; diese
+Blöcke warten jetzt auf ihre Formen unter "Rendering / Blockmodelle und
+Voxel-Shapes". Hier bleibt die Speicher- und Contract-Seite.
 
-- *Ist:*
-  - `BlockStateId` ist ein reiner Alias auf `BlockId` (`blocks/mod.rs:80`),
-    trägt also keinen Zustand; `RandomTickFn` bekommt ihn trotzdem schon als
-    Parameter (`:81`).
-  - `Chunk::block_data` ist bereits **ein Byte pro Voxel** als
-    `Arc<Vec<u8>>` (`world/chunk.rs:10`), Copy-on-Write über `Arc::make_mut`
-    (`:163-172`), für unveränderte Sektionen ein geteilter Null-Puffer
-    (`:455-462`). Es wird mitgespeichert (`storage/chunk_codec.rs`,
-    `COLUMN_PAYLOAD_FORMAT_VERSION = 2`, eigene u8-Palette `:120-127`) **und
-    liegt dem Mesher im gepolsterten Nachbarschaftspuffer vor**
-    (`meshing/neighborhood.rs:11`, `:170`).
-  - Belegung heute: Fluids nutzen `0x0F` (Level), `0x20`, `0x40`, `0x80`
-    (`world/fluids.rs:174-177`), **nur für Fluid-Blöcke**; Bit `0x10` ist
-    frei. Der Setzling nutzt Bit 0 als Wachstumsstufe
-    (`sapling_stage`/`sapling_set_stage`, `blocks/mod.rs:2495-2501`) — der
-    erste Nicht-Fluid-Nutzer und der Beleg, dass die Umdeutung pro Blocktyp
-    funktioniert. Es gibt aber keine typisierte Sicht und keine zentrale
-    Stelle, die festhält, welcher Block welche Bits besitzt
-    (`blocks/state.rs` existiert nicht).
-  - Kein Setter schreibt einen State mit Nebenwirkungen: es gibt
-    `set_block_and_data` / `set_block_and_data_loaded_only`
-    (`world/mod.rs:3223`, `:3279`), aber keine `set_block_state`-Variante, und
-    Platzieren setzt für Nicht-Fluids immer `0` (`render/state.rs:19316-19325`).
-  - Die Ablehnung "`blocks` + `block_data` zu einer `u16`-State-ID
-    verschmelzen" (`world/chunk.rs:328-330`: spart nichts, ~150 Call-Sites)
-    gilt weiter für die **Speicherung**, aber nicht für die **API** — dort
-    fehlt ein Wert, der Block und Daten gemeinsam trägt.
+- *Ist:* Seit 2026-11-16 steht die Datenschicht in `blocks/state.rs`:
+  `BlockState { id, data }` (gedruckt als `minecraft:oak_sapling[stage=1]`,
+  so auch im F3-Overlay hinter dem Zielblock), `PropertySpec` und die
+  typisierte Sicht `Property<T>` mit `get`/`with` auf dem State oder dem
+  nackten Datenbyte, dazu das Vokabular `views::{facing4, facing6, half, open,
+  powered, rail_shape, redstone_power, age, snow_layers}` für die kommenden
+  Formfamilien. Jeder Block deklariert sein Schema in `blocks!`
+  (`with_properties`): heute der Setzling (`stage`, Bit 0) und die vier
+  Fluid-Blöcke (`level` 0x0F, `static` 0x20, `source` 0x40, `falling` 0x80;
+  Bit 0x10 frei), über deren Sichten auch die `fluid_data_*`-Helfer laufen.
+  `every_schema_fits_its_data_byte` erzwingt disjunkte Bits im Byte und Rohwert
+  0 als Default. `RandomTickFn` bekommt einen `BlockState`, die Shape-Abfragen
+  (`collision_shape`, `raycast_shape`, `occlusion_shape`) hängen an
+  `BlockState`, und `World::set_block_state`/`get_block_state` schreiben bzw.
+  lesen über das Änderungsjournal; `set_block` ist die Kurzform mit dem
+  Default-State, Platzieren setzt den Default-State. Das Speicherformat bleibt
+  v2 (Blockname + Datenbyte). Offen: Waterlogging (in der Vorlage a1.0.17 nicht
+  enthalten) und die Formfamilien; außerdem markiert der Edit-Pfad
+  Daten-only-Änderungen nur als ungespeichert (`enqueue_world_block_changes`,
+  `render/state.rs`), ohne Remesh oder Relight.
 - *Ziel:* Jeder Block deklariert seine Properties einmal; alle Systeme
   (Mesher, Shapes, Interaktion, Speicher, Debug-Anzeige) lesen sie über einen
   typisierten `BlockState`-Wert. Die Speicherform (heute `BlockId` + Byte)
@@ -621,52 +615,28 @@ Contract-Seite, weil daran alle Content-Punkte hängen.
   Formen (4 Bit) + `powered` (1); Redstone-Staub = `power` (4); Alter/Stufen
   ≤ 4 Bit.
 - *Vorgehen:*
-  1. `blocks/state.rs`: `BlockState { id, data }`, `PropertySpec` und
-     typisierte Sichten `Facing4`/`Facing6` (2-3 Bit), `Half` (1 Bit,
-     Slab/Treppe/Tür oben/unten), `Open`/`Powered` (je 1 Bit), `RailShape`
-     (4 Bit), `RedstonePower` (4 Bit), `Age { max }` (4 Bit für
-     Kaktus/Zuckerrohr/Setzling), `SnowLayers` (3 Bit). Jeweils
-     `fn get(BlockState) -> T` / `fn with(BlockState, T) -> BlockState` analog
-     zu den `fluid_data_*`-Helfern, damit der Stil konsistent bleibt.
-     Setzling-Bit und Fluid-Bits als erste Schemata eintragen.
-  2. `BlockSpec` bekommt `properties: &'static [PropertySpec]` (über das
-     Registry-Makro aus "Architektur"). Damit steht pro Block an genau einer
-     Stelle, wer die Bits besitzt. Ein Test in der Art von
-     `every_model_states_its_raycast_shape` erzwingt: Bit-Bereiche pro Block
-     sind disjunkt und passen in 8 Bit, Fluid-Blöcke deklarieren genau die
-     Fluid-Bits.
-  3. Den `BlockStateId`-Alias durch `BlockState` ersetzen, zuerst in den
-     Funktionszeiger-Signaturen (`RandomTickFn`, künftige Hooks) und in den
-     Shape-/Modell-Abfragen (`collision_shape`, `raycast_shape`,
-     `occlusion_shape` nehmen einen State statt einer ID).
-  4. `World::set_block_state(pos, BlockState)` als Schreibweg, der über das
-     Welt-Änderungsjournal ("Architektur") dieselbe Dirty-/Lighting-
-     Invalidierung auslöst; `set_block` bleibt als Kurzform mit dem
-     Default-State. Der bestehende Fluid-Pfad zeigt, dass das geht.
-  5. **Waterlogging:** ein gespeichertes Bit `waterlogged` in jedem Block, der
-     es unterstützt; der Fluid-Pfad liest es als "Quelle, still". Keine zweite
-     Fluid-Schicht — Vanilla erlaubt in gefluteten Blöcken auch nur Quellen.
-  6. Speicherformat bleibt v2 (Blockname + Daten-Byte). Palette-Namen der Form
-     `name[prop=wert,…]` nur, wenn ein späterer Umbau das erzwingt (siehe
-     "Storage: Versionierung & Migrationskette").
-  7. Neue `BlockModelSpec`-Varianten (`Stairs`, `Fence`, `Torch`, `Ladder`,
+  1. **Waterlogging** (erst, wenn eine Formfamilie es braucht): ein
+     gespeichertes Bit `waterlogged` in jedem Block, der es unterstützt; der
+     Fluid-Pfad liest es als "Quelle, still". Keine zweite Fluid-Schicht —
+     Vanilla erlaubt in gefluteten Blöcken auch nur Quellen.
+  2. Neue `BlockModelSpec`-Varianten (`Stairs`, `Fence`, `Torch`, `Ladder`,
      `Door`, `Rail`, `FlatOnFloor`, `Sign`) entstehen pro Formfamilie unter
      "Rendering / Blockmodelle und Voxel-Shapes"; Nicht-Würfel laufen dort über
-     den Modell-Pfad, den der Greedy-Merger nie sieht.
-- *Dateien:* neues `blocks/state.rs`, `blocks/mod.rs`, `world/mod.rs`,
-  `world/fluids.rs`, `render/state.rs` (Platzieren), `meshing/*`.
-- *Abhängigkeiten:* Registry-Makro (Schema-Deklaration), Welt-Änderungsjournal
-  (Nebenwirkungen). Blockiert Blockmodelle, Interaktion und Redstone.
-- *Priorität/Aufwand/Impact:* **P2**; Schritte 1-4 M, danach pro Formfamilie
-  S; Impact sehr hoch.
-- *Akzeptanz:* Schema-Test grün; Setzling und Fluids laufen über die neuen
-  Sichten ohne Verhaltensänderung (bestehende Fluid-Tests grün); das
-  F3-Overlay zeigt für den anvisierten Block `name[prop=wert]`; ein Save von
-  vorher lädt bitgleich.
+     den Modell-Pfad, den der Greedy-Merger nie sieht. Mit der ersten Property,
+     die Modell oder Form ändert, muss der Edit-Pfad Daten-only-Änderungen wie
+     einen Blocktausch remeshen und relighten. Palette-Namen der Form
+     `name[prop=wert,…]` im Speicher nur, wenn ein späterer Umbau das erzwingt
+     (siehe "Storage: Versionierung & Migrationskette").
+- *Dateien:* `blocks/state.rs`, `blocks/mod.rs`, `world/fluids.rs`
+  (Waterlogging), `render/state.rs` (Edit-Pfad), `meshing/*`.
+- *Abhängigkeiten:* Formfamilien: "Rendering / Blockmodelle und Voxel-Shapes".
+- *Priorität/Aufwand/Impact:* **P2**; pro Formfamilie S, Waterlogging S-M;
+  Impact sehr hoch.
+- *Akzeptanz:* Ein Block mit `waterlogged` hält stilles Wasser, das der
+  Fluid-Pfad als Quelle liest; eine Daten-only-Änderung an einer
+  formrelevanten Property wird neu gemesht und beleuchtet.
 
-Reihenfolge: erst 1+2 (reine Datenschicht, testbar ohne Rendering), dann 3+4,
-dann die Blockmodelle pro Formfamilie. Jede Formfamilie ist danach ein
-isolierter, kleiner Change.
+Jede Formfamilie ist ein isolierter, kleiner Change auf der Datenschicht.
 
 ### Blöcke (Inhalt)
 

@@ -580,7 +580,7 @@ fn face_vertex_shade_and_light(
         let sample_pos = block_pos + *cell_offset;
         let local_point = sample_local_point(vertex_local, *cell_offset);
         occluded[index] = world
-            .get_block(sample_pos)
+            .get_block_state(sample_pos)
             .occlusion_shape()
             .occludes_ao_sample(local_point);
         raw_lights[index] = world.get_light_packed(sample_pos);

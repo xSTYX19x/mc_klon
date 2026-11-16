@@ -54,6 +54,7 @@ That direction is now active in the code:
 - full cubes can carry a texture per face (`CubeFaces`); the furnace keeps a fixed south front (`BlockSpec::cube_front`) until blocks have a facing state
 - the creative palette is sorted from each block's `creative_order` at compile time
 - `BlockRegistry::get()` is a static view over the table; nothing is rebuilt per saved or loaded column
+- block states (`blocks/state.rs`): a `BlockState` is a block plus its data byte; each block declares its bit layout in `blocks!` (sapling `stage`, fluid `level`/`static`/`source`/`falling`) and code reads it through typed `Property` views; random-tick hooks, shape queries and `World::set_block_state` take states; F3 shows the targeted state as `name[prop=value]`; the save format is unchanged
 
 ### Startup / Streaming
 

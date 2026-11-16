@@ -7,6 +7,11 @@ use crate::registry::NamespacedKey;
 use crate::world::World;
 use crate::world::fluids::FluidKind;
 
+pub(crate) mod state;
+
+pub(crate) use state::BlockState;
+use state::{FLUID_PROPERTIES, PropertySpec, SAPLING_PROPERTIES, SAPLING_STAGE};
+
 pub(crate) const TEX_STONE: &str = "minecraft:textures/block/stone.png";
 pub(crate) const TEX_COBBLESTONE: &str = "minecraft:textures/block/cobblestone.png";
 pub(crate) const TEX_OBSIDIAN: &str = "minecraft:textures/block/obsidian.png";
@@ -92,8 +97,9 @@ pub(crate) const TINT_NONE: u32 = 0;
 pub(crate) const TINT_GRASS_TOP: u32 = 1;
 pub(crate) const TINT_WATER: u32 = 2;
 
-pub(crate) type BlockStateId = BlockId;
-pub(crate) type RandomTickFn = fn(&mut World, IVec3, BlockStateId, u64);
+/// A block's random-tick hook: the world, the block's position, its current
+/// state there, and the tick index.
+pub(crate) type RandomTickFn = fn(&mut World, IVec3, BlockState, u64);
 
 /// Declares every block in one place: each `Variant => spec` entry becomes a
 /// `BlockId` variant and the matching `BLOCK_SPECS` row, and `BLOCK_COUNT`
@@ -496,6 +502,8 @@ struct BlockSpec {
     /// Position in the creative palette (`CLASSIC_PALETTE`); `None` keeps the
     /// block out of it.
     creative_order: Option<u16>,
+    /// Which bits of the block's data byte mean what (`state::BlockState`).
+    properties: &'static [PropertySpec],
 }
 
 /// Builders for `blocks!` entries. `new` is the common case — a solid, opaque,
@@ -528,6 +536,7 @@ impl BlockSpec {
             block_entity: None,
             random_tick: None,
             creative_order: None,
+            properties: &[],
         }
     }
 
@@ -653,6 +662,11 @@ impl BlockSpec {
 
     const fn with_creative_order(mut self, order: u16) -> Self {
         self.creative_order = Some(order);
+        self
+    }
+
+    const fn with_properties(mut self, properties: &'static [PropertySpec]) -> Self {
+        self.properties = properties;
         self
     }
 }
@@ -878,6 +892,7 @@ blocks! {
     Sapling => BlockSpec::plant("minecraft:oak_sapling", "Sapling", TEX_SAPLING, [0.28, 0.88, 0.36])
         .with_aliases(&["core:sapling"])
         .with_random_tick(sapling_random_tick)
+        .with_properties(&SAPLING_PROPERTIES)
         .with_creative_order(11),
     OakPlanks => BlockSpec::cube(
         "minecraft:oak_planks", "Oak Planks", TEX_OAK_PLANKS, [0.68, 0.56, 0.34],
@@ -902,7 +917,8 @@ blocks! {
     .with_cull(CullGroupSpec::Water)
     .non_occluding()
     .non_solid()
-    .with_tint_all(TINT_WATER),
+    .with_tint_all(TINT_WATER)
+    .with_properties(&FLUID_PROPERTIES),
     WaterFlowing => BlockSpec::new(
         "minecraft:flowing_water", "Water (Flowing)",
         BlockModelSpec::LiquidTopSideBottom {
@@ -918,7 +934,8 @@ blocks! {
     .with_cull(CullGroupSpec::Water)
     .non_occluding()
     .non_solid()
-    .with_tint_all(TINT_WATER),
+    .with_tint_all(TINT_WATER)
+    .with_properties(&FLUID_PROPERTIES),
     LavaStill => BlockSpec::new(
         "minecraft:lava", "Lava (Still)",
         BlockModelSpec::LiquidTopSideBottom {
@@ -934,7 +951,8 @@ blocks! {
     .non_occluding()
     .non_solid()
     .unbreakable()
-    .with_light(15),
+    .with_light(15)
+    .with_properties(&FLUID_PROPERTIES),
     LavaFlowing => BlockSpec::new(
         "minecraft:flowing_lava", "Lava (Flowing)",
         BlockModelSpec::LiquidTopSideBottom {
@@ -950,7 +968,8 @@ blocks! {
     .non_occluding()
     .non_solid()
     .unbreakable()
-    .with_light(15),
+    .with_light(15)
+    .with_properties(&FLUID_PROPERTIES),
     Cobblestone => BlockSpec::cube(
         "minecraft:cobblestone", "Cobblestone", TEX_COBBLESTONE, [0.48, 0.48, 0.50],
     )
@@ -1770,20 +1789,6 @@ impl BlockTextureLookup {
 }
 
 impl BlockId {
-    pub(crate) fn collision_shape(self) -> CollisionShape {
-        block_spec_for(self).collision_shape()
-    }
-
-    pub(crate) fn raycast_shape(self) -> CollisionShape {
-        block_spec_for(self).raycast_shape()
-    }
-
-    /// Visibility/AO occlusion shape. This is intentionally separate from collision,
-    /// raycast selection, and render shape.
-    pub(crate) fn occlusion_shape(self) -> OcclusionShape {
-        block_spec_for(self).occlusion_shape()
-    }
-
     /// Physische Solidität (Collision).
     pub(crate) fn is_solid(self) -> bool {
         block_spec_for(self).solid
@@ -1857,7 +1862,7 @@ pub(crate) fn grass_survives_under(above: BlockId) -> bool {
         ))
 }
 
-fn grass_random_tick(world: &mut World, pos: IVec3, _state: BlockStateId, tick_index: u64) {
+fn grass_random_tick(world: &mut World, pos: IVec3, _state: BlockState, tick_index: u64) {
     let above = pos + IVec3::Y;
     if !World::in_bounds(above)
         || world
@@ -1922,14 +1927,6 @@ enum SaplingTreePreset {
 struct SaplingTreeShape {
     preset: SaplingTreePreset,
     trunk_height: i32,
-}
-
-pub(crate) fn sapling_stage(data: u8) -> u8 {
-    data & 1
-}
-
-pub(crate) fn sapling_set_stage(data: u8, stage: u8) -> u8 {
-    (data & !1) | (stage & 1)
 }
 
 fn sapling_rng_seed(world_seed: u64, pos: IVec3, tick_index: u64) -> u64 {
@@ -2149,7 +2146,7 @@ fn place_sapling_tree(world: &mut World, sapling_pos: IVec3, trunk: &[IVec3], le
     }
 }
 
-fn sapling_random_tick(world: &mut World, pos: IVec3, _state: BlockStateId, tick_index: u64) {
+fn sapling_random_tick(world: &mut World, pos: IVec3, state: BlockState, tick_index: u64) {
     if !World::in_bounds(pos) || world.get_block(pos) != BlockId::Sapling {
         return;
     }
@@ -2173,11 +2170,8 @@ fn sapling_random_tick(world: &mut World, pos: IVec3, _state: BlockStateId, tick
         return;
     }
 
-    let data = world.get_block_data(pos);
-    let stage = sapling_stage(data);
-    if stage == 0 {
-        let next_data = sapling_set_stage(data, 1);
-        let _ = world.set_block_and_data_loaded_only(pos, BlockId::Sapling, next_data);
+    if SAPLING_STAGE.get(state) == 0 {
+        let _ = world.set_block_state_loaded_only(pos, SAPLING_STAGE.with(state, 1));
         return;
     }
 
@@ -2280,8 +2274,10 @@ mod tests {
     use super::{
         BlockId, BlockRegistry, CLASSIC_PALETTE, Face, FaceCoverage, OcclusionShape, RenderLayer,
         TEX_CRAFTING_TABLE_FRONT, TEX_FURNACE_FRONT, TEX_FURNACE_FRONT_ON, block_spec_for,
-        grass_random_tick, sapling_random_tick, sapling_set_stage,
+        grass_random_tick, sapling_random_tick,
     };
+    use crate::blocks::BlockState;
+    use crate::blocks::state::SAPLING_STAGE;
     use crate::world::{CHUNK_SIZE, Chunk, ChunkCoord, World};
 
     #[test]
@@ -2290,11 +2286,11 @@ mod tests {
         // ray is stopped even though the sides are only half covered. This used
         // to assert the opposite, which is what let light leak under slabs.
         assert_eq!(
-            BlockId::StoneSlab.occlusion_shape(),
+            BlockState::from(BlockId::StoneSlab).occlusion_shape(),
             OcclusionShape::SlabLower
         );
         assert_eq!(
-            BlockId::StoneSlab
+            BlockState::from(BlockId::StoneSlab)
                 .occlusion_shape()
                 .boundary_coverage(Face::Down),
             FaceCoverage::Full
@@ -2338,7 +2334,7 @@ mod tests {
             let Ok(block) = BlockId::from_u8(raw as u8) else {
                 continue;
             };
-            if block.occlusion_shape() != OcclusionShape::FullCube {
+            if BlockState::from(block).occlusion_shape() != OcclusionShape::FullCube {
                 continue;
             }
             assert!(
@@ -2366,7 +2362,10 @@ mod tests {
         ];
         for block in opaque {
             assert_eq!(block_spec_for(block).render_layer, RenderLayer::Opaque);
-            assert_eq!(block.occlusion_shape(), OcclusionShape::FullCube);
+            assert_eq!(
+                BlockState::from(block).occlusion_shape(),
+                OcclusionShape::FullCube
+            );
             assert!(block.is_solid() && block.blocks_skylight(), "{block:?}");
         }
         assert_eq!(BlockId::LitRedstoneOre.emitted_light(), 9);
@@ -2376,7 +2375,10 @@ mod tests {
         // Cutout and see-through like glass, but still a solid block.
         let spawner = BlockId::Spawner;
         assert_eq!(block_spec_for(spawner).render_layer, RenderLayer::Cutout);
-        assert_eq!(spawner.occlusion_shape(), OcclusionShape::Decorative);
+        assert_eq!(
+            BlockState::from(spawner).occlusion_shape(),
+            OcclusionShape::Decorative
+        );
         assert!(spawner.is_solid() && !spawner.blocks_skylight());
 
         let registry = BlockRegistry::get();
@@ -2398,7 +2400,7 @@ mod tests {
         world.set_block(pos, BlockId::Grass).unwrap();
         world.set_block(above, BlockId::Stone).unwrap();
 
-        grass_random_tick(&mut world, pos, BlockId::Grass, 0);
+        grass_random_tick(&mut world, pos, BlockId::Grass.into(), 0);
 
         assert_eq!(world.get_block(pos), BlockId::Dirt);
     }
@@ -2435,7 +2437,7 @@ mod tests {
         let ground = sapling - IVec3::Y;
         world.set_block(ground, BlockId::Grass).unwrap();
         world
-            .set_block_and_data(sapling, BlockId::Sapling, sapling_set_stage(0, 1))
+            .set_block_state(sapling, SAPLING_STAGE.with(BlockId::Sapling.into(), 1))
             .unwrap();
         // Room for the tallest preset, and enough light to grow.
         world
@@ -2449,7 +2451,8 @@ mod tests {
         let mut tick = 0u64;
         while world.get_block(sapling) == BlockId::Sapling {
             assert!(tick < 10_000, "the sapling never grew");
-            sapling_random_tick(&mut world, sapling, BlockId::Sapling, tick);
+            let state = world.get_block_state(sapling);
+            sapling_random_tick(&mut world, sapling, state, tick);
             tick += 1;
         }
         world.drain_block_changes(&mut journal);
@@ -2488,7 +2491,7 @@ mod tests {
 #[cfg(test)]
 mod interaction_shape_tests {
     use super::{
-        BlockAabb, BlockId, BlockModelSpec, CROSS_PLANT_SELECTION_AABB, CollisionShape,
+        BlockAabb, BlockId, BlockModelSpec, BlockState, CROSS_PLANT_SELECTION_AABB, CollisionShape,
         FULL_CUBE_AABB, LOWER_SLAB_AABB, SNOW_LAYER_AABB, block_spec_for,
     };
 
@@ -2523,7 +2526,7 @@ mod interaction_shape_tests {
     fn every_model_states_its_raycast_shape() {
         for block in all_blocks() {
             let spec = block_spec_for(block);
-            let shape = block.raycast_shape();
+            let shape = BlockState::from(block).raycast_shape();
             if model_fills_the_cell(spec.model) {
                 continue;
             }
@@ -2537,7 +2540,7 @@ mod interaction_shape_tests {
     #[test]
     fn selection_boxes_stay_inside_their_cell() {
         for block in all_blocks() {
-            let Some(bounds) = block.raycast_shape().local_bounds() else {
+            let Some(bounds) = BlockState::from(block).raycast_shape().local_bounds() else {
                 continue;
             };
             let (min, max) = bounds.world_bounds(glam::IVec3::ZERO);
@@ -2571,7 +2574,7 @@ mod interaction_shape_tests {
                 _ => Some(FULL_CUBE_AABB),
             };
             assert_eq!(
-                block.raycast_shape().local_bounds(),
+                BlockState::from(block).raycast_shape().local_bounds(),
                 expected,
                 "{block:?} selection box does not match its rendered height"
             );
@@ -2583,7 +2586,10 @@ mod interaction_shape_tests {
         for block in all_blocks() {
             if matches!(block_spec_for(block).model, BlockModelSpec::None) {
                 assert!(
-                    block.raycast_shape().local_bounds().is_none(),
+                    BlockState::from(block)
+                        .raycast_shape()
+                        .local_bounds()
+                        .is_none(),
                     "{block:?} has no geometry but offers a selection box"
                 );
             }

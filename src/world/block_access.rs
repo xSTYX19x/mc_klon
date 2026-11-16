@@ -1,12 +1,15 @@
 use glam::IVec3;
 
-use crate::blocks::BlockId;
+use crate::blocks::{BlockId, BlockState};
 
 use super::{Chunk, ChunkCoord, World};
 
 pub(crate) trait BlockAccess {
     fn get_block(&self, pos: IVec3) -> BlockId;
     fn get_block_data(&self, pos: IVec3) -> u8;
+    fn get_block_state(&self, pos: IVec3) -> BlockState {
+        BlockState::new(self.get_block(pos), self.get_block_data(pos))
+    }
     fn get_light_packed(&self, pos: IVec3) -> u8;
     fn get_chunk(&self, coord: ChunkCoord) -> Option<&Chunk>;
 }

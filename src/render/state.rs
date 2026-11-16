@@ -40,11 +40,13 @@ use super::texture_anim::{
     resize_rgba_nearest,
 };
 use crate::assets::AssetSource;
+use crate::blocks::state::FLUID_SOURCE;
 use crate::blocks::{
-    BlockId, BlockModel, BlockRegistry, BlockTextureLookup, CullGroup, Face, FaceCoverage,
-    REQUIRED_OVERLAY_TEXTURE_KEYS, TEX_BEDROCK, TEX_DIRT, TEX_GRASS_SIDE, TEX_GRASS_TOP,
-    TEX_OAK_PLANKS, TEX_SAPLING, TEX_STONE, TEX_WATER_OVERLAY, TEXTURE_SELF_TEST_KEYS,
-    TINT_GRASS_TOP, TINT_NONE, TINT_WATER, debug_assert_block_blueprint_integrity,
+    BlockId, BlockModel, BlockRegistry, BlockState, BlockTextureLookup, CullGroup, Face,
+    FaceCoverage, REQUIRED_OVERLAY_TEXTURE_KEYS, TEX_BEDROCK, TEX_DIRT, TEX_GRASS_SIDE,
+    TEX_GRASS_TOP, TEX_OAK_PLANKS, TEX_SAPLING, TEX_STONE, TEX_WATER_OVERLAY,
+    TEXTURE_SELF_TEST_KEYS, TINT_GRASS_TOP, TINT_NONE, TINT_WATER,
+    debug_assert_block_blueprint_integrity,
 };
 use crate::camera::{
     Camera, CameraMode, CameraUniform, Frustum, build_view_proj_wgpu, chunk_in_frustum,
@@ -10983,8 +10985,9 @@ impl State {
         ) else {
             return vec!["Target: none".to_string()];
         };
-        let block = self.world.get_block(hit.hit_block_pos);
-        let shape = block.occlusion_shape();
+        let state = self.world.get_block_state(hit.hit_block_pos);
+        let block = state.id;
+        let shape = state.occlusion_shape();
         let coverage = |face: Face| match shape.boundary_coverage(face) {
             FaceCoverage::None => "-",
             FaceCoverage::LowerHalf => "lo",
@@ -10993,8 +10996,9 @@ impl State {
         };
         let mut lines = vec![
             format!(
-                "Target: {} at {} {} {}",
+                "Target: {} {} at {} {} {}",
                 block.display_name(),
+                state,
                 hit.hit_block_pos.x,
                 hit.hit_block_pos.y,
                 hit.hit_block_pos.z
@@ -19409,13 +19413,13 @@ impl State {
 
     fn block_intersects_player_hitbox(
         block_pos: IVec3,
-        block: BlockId,
+        state: BlockState,
         player_feet_pos: Vec3,
     ) -> bool {
         let player_min = player_feet_pos + Vec3::new(-PLAYER_RADIUS, 0.0, -PLAYER_RADIUS);
         let player_max = player_feet_pos + Vec3::new(PLAYER_RADIUS, PLAYER_HEIGHT, PLAYER_RADIUS);
 
-        let Some((block_min, block_max)) = block.collision_shape().world_bounds(block_pos) else {
+        let Some((block_min, block_max)) = state.collision_shape().world_bounds(block_pos) else {
             return false;
         };
 
@@ -19491,7 +19495,17 @@ impl State {
             );
             return;
         }
-        if Self::block_intersects_player_hitbox(place_pos, selected_block, player_feet_pos) {
+        // Placed blocks start in their default state; fluids as a still source.
+        let (place_state, deferred_kind) = if let Some(kind) = fluid_kind(selected_block) {
+            let still = BlockState::default_of(make_still(kind));
+            (FLUID_SOURCE.with(still, true), DeferredEditKind::PlaceFluid)
+        } else {
+            (
+                BlockState::default_of(selected_block),
+                DeferredEditKind::PlaceBlock,
+            )
+        };
+        if Self::block_intersects_player_hitbox(place_pos, place_state, player_feet_pos) {
             maybe_log_slow_block_edit(
                 "place",
                 edit_started.elapsed().as_secs_f32() * 1000.0,
@@ -19510,24 +19524,15 @@ impl State {
             );
         }
 
-        let (block_to_place, block_data, deferred_kind) =
-            if let Some(kind) = fluid_kind(selected_block) {
-                (
-                    make_still(kind),
-                    fluid_data_make(0, false, true),
-                    DeferredEditKind::PlaceFluid,
-                )
-            } else {
-                (selected_block, 0, DeferredEditKind::PlaceBlock)
-            };
+        let (block_to_place, block_data) = (place_state.id, place_state.data);
         let chunk_coord = World::world_to_chunk_coord(place_pos);
         let chunk_existed_before = self.world.get_chunk(chunk_coord).is_some();
         let set_result = {
             let _scope = perf_trace::scope("block_edit.set_block");
             let started = Instant::now();
-            let result =
-                self.world
-                    .set_block_and_data_loaded_only(place_pos, block_to_place, block_data);
+            let result = self
+                .world
+                .set_block_state_loaded_only(place_pos, place_state);
             timings.set_block_ms = started.elapsed().as_secs_f32() * 1000.0;
             result
         };

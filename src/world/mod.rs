@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use glam::{IVec2, IVec3};
 
-use crate::blocks::{BlockId, BlockRegistry, block_has_block_entity};
+use crate::blocks::{BlockId, BlockRegistry, BlockState, block_has_block_entity};
 use crate::world::ticking_areas::{TICKING_AREA_MAX_RADIUS_CHUNKS, TickingArea, TickingFlags};
 use crate::worldgen::{ChunkGenerator, DEFAULT_WORLDGEN_PRESET, TerrainGenerator, WorldgenPreset};
 
@@ -3221,6 +3221,11 @@ impl World {
             .map_or(0, |chunk| chunk.get_data(local.x, local.y, local.z))
     }
 
+    /// The block and its data at `world_pos`; air outside loaded chunks.
+    pub(crate) fn get_block_state(&self, world_pos: IVec3) -> BlockState {
+        BlockState::new(self.get_block(world_pos), self.get_block_data(world_pos))
+    }
+
     pub(crate) fn get_light_packed(&self, world_pos: IVec3) -> u8 {
         if world_pos.y > WORLD_MAX_Y {
             return LightLevel::new(15, 0).pack();
@@ -3553,8 +3558,29 @@ impl World {
         }
     }
 
+    /// `set_block_state` with the block's default state.
     pub(crate) fn set_block(&mut self, world_pos: IVec3, id: BlockId) -> Result<(), SetBlockError> {
-        self.set_block_and_data(world_pos, id, 0)
+        self.set_block_state(world_pos, BlockState::default_of(id))
+    }
+
+    /// Writes a block state. Like every setter it feeds the change journal, so
+    /// the drain after the producer runs the dirty, lighting and remesh side
+    /// effects (`State::apply_world_block_changes`).
+    pub(crate) fn set_block_state(
+        &mut self,
+        world_pos: IVec3,
+        state: BlockState,
+    ) -> Result<(), SetBlockError> {
+        self.set_block_and_data(world_pos, state.id, state.data)
+    }
+
+    /// `set_block_state` that refuses to create a chunk for a non-air block.
+    pub(crate) fn set_block_state_loaded_only(
+        &mut self,
+        world_pos: IVec3,
+        state: BlockState,
+    ) -> Result<(), SetBlockError> {
+        self.set_block_and_data_loaded_only(world_pos, state.id, state.data)
     }
 
     pub(crate) fn set_block_and_data(

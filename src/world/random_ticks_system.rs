@@ -1,6 +1,6 @@
 use glam::IVec3;
 
-use crate::blocks::BlockRegistry;
+use crate::blocks::{BlockRegistry, BlockState};
 use crate::sim::{ActiveSimColumns, ColumnCoord, SimSystem};
 use crate::util::rng::{Rng64, hash64};
 use crate::world::{CHUNK_SIZE, ChunkCoord, World};
@@ -116,8 +116,9 @@ impl SimSystem for RandomTicksSystem {
                 let world_pos =
                     IVec3::new(chunk_x0 + local_x, chunk_y0 + local_y, chunk_z0 + local_z);
 
-                let state = world.get_block(world_pos);
-                if let Some(random_tick) = BlockRegistry::get().random_tick_for(state) {
+                let block = world.get_block(world_pos);
+                if let Some(random_tick) = BlockRegistry::get().random_tick_for(block) {
+                    let state = BlockState::new(block, world.get_block_data(world_pos));
                     random_tick(world, world_pos, state, tick_index);
                     self.callbacks_last_tick += 1;
                 }
@@ -157,8 +158,9 @@ mod tests {
                     coord.y * CHUNK_SIZE + local_y,
                     coord.z * CHUNK_SIZE + local_z,
                 );
-                let state = world.get_block(pos);
-                if let Some(random_tick) = registry.random_tick_for(state) {
+                let block = world.get_block(pos);
+                if let Some(random_tick) = registry.random_tick_for(block) {
+                    let state = BlockState::new(block, world.get_block_data(pos));
                     random_tick(world, pos, state, tick_index);
                 }
             }

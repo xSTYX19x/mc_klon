@@ -2,6 +2,7 @@ use glam::{IVec3, Vec3};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::blocks::BlockId;
+use crate::blocks::state::{FLUID_FALLING, FLUID_LEVEL, FLUID_SOURCE, FLUID_STATIC};
 
 use super::{CHUNK_SIZE, Chunk, ChunkCoord, SetBlockError, World};
 
@@ -74,48 +75,39 @@ pub(crate) fn make_flowing(kind: FluidKind) -> BlockId {
     }
 }
 
+// The fluid bits are the fluid blocks' schema (`blocks::state::FLUID_*`); these
+// helpers are its views on a bare data byte.
+
 pub(crate) fn fluid_data_level(data: u8) -> u8 {
-    data & FLUID_LEVEL_MASK
+    FLUID_LEVEL.get_data(data)
 }
 
 pub(crate) fn fluid_data_set_level(data: u8, level: u8) -> u8 {
-    (data & !FLUID_LEVEL_MASK) | (level & FLUID_LEVEL_MASK)
+    FLUID_LEVEL.with_data(data, level & FLUID_LEVEL.spec().mask())
 }
 
 pub(crate) fn fluid_data_is_falling(data: u8) -> bool {
-    (data & FLUID_FLAG_FALLING) != 0
+    FLUID_FALLING.get_data(data)
 }
 
 pub(crate) fn fluid_data_set_falling(data: u8, on: bool) -> u8 {
-    if on {
-        data | FLUID_FLAG_FALLING
-    } else {
-        data & !FLUID_FLAG_FALLING
-    }
+    FLUID_FALLING.with_data(data, on)
 }
 
 pub(crate) fn fluid_data_is_source_origin(data: u8) -> bool {
-    (data & FLUID_FLAG_SOURCE_ORIGIN) != 0
+    FLUID_SOURCE.get_data(data)
 }
 
 pub(crate) fn fluid_data_set_source_origin(data: u8, on: bool) -> u8 {
-    if on {
-        data | FLUID_FLAG_SOURCE_ORIGIN
-    } else {
-        data & !FLUID_FLAG_SOURCE_ORIGIN
-    }
+    FLUID_SOURCE.with_data(data, on)
 }
 
 pub(crate) fn fluid_data_is_worldgen_static(data: u8) -> bool {
-    (data & FLUID_FLAG_WORLDGEN_STATIC) != 0
+    FLUID_STATIC.get_data(data)
 }
 
 pub(crate) fn fluid_data_set_worldgen_static(data: u8, on: bool) -> u8 {
-    if on {
-        data | FLUID_FLAG_WORLDGEN_STATIC
-    } else {
-        data & !FLUID_FLAG_WORLDGEN_STATIC
-    }
+    FLUID_STATIC.with_data(data, on)
 }
 
 pub(crate) fn fluid_data_make(level: u8, falling: bool, source_origin: bool) -> u8 {
@@ -170,11 +162,6 @@ pub(crate) const FLUID_FIXED_STEP_SECONDS: f32 = MINECRAFT_TICK_SECONDS;
 pub(crate) const WATER_SPREAD_INTERVAL_TICKS: u64 = 5;
 pub(crate) const LAVA_SPREAD_INTERVAL_TICKS: u64 = 30;
 pub(crate) const LAVA_SPREAD_INTERVAL_TICKS_NETHER: u64 = 10;
-
-const FLUID_LEVEL_MASK: u8 = 0x0F;
-const FLUID_FLAG_FALLING: u8 = 0x80;
-const FLUID_FLAG_SOURCE_ORIGIN: u8 = 0x40;
-const FLUID_FLAG_WORLDGEN_STATIC: u8 = 0x20;
 
 const WATER_MAX_LEVEL: u8 = 7;
 const LAVA_MAX_LEVEL_OVERWORLD: u8 = 6;
