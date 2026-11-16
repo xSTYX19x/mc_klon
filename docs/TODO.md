@@ -1701,7 +1701,8 @@ Welttypen" wählbar (Grundregel: das vorhandene Feature gewinnt).
     (Zellgröße 4×8×4), `Aquifer`, Noise-Höhlen (Cheese/Spaghetti/Noodle).
     Übertragung: `DensityFn` bleibt ein Enum-Baum wie heute (kein Trait-Objekt
     pro Knoten), Splines als kleine Tabellen; 2D-Knoten pro Spalte cachen
-    (siehe Performance "2D-Terrain-Noise pro Spalte").
+    (Ansatzpunkt seit 2026-11-16: `ColumnTerrain` in `worldgen/pipeline.rs`,
+    das die Heightmap schon einmal pro Spalte berechnet).
   - *Vorgehen:* 1) `DensityFn` um die fehlenden Knoten erweitern (`Spline`,
     `Clamp`, `RangeChoice`, `Interpolated`, `FlatCache`), die
     Fast-Path-Erkennung beibehalten. 2) Klimanoise (`temperature`,
@@ -1717,8 +1718,7 @@ Welttypen" wählbar (Grundregel: das vorhandene Feature gewinnt).
     `worldgen/pipeline.rs`, `worldgen/noise.rs`, Worldgen-Phasen (nach der
     Konsolidierung in `worldgen/`).
   - *Abhängigkeiten:* "Worldgen-Einstiegspunkte konsolidieren",
-    Regressionstests, "Höhere Welten vorbereiten", Performance
-    "2D-Terrain-Noise pro Spalte".
+    Regressionstests, "Höhere Welten vorbereiten".
   - *Priorität/Aufwand/Impact:* **P3**, XL, sehr hoch (Grundlage für Biome,
     Meere, Gebirge).
   - *Akzeptanz:* Der Preset erzeugt über mehrere Seeds Ozeane, Küsten, Hügel und
@@ -2253,40 +2253,35 @@ loading screen, where throughput legitimately outranks frame time.
     `lighting.region_task_create` sinken weiter; das Lichtergebnis ist
     bitgleich (`region_seed_columns_match_full_scan_reference` und die
     bestehenden Lighting-Tests).
-- **Worldgen: 2D-Terrain-Noise pro Spalte statt pro Sektion** (neu 2026-09-28)
-  - *Ist:* Die Basis-Terrain-Phase ruft `TerrainGenerator::generate_chunk` für
-    jede der 16 Sektionen einer Spalte auf (`render/chunkgen_worker.rs:
-    1776-1788`), und jeder Aufruf berechnet die komplette 16×16-Heightmap neu
-    (`worldgen/pipeline.rs:157-181`; geglättet 10 `height_at` pro Spalte,
-    `density/cache.rs:133-142`) plus 25 Samples für das Density-Grid
-    (`:66-68`) — unabhängig von der Sektionshöhe, auch für reine
-    Luftsektionen. Das sind rund 45 000 `height_at`-Aufrufe pro Spalte mit je
-    ~21-23 Fbm-Oktaven (`worldgen/terrain.rs:156-234`), wo ein Sechzehntel
-    reichen würde. Außerdem pro Spalte zwei `TerrainSampler`
-    (`chunkgen_worker.rs:1762`, `:1776`) und eine Neuberechnung aller Seen und
-    Quellen der 7×7 Quellchunks ohne spaltenübergreifenden Cache (`:413-451`).
-  - *Ziel:* Jede 2D-Größe einmal pro Spalte; Luft- und Vollstein-Sektionen
-    ohne Per-Voxel-Arbeit.
-  - *Vorbild:* Vanilla `NoiseChunk` (`cache_2d`/`flat_cache` für y-unabhängige
-    Dichteknoten), C2ME (Noise-Caches). Direkt übertragbar und Voraussetzung
-    für Multi-Noise, wo die 2D-Knoten (Kontinentalität, Erosion) noch teurer
-    sind.
-  - *Vorgehen:* 1) Messen: `ColumnGenerationStageTimings::base_terrain_fill`
-    (`chunkgen_worker.rs:1859`) über 200 Spalten, vorher und nachher.
-    2) `WorldgenPipeline` bekommt `generate_column(cx, cz, out)`, das die
-    Heightmap einmal füllt und die Sektionen daraus schreibt; Sektionen
-    oberhalb der Spalten-Maximalhöhe werden direkt `ChunkBlocks::Uniform(Air)`.
-    3) Einen `TerrainSampler` pro Spalte teilen. 4) Seen-/Quell-Kandidaten pro
-    Quellchunk in einem kleinen LRU cachen (wie den Column-Cache, `:85`).
-  - *Dateien:* `worldgen/pipeline.rs`, `worldgen/terrain_generator.rs`,
-    `worldgen/density/cache.rs`, `render/chunkgen_worker.rs`.
-  - *Abhängigkeiten:* keine; vor "Multi-Noise-Terrain".
-  - *Priorität/Aufwand/Impact:* **P1**, S-M, hoch für den Chunkgen-Durchsatz
-    (Worker-Zeit, nicht Frame-Zeit — wirkt über weniger CPU-Konkurrenz und
-    schneller gefüllte Sichtweite).
-  - *Akzeptanz:* `base_terrain_fill` pro Spalte sinkt deutlich (erwartet: mehr
-    als 5×); der Determinismus-Test `trees_are_deterministic_for_same_seed_
-    and_column` bleibt bitgleich.
+- **Worldgen: Seen- und Quell-Kandidaten pro Quellchunk cachen** (neu
+  2026-09-28; Rest von "2D-Terrain-Noise pro Spalte statt pro Sektion")
+  - *Ist:* Seit 2026-11-16 berechnet die Basis-Terrain-Phase die
+    y-unabhängigen Größen einmal pro Spalte (`WorldgenPipeline::
+    generate_column`, `ColumnTerrain`: Rohhöhen 19×19, geglättete Höhe pro
+    Säule und an den Dichte-Gitterpunkten) und überspringt reine
+    Luftsektionen; der Chunkgen-Worker teilt einen `TerrainSampler` pro
+    Spalte. Gemessen mit `column_generation_cost_report` (Release, 100 Spalten):
+    `base_terrain_fill` 18,1 → 0,50 ms (ClassicFlatter) bzw. 18,9 → 0,55 ms
+    (Hilly), ganze Spalte 19,8 → 2,19 ms bzw. 20,2 → 1,74 ms; Ausgabe bitgleich
+    (`column_generation_matches_per_section_generation`). Größter Rest:
+    Generator-Aufbau plus `collect_nearby_water_features`
+    (`render/chunkgen_worker.rs`), zusammen ~0,9 ms pro Spalte (ClassicFlatter)
+    — jede Spalte berechnet die Seen und Quellen aller 7×7 Quellchunks neu,
+    obwohl Nachbarspalten fast dieselben Quellchunks auswerten.
+  - *Ziel:* Jeder Quellchunk wird einmal ausgewertet, solange er gebraucht
+    wird.
+  - *Vorbild:* Vanilla legt Features pro Chunk einmal an; C2ME cacht
+    Noise- und Feature-Ergebnisse.
+  - *Vorgehen:* 1) `collect_nearby_water_features` getrennt messen
+    (Stufen-Timing ergänzen). 2) Kandidaten pro Quellchunk in einem kleinen
+    LRU halten (wie den Column-Cache), Schlüssel (Seed, Preset, Quellchunk).
+    3) Optional den `TerrainGenerator` pro Worker statt pro Spalte bauen.
+  - *Dateien:* `render/chunkgen_worker.rs`.
+  - *Abhängigkeiten:* keine.
+  - *Priorität/Aufwand/Impact:* **P2**, S, mittel (bis ~40 % der
+    Spaltenzeit).
+  - *Akzeptanz:* Ganze Spalte im Report sinkt um mindestens 30 %; die
+    Ausgabe bleibt bitgleich (Prüfsummen über alle Presets vorher/nachher).
 - **Chunkgen-Jobs spaltenweise statt sektionsweise** (neu 2026-09-28)
   - *Ist:* Pro Sektion ein `ChunkGenJob` (`render/state.rs:12378-12400`); der
     Worker erzeugt die ganze Spalte, legt sie in einen LRU-Cache (384 Spalten,
@@ -2305,7 +2300,8 @@ loading screen, where throughput legitimately outranks frame time.
     reduzieren.
   - *Dateien:* `render/chunkgen_worker.rs`, `render/state.rs`
     (`request_chunk_generation`, `pump_chunkgen_results` `:13639`).
-  - *Abhängigkeiten:* "2D-Terrain-Noise pro Spalte".
+  - *Abhängigkeiten:* keine (2D-Noise pro Spalte ist seit 2026-11-16
+    erledigt; eine Spalte kostet jetzt ~2 ms statt ~20 ms).
   - *Priorität/Aufwand/Impact:* **P3**, M, mittel — nur, wenn die Messung
     relevante Wartezeiten zeigt.
   - *Akzeptanz:* Condvar-Waits nahe 0; Chunks/s beim Streamen gleich oder

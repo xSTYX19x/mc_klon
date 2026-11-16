@@ -19,8 +19,8 @@ use crate::world::fluids::{
 };
 use crate::world::{CHUNK_SIZE, Chunk, ChunkBlocks, ChunkCoord, WORLD_MAX_Y, block_data_arc};
 use crate::worldgen::{
-    ChunkGenerator, ColumnBuffer, GenContext, TerrainGenerator, TerrainSampler, WorldGenConfig,
-    WorldgenPreset, carvers::Carvers, ores::apply_ores_to_column,
+    ColumnBuffer, GenContext, TerrainGenerator, TerrainSampler, WorldGenConfig, WorldgenPreset,
+    carvers::Carvers, ores::apply_ores_to_column,
 };
 
 const WATER_FEATURE_CHANCE_PER_CHUNK_256: u32 = 24;
@@ -1775,14 +1775,12 @@ impl StreamingWorldColumnGenerator {
         let min_chunk_y = cfg.min_y.div_euclid(CHUNK_SIZE);
         let max_chunk_y = cfg.max_y.div_euclid(CHUNK_SIZE);
         let section_count = (max_chunk_y - min_chunk_y + 1).max(1);
-        let terrain_cfg = WorldGenConfig::from_preset_with_sea_level(
-            worldgen_seed32(cfg.seed),
-            self.preset,
-            cfg.sea_level(),
-        );
-        let terrain_sampler = TerrainSampler::new(terrain_cfg);
+        // One generator per column; its sampler (same seed, preset and sea
+        // level) also places lakes, springs and trees.
+        let terrain_generator = TerrainGenerator::new(cfg, self.preset);
+        let terrain_sampler = terrain_generator.terrain_sampler();
         let (water_lakes, springs, lava_lakes) =
-            collect_nearby_water_features(&cfg, self.preset, cx, cz, &terrain_sampler);
+            collect_nearby_water_features(&cfg, self.preset, cx, cz, terrain_sampler);
         let nearby_water_features = NearbyWaterFeatures {
             water_lakes,
             springs,
@@ -1794,19 +1792,14 @@ impl StreamingWorldColumnGenerator {
         // 1) Base terrain fill
         ctx.report_progress("Base terrain fill", 0, 7);
         let stage_started = Instant::now();
-        let terrain_generator = TerrainGenerator::new(cfg, self.preset);
-        for chunk_y in min_chunk_y..=max_chunk_y {
-            let mut section = Chunk::new_empty();
-            terrain_generator.generate_chunk(
-                ChunkCoord {
-                    x: cx,
-                    y: chunk_y,
-                    z: cz,
-                },
-                &mut section,
-            );
-            out.write_chunk_section(chunk_y, &section);
-        }
+        let mut section = Chunk::new_empty();
+        terrain_generator.generate_column(
+            cx,
+            cz,
+            min_chunk_y..=max_chunk_y,
+            &mut section,
+            |chunk_y, section| out.write_chunk_section(chunk_y, section),
+        );
         stage_timings.base_terrain_fill = stage_started.elapsed();
 
         // 2) Caves / carvers
@@ -1836,7 +1829,7 @@ impl StreamingWorldColumnGenerator {
             apply_streaming_lakes_and_fluids(
                 &mut section,
                 coord,
-                &terrain_sampler,
+                terrain_sampler,
                 &nearby_water_features,
             );
 
@@ -1859,12 +1852,12 @@ impl StreamingWorldColumnGenerator {
 
         // 6) Trees (column-level feature pass)
         let stage_started = Instant::now();
-        apply_trees_to_column(out, &cfg, self.preset, cx, cz, &terrain_sampler);
+        apply_trees_to_column(out, &cfg, self.preset, cx, cz, terrain_sampler);
         stage_timings.trees = stage_started.elapsed();
         ctx.report_progress("Trees", 6, 7);
         // 7) Foliage (flowers + mushrooms)
         let stage_started = Instant::now();
-        apply_foliage_to_column(out, &cfg, self.preset, cx, cz, &terrain_sampler);
+        apply_foliage_to_column(out, &cfg, self.preset, cx, cz, terrain_sampler);
         stage_timings.foliage = stage_started.elapsed();
         ctx.report_progress("Foliage", 7, 7);
         if cfg.environment().enables_winter_surface_rules() {

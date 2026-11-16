@@ -13,6 +13,10 @@ use crate::world::{Chunk, ChunkCoord};
 pub(crate) use carvers::ChunkColumn as ColumnBuffer;
 
 pub trait ChunkGenerator {
+    /// Per-section generation, used by `World::ensure_column_generated` (tests)
+    /// and as the oracle for the column path. Streaming generates whole
+    /// columns through `TerrainGenerator::generate_column` instead.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn generate_chunk(&self, coord: ChunkCoord, out: &mut Chunk);
     fn estimate_surface_height(&self, world_x: i32, world_z: i32, world_max_y: i32) -> i32;
 }

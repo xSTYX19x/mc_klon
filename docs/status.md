@@ -89,6 +89,7 @@ That direction is now active in the code:
 
 - presets: `Flatish`, `ClassicFlatter`, `Rd161348Like`, `Hilly`
 - terrain + density + surface rules
+- streaming generates the base terrain per column: the y-independent heightmap is computed once per column and all-air sections are skipped (`WorldgenPipeline::generate_column`)
 - carvers (caves/ravines)
 - lakes/springs and shoreline post-processing
 - foliage pass (flowers + mushrooms)

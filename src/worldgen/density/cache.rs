@@ -1,18 +1,12 @@
-use std::cell::RefCell;
-
 use crate::world::{CHUNK_SIZE, ChunkCoord};
-use crate::worldgen::TerrainSampler;
 
 use super::{DensityFn, EvalContext};
 
 pub const DENSITY_SAMPLE_STEP: i32 = 4;
 const GRID_AXIS: usize = (CHUNK_SIZE as usize / DENSITY_SAMPLE_STEP as usize) + 1;
 const GRID_LEN: usize = GRID_AXIS * GRID_AXIS * GRID_AXIS;
-
-thread_local! {
-    static HEIGHTMAP_GRID_SCRATCH: RefCell<[f32; GRID_AXIS * GRID_AXIS]> =
-        RefCell::new([0.0_f32; GRID_AXIS * GRID_AXIS]);
-}
+/// Density-grid points per horizontal layer (5×5 for 16-wide chunks).
+pub const GRID_COLUMNS: usize = GRID_AXIS * GRID_AXIS;
 
 #[derive(Clone)]
 pub struct DensityChunkCache {
@@ -41,39 +35,41 @@ impl DensityChunkCache {
         Self { grid }
     }
 
-    pub fn build_heightmap_minus_y(
-        coord: ChunkCoord,
-        sampler: &TerrainSampler,
-        max_y: i32,
-        smooth: bool,
-    ) -> Self {
-        let chunk_world_x0 = coord.x * CHUNK_SIZE;
-        let chunk_world_y0 = coord.y * CHUNK_SIZE;
-        let chunk_world_z0 = coord.z * CHUNK_SIZE;
+    /// The heightmap (`height_at(world_x, world_z)`) at the density-grid
+    /// points of chunk column (`chunk_x`, `chunk_z`). It does not depend on y,
+    /// so a column computes it once and builds every section's cache from it
+    /// (`from_grid_heights`).
+    pub fn grid_heights(
+        chunk_x: i32,
+        chunk_z: i32,
+        height_at: impl Fn(i32, i32) -> f32,
+    ) -> [f32; GRID_COLUMNS] {
+        let chunk_world_x0 = chunk_x * CHUNK_SIZE;
+        let chunk_world_z0 = chunk_z * CHUNK_SIZE;
+        let mut heights = [0.0_f32; GRID_COLUMNS];
+        for gz in 0..GRID_AXIS {
+            let world_z = chunk_world_z0 + (gz as i32) * DENSITY_SAMPLE_STEP;
+            for gx in 0..GRID_AXIS {
+                let world_x = chunk_world_x0 + (gx as i32) * DENSITY_SAMPLE_STEP;
+                heights[gx + gz * GRID_AXIS] = height_at(world_x, world_z);
+            }
+        }
+        heights
+    }
 
+    /// Density grid of the "heightmap minus y" terrain for the section
+    /// starting at `chunk_world_y0`, from that column's `grid_heights`.
+    pub fn from_grid_heights(chunk_world_y0: i32, heights: &[f32; GRID_COLUMNS]) -> Self {
         let mut grid = [0.0_f32; GRID_LEN];
-        // Cache per sampled (gx,gz) heightmap value and reuse over gy, matching
-        // the old Cache2D behavior while avoiding enum dispatch in the hot loop.
-        HEIGHTMAP_GRID_SCRATCH.with(|scratch| {
-            let mut sampled_heightmap = scratch.borrow_mut();
-            for gz in 0..GRID_AXIS {
-                let world_z = chunk_world_z0 + (gz as i32) * DENSITY_SAMPLE_STEP;
-                for gy in 0..GRID_AXIS {
-                    let world_y = chunk_world_y0 + (gy as i32) * DENSITY_SAMPLE_STEP;
-                    for gx in 0..GRID_AXIS {
-                        let world_x = chunk_world_x0 + (gx as i32) * DENSITY_SAMPLE_STEP;
-                        let column_idx = gx + gz * GRID_AXIS;
-                        if gy == 0 {
-                            sampled_heightmap[column_idx] =
-                                heightmap2d_value(sampler, max_y, smooth, world_x, world_z);
-                        }
-                        let heightmap = sampled_heightmap[column_idx];
-                        grid[Self::grid_index(gx, gy, gz)] = heightmap + (-1.0 * world_y as f32);
-                    }
+        for gz in 0..GRID_AXIS {
+            for gy in 0..GRID_AXIS {
+                let world_y = chunk_world_y0 + (gy as i32) * DENSITY_SAMPLE_STEP;
+                for gx in 0..GRID_AXIS {
+                    let heightmap = heights[gx + gz * GRID_AXIS];
+                    grid[Self::grid_index(gx, gy, gz)] = heightmap + (-1.0 * world_y as f32);
                 }
             }
-        });
-
+        }
         Self { grid }
     }
 
@@ -122,21 +118,25 @@ impl DensityChunkCache {
     }
 }
 
+/// The heightmap value at (`world_x`, `world_z`) from raw heights. With
+/// `smooth`, it blends the height with its 3×3 neighbourhood. A caller that
+/// already holds the raw heights of an area (a chunk column) passes a lookup
+/// instead of resampling; the arithmetic is the same either way, so the
+/// result is bit-identical.
 #[inline]
-pub fn heightmap2d_value(
-    sampler: &TerrainSampler,
-    max_y: i32,
+pub fn smoothed_height(
+    raw_height: impl Fn(i32, i32) -> i32,
     smooth: bool,
     world_x: i32,
     world_z: i32,
 ) -> f32 {
     if smooth {
-        let current = sampler.height_at(world_x, world_z, max_y) as f32;
+        let current = raw_height(world_x, world_z) as f32;
         let mut sum = 0.0_f32;
         let mut count = 0.0_f32;
         for dz in -1..=1 {
             for dx in -1..=1 {
-                sum += sampler.height_at(world_x + dx, world_z + dz, max_y) as f32;
+                sum += raw_height(world_x + dx, world_z + dz) as f32;
                 count += 1.0;
             }
         }
@@ -148,6 +148,6 @@ pub fn heightmap2d_value(
         };
         current * (1.0 - blend) + avg * blend
     } else {
-        sampler.height_at(world_x, world_z, max_y) as f32
+        raw_height(world_x, world_z) as f32
     }
 }

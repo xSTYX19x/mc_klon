@@ -1,21 +1,27 @@
-use std::cell::RefCell;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use crate::blocks::BlockId;
 use crate::world::{CHUNK_SIZE, Chunk, ChunkCoord};
 
 use super::TerrainSampler;
-use super::density::cache::{DensityChunkCache, heightmap2d_value};
+use super::density::cache::{DensityChunkCache, GRID_COLUMNS, smoothed_height};
 use super::density::{DensityFn, EvalContext};
 use super::surface_rules::{SurfaceContext, SurfaceRules};
 
 const CHUNK_VOLUME: usize = (CHUNK_SIZE as usize) * (CHUNK_SIZE as usize) * (CHUNK_SIZE as usize);
 const COLUMN_COUNT: usize = (CHUNK_SIZE as usize) * (CHUNK_SIZE as usize);
 const CHUNK_Y_STRIDE: usize = (CHUNK_SIZE as usize) * (CHUNK_SIZE as usize);
+/// Raw-height samples per axis for one column: x/z from -1 to 17.
+const RAW_HEIGHT_AXIS: usize = CHUNK_SIZE as usize + 3;
 
-thread_local! {
-    static COLUMN_HEIGHTMAP_SCRATCH: RefCell<[f32; COLUMN_COUNT]> =
-        RefCell::new([0.0_f32; COLUMN_COUNT]);
+/// The y-independent part of terrain generation for one chunk column: the
+/// smoothed heightmap at every block column (for the surface rules) and at the
+/// density-grid points. It is the same for all sections of the column.
+struct ColumnTerrain {
+    top_y: [i32; COLUMN_COUNT],
+    grid_heights: [f32; GRID_COLUMNS],
+    grid_max_height: f32,
 }
 
 #[derive(Clone)]
@@ -103,7 +109,92 @@ impl WorldgenPipeline {
             || matches!((&**a, &**b), (DensityFn::Y, DensityFn::Constant(v)) if *v == -1.0)
     }
 
+    /// The y-independent part of generating chunk column (`chunk_x`,
+    /// `chunk_z`), or `None` when the density tree has no heightmap fast path
+    /// and every section has to evaluate the tree itself.
+    fn column_terrain(&self, chunk_x: i32, chunk_z: i32) -> Option<ColumnTerrain> {
+        let Some(DensityFastPath::HeightmapMinusY {
+            sampler,
+            max_y,
+            smooth,
+        }) = &self.density_fast_path
+        else {
+            return None;
+        };
+        // Raw heights over the column plus a one-block margin (the 3×3
+        // smoothing) and the density-grid points on its far edge (x/z = 16):
+        // each is sampled once instead of up to nine times per section.
+        let world_x0 = chunk_x * CHUNK_SIZE - 1;
+        let world_z0 = chunk_z * CHUNK_SIZE - 1;
+        let mut raw = [0_i32; RAW_HEIGHT_AXIS * RAW_HEIGHT_AXIS];
+        for (i, raw_height) in raw.iter_mut().enumerate() {
+            let world_x = world_x0 + (i % RAW_HEIGHT_AXIS) as i32;
+            let world_z = world_z0 + (i / RAW_HEIGHT_AXIS) as i32;
+            *raw_height = sampler.height_at(world_x, world_z, *max_y);
+        }
+        let raw_height = |world_x: i32, world_z: i32| {
+            raw[(world_x - world_x0) as usize + (world_z - world_z0) as usize * RAW_HEIGHT_AXIS]
+        };
+        let height_at = |world_x, world_z| smoothed_height(raw_height, *smooth, world_x, world_z);
+
+        let mut top_y = [0_i32; COLUMN_COUNT];
+        for local_z in 0..CHUNK_SIZE {
+            let world_z = chunk_z * CHUNK_SIZE + local_z;
+            for local_x in 0..CHUNK_SIZE {
+                let world_x = chunk_x * CHUNK_SIZE + local_x;
+                let height_f = height_at(world_x, world_z);
+                let mut candidate = height_f.floor() as i32;
+                if height_f + (-1.0 * candidate as f32) <= 0.0 {
+                    candidate -= 1;
+                }
+                top_y[(local_x + local_z * CHUNK_SIZE) as usize] =
+                    candidate.clamp(self.min_y, self.max_y);
+            }
+        }
+        let grid_heights = DensityChunkCache::grid_heights(chunk_x, chunk_z, height_at);
+        let grid_max_height = grid_heights
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        Some(ColumnTerrain {
+            top_y,
+            grid_heights,
+            grid_max_height,
+        })
+    }
+
+    /// One section on its own; see `ChunkGenerator::generate_chunk`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn generate_chunk(&self, coord: ChunkCoord, out: &mut Chunk) {
+        let column = self.column_terrain(coord.x, coord.z);
+        self.generate_section(coord, out, column.as_ref());
+    }
+
+    /// Generates sections `chunk_ys` of one column, one after another into
+    /// `scratch`, and hands each to `emit`. The y-independent terrain (the
+    /// smoothed heightmap) is computed once for the column instead of once per
+    /// section; the output is identical to calling `generate_chunk` per section.
+    pub fn generate_column(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+        chunk_ys: RangeInclusive<i32>,
+        scratch: &mut Chunk,
+        mut emit: impl FnMut(i32, &Chunk),
+    ) {
+        let column = self.column_terrain(chunk_x, chunk_z);
+        for chunk_y in chunk_ys {
+            let coord = ChunkCoord {
+                x: chunk_x,
+                y: chunk_y,
+                z: chunk_z,
+            };
+            self.generate_section(coord, scratch, column.as_ref());
+            emit(chunk_y, scratch);
+        }
+    }
+
+    fn generate_section(&self, coord: ChunkCoord, out: &mut Chunk, column: Option<&ColumnTerrain>) {
         out.blocks.make_flat_mut().fill(BlockId::Air);
         Arc::make_mut(&mut out.block_data).fill(0);
 
@@ -115,12 +206,17 @@ impl WorldgenPipeline {
         }
 
         let mut fallback_ctx = None;
-        let density_cache = match &self.density_fast_path {
-            Some(DensityFastPath::HeightmapMinusY {
-                sampler,
-                max_y,
-                smooth,
-            }) => DensityChunkCache::build_heightmap_minus_y(coord, sampler, *max_y, *smooth),
+        let density_cache = match column {
+            Some(column) => {
+                // Every grid value is at most `grid_max_height - chunk_world_y0`.
+                // Below zero, trilinear interpolation cannot reach a positive
+                // density anywhere in the section: it is all air.
+                if column.grid_max_height - (chunk_world_y0 as f32) < 0.0 {
+                    out.recompute_cached_block_classification();
+                    return;
+                }
+                DensityChunkCache::from_grid_heights(chunk_world_y0, &column.grid_heights)
+            }
             None => {
                 let mut ctx = EvalContext::new();
                 ctx.init_for_chunk(coord.x, coord.z);
@@ -154,36 +250,13 @@ impl WorldgenPipeline {
             }
         }
 
-        let mut top_y_per_column = [0_i32; COLUMN_COUNT];
-        match &self.density_fast_path {
-            Some(DensityFastPath::HeightmapMinusY {
-                sampler,
-                max_y,
-                smooth,
-            }) => {
-                COLUMN_HEIGHTMAP_SCRATCH.with(|scratch| {
-                    let mut heightmap_per_column = scratch.borrow_mut();
-                    for local_z in 0..CHUNK_SIZE {
-                        let world_z = coord.z * CHUNK_SIZE + local_z;
-                        for local_x in 0..CHUNK_SIZE {
-                            let world_x = coord.x * CHUNK_SIZE + local_x;
-                            let column_idx = (local_x + local_z * CHUNK_SIZE) as usize;
-                            let height_f =
-                                heightmap2d_value(sampler, *max_y, *smooth, world_x, world_z);
-                            heightmap_per_column[column_idx] = height_f;
-                            let mut candidate = height_f.floor() as i32;
-                            if height_f + (-1.0 * candidate as f32) <= 0.0 {
-                                candidate -= 1;
-                            }
-                            top_y_per_column[column_idx] = candidate.clamp(self.min_y, self.max_y);
-                        }
-                    }
-                });
-            }
+        let top_y_per_column = match column {
+            Some(column) => column.top_y,
             None => {
                 let ctx = fallback_ctx
                     .as_mut()
                     .expect("fallback context must exist when no fast path is active");
+                let mut top_y_per_column = [0_i32; COLUMN_COUNT];
                 for local_z in 0..CHUNK_SIZE {
                     let world_z = coord.z * CHUNK_SIZE + local_z;
                     for local_x in 0..CHUNK_SIZE {
@@ -197,8 +270,9 @@ impl WorldgenPipeline {
                         top_y_per_column[column_idx] = candidate.clamp(self.min_y, self.max_y);
                     }
                 }
+                top_y_per_column
             }
-        }
+        };
 
         let out_blocks = out.blocks.make_flat_mut();
         for local_z in 0..CHUNK_SIZE {
