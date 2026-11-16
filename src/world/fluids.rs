@@ -2253,3 +2253,213 @@ mod tests {
         assert_eq!(world.get_block(water_column), BlockId::Stone);
     }
 }
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::*;
+    use crate::world::{BlockChange, Chunk, ChunkBlocks, ChunkCoord};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    const VOXELS: usize = (CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE) as usize;
+
+    /// The column bootstrap as it was before it stopped scanning every loaded
+    /// chunk: kept as the oracle.
+    fn reference_bootstrap(fluids: &mut FluidSystem, world: &mut World, col_x: i32, col_z: i32) {
+        let mut fluid_positions = Vec::new();
+        let mut has_loaded_chunks_in_column = false;
+        let mut coords: Vec<ChunkCoord> = world.chunks.keys().copied().collect();
+        coords.sort_unstable_by_key(|c| (c.x, c.y, c.z));
+        for coord in coords {
+            if coord.x != col_x || coord.z != col_z {
+                continue;
+            }
+            has_loaded_chunks_in_column = true;
+            let chunk = &world.chunks[&coord];
+            for local_y in 0..CHUNK_SIZE {
+                for local_z in 0..CHUNK_SIZE {
+                    for local_x in 0..CHUNK_SIZE {
+                        if fluid_kind(chunk.get(local_x, local_y, local_z)).is_some() {
+                            fluid_positions.push(IVec3::new(
+                                coord.x * CHUNK_SIZE + local_x,
+                                coord.y * CHUNK_SIZE + local_y,
+                                coord.z * CHUNK_SIZE + local_z,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if !has_loaded_chunks_in_column {
+            return;
+        }
+        for pos in fluid_positions {
+            fluids.normalize_fluid_state_and_schedule(world, pos, 1);
+        }
+    }
+
+    /// A compact section: stone below `ly = 8`, static worldgen water above.
+    fn static_lake_section() -> Chunk {
+        let mut blocks = vec![BlockId::Stone; VOXELS];
+        let mut data = vec![0u8; VOXELS];
+        for ly in 8..CHUNK_SIZE {
+            for lz in 0..CHUNK_SIZE {
+                for lx in 0..CHUNK_SIZE {
+                    let i = Chunk::index(lx, ly, lz);
+                    blocks[i] = BlockId::WaterStill;
+                    data[i] = fluid_data_make_static(0, false);
+                }
+            }
+        }
+        Chunk::from_parts(
+            ChunkBlocks::compact(blocks),
+            Arc::new(data),
+            Arc::new(vec![0; VOXELS]),
+            0,
+        )
+    }
+
+    /// Two columns: (0, 0) with a static lake section, live sources and a
+    /// flowing cell; (1, 0) with a live source that must not be touched when
+    /// only (0, 0) is bootstrapped.
+    fn bootstrap_world() -> World {
+        let mut world = World::new();
+        for cx in 0..=1 {
+            for cy in 0..3 {
+                world.chunks.insert(
+                    ChunkCoord { x: cx, y: cy, z: 0 },
+                    Chunk::from_parts(
+                        ChunkBlocks::Uniform(BlockId::Stone),
+                        Arc::new(vec![0; VOXELS]),
+                        Arc::new(vec![0; VOXELS]),
+                        0,
+                    ),
+                );
+            }
+        }
+        world
+            .chunks
+            .insert(ChunkCoord { x: 0, y: 3, z: 0 }, static_lake_section());
+        let source = |world: &mut World, pos: IVec3, kind: FluidKind| {
+            let _ =
+                world.set_block_and_data(pos, make_still(kind), fluid_data_make(0, false, true));
+        };
+        source(&mut world, IVec3::new(3, 70, 4), FluidKind::Water);
+        source(&mut world, IVec3::new(9, 71, 2), FluidKind::Lava);
+        let _ = world.set_block_and_data(
+            IVec3::new(5, 70, 5),
+            BlockId::WaterStill,
+            fluid_data_make(3, false, false),
+        );
+        source(&mut world, IVec3::new(20, 70, 4), FluidKind::Water);
+        let mut discard = Vec::new();
+        world.drain_block_changes(&mut discard);
+        world
+    }
+
+    fn scheduled(fluids: &FluidSystem) -> (Vec<IVec3>, Vec<IVec3>) {
+        let mut water: Vec<_> = fluids
+            .water_scheduler
+            .scheduled_due
+            .keys()
+            .copied()
+            .collect();
+        let mut lava: Vec<_> = fluids
+            .lava_scheduler
+            .scheduled_due
+            .keys()
+            .copied()
+            .collect();
+        water.sort_unstable_by_key(|p| (p.x, p.y, p.z));
+        lava.sort_unstable_by_key(|p| (p.x, p.y, p.z));
+        (water, lava)
+    }
+
+    #[test]
+    fn column_bootstrap_matches_full_scan_reference() {
+        let mut world = bootstrap_world();
+        let mut fluids = FluidSystem::new();
+        fluids.bootstrap_column_from_world(&mut world, 0, 0);
+
+        let mut reference_world = bootstrap_world();
+        let mut reference = FluidSystem::new();
+        reference_bootstrap(&mut reference, &mut reference_world, 0, 0);
+
+        let (water, lava) = scheduled(&fluids);
+        assert_eq!((water.clone(), lava.clone()), scheduled(&reference));
+        assert!(water.contains(&IVec3::new(3, 70, 4)) && water.contains(&IVec3::new(5, 70, 5)));
+        assert_eq!(lava, vec![IVec3::new(9, 71, 2)]);
+        assert!(
+            !water.contains(&IVec3::new(20, 70, 4)),
+            "a column that was not bootstrapped got scheduled"
+        );
+
+        let (mut got, mut want) = (Vec::<BlockChange>::new(), Vec::<BlockChange>::new());
+        world.drain_block_changes(&mut got);
+        reference_world.drain_block_changes(&mut want);
+        got.sort_unstable_by_key(|c| (c.pos.x, c.pos.y, c.pos.z));
+        want.sort_unstable_by_key(|c| (c.pos.x, c.pos.y, c.pos.z));
+        assert_eq!(
+            got, want,
+            "bootstrap wrote different blocks than the reference"
+        );
+    }
+
+    /// Numbers for `docs/TODO.md` "Fluid-Bootstrap beim Spalten-Eintritt ohne
+    /// Vollscan". Run with
+    /// `cargo test --release fluid_bootstrap_cost_report -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing report, run manually in release"]
+    fn fluid_bootstrap_cost_report() {
+        // Bootstrapped columns 0..8 exist at every measured view distance.
+        let columns = 8;
+        for view_distance in [8, 32] {
+            let mut world = World::new();
+            let data = Arc::new(vec![0u8; VOXELS]);
+            let light = Arc::new(vec![0u8; VOXELS]);
+            for cx in -view_distance..=view_distance {
+                for cz in -view_distance..=view_distance {
+                    for cy in 0..8 {
+                        let chunk = if cy == 4 && cz == 0 && (0..columns).contains(&cx) {
+                            static_lake_section()
+                        } else {
+                            Chunk::from_parts(
+                                ChunkBlocks::Uniform(BlockId::Stone),
+                                Arc::clone(&data),
+                                Arc::clone(&light),
+                                0,
+                            )
+                        };
+                        world.chunks.insert(
+                            ChunkCoord {
+                                x: cx,
+                                y: cy,
+                                z: cz,
+                            },
+                            chunk,
+                        );
+                    }
+                }
+            }
+            let mut fluids = FluidSystem::new();
+            let start = Instant::now();
+            for cx in 0..columns {
+                fluids.bootstrap_column_from_world(&mut world, cx, 0);
+            }
+            let per_column_ms = start.elapsed().as_secs_f64() * 1000.0 / f64::from(columns);
+            let flattened = (0..columns)
+                .filter(|&cx| {
+                    matches!(
+                        world.chunks[&ChunkCoord { x: cx, y: 4, z: 0 }].blocks,
+                        ChunkBlocks::Flat(_)
+                    )
+                })
+                .count();
+            println!(
+                "view distance {view_distance:2}: {:6} loaded chunks, {per_column_ms:7.3} ms per \
+                 column bootstrap, {flattened}/{columns} static lake sections flattened",
+                world.chunks.len()
+            );
+        }
+    }
+}
