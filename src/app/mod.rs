@@ -4046,7 +4046,7 @@ impl ApplicationHandler for App {
                         }
 
                         {
-                            let _perf_scope = self.perf.scope(PerfCat::Fluids);
+                            let _perf_scope = self.perf.scope(PerfCat::Sim);
                             state.update_simulation_activation(&self.camera);
                             state.update_fluid_simulation(dt_non_negative);
                         }

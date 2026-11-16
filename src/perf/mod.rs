@@ -20,7 +20,7 @@ const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 pub enum PerfCat {
     Movement,
     ChunkStream,
-    Fluids,
+    Sim,
     TexAnim,
     Uniforms,
     Particles,
@@ -33,7 +33,7 @@ impl PerfCat {
     const ORDER: [PerfCat; PerfCat::N] = [
         PerfCat::Movement,
         PerfCat::ChunkStream,
-        PerfCat::Fluids,
+        PerfCat::Sim,
         PerfCat::TexAnim,
         PerfCat::Uniforms,
         PerfCat::Particles,
@@ -45,7 +45,7 @@ impl PerfCat {
         match self {
             PerfCat::Movement => 0,
             PerfCat::ChunkStream => 1,
-            PerfCat::Fluids => 2,
+            PerfCat::Sim => 2,
             PerfCat::TexAnim => 3,
             PerfCat::Uniforms => 4,
             PerfCat::Particles => 5,
@@ -58,7 +58,7 @@ impl PerfCat {
         match self {
             PerfCat::Movement => "mov",
             PerfCat::ChunkStream => "chunk",
-            PerfCat::Fluids => "fluid",
+            PerfCat::Sim => "sim",
             PerfCat::TexAnim => "tex",
             PerfCat::Uniforms => "ubo",
             PerfCat::Particles => "part",

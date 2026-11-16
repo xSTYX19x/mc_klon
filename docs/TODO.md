@@ -2030,24 +2030,6 @@ loading screen, where throughput legitimately outranks frame time.
     wird, fließt ohne Sprung weiter; der Bootstrap plant für solche Spalten
     nichts neu ein.
 
-- **F3: Bucket "fluid" misst den ganzen Sim-Tick** (neu 2026-11-16)
-  - *Ist:* `PerfCat::Fluids` ("fluid" in der F3-Zeitleiste) umschließt
-    `update_simulation_activation` und `update_fluid_simulation`
-    (`app/mod.rs:4049-4050`), also `fixed_sim_tick` mit **allen**
-    Sim-Systemen: Fluids, Block-Entities, Random Ticks, Winter-Tick. Bei
-    Random-Tick-Speed 1000 zeigte F3 deshalb ~100 ms "fluid", obwohl fast
-    alles Random Ticks waren (gemessen: Sim-Distanz 6, 113 Spalten,
-    87,7 ms pro Tick Debug). Die Aufteilung pro System steht schon in der
-    Zeile "SimSystems active: … slowest" (`render/state.rs:21012-21037`).
-  - *Ziel:* Die F3-Zeitleiste führt nicht auf das falsche System.
-  - *Vorgehen:* `PerfCat::Fluids` in `PerfCat::Sim` ("sim") umbenennen; optional
-    das langsamste System direkt dahinter anzeigen.
-  - *Dateien:* `perf/mod.rs`, `app/mod.rs`.
-  - *Abhängigkeiten:* keine.
-  - *Priorität/Aufwand/Impact:* **P3**, S, niedrig (Diagnose).
-  - *Akzeptanz:* Bei hohem Random-Tick-Speed zeigt F3 "sim" statt "fluid",
-    und die SimSystems-Zeile nennt `random_ticks` als langsamstes System.
-
 - finish the streaming-lag hunt — the open half of the reported symptom. Measured after the fixes in `docs/performance/audit-2026-08.md`: streaming frames are median **10.6 ms / p90 53.1 ms**, and `state.process_dirty_chunk_meshes` alone is **mean 12.9 ms**, ~60 % of a 21 ms frame. Chunk apply is no longer the cost (104 ms → 0.51 ms per applied chunk). The p90 spikes are what feels laggy, and they never cross the 200 ms stall threshold, so no stall report ever contained them. Open: where the remaining ~9 ms/frame inside `process_dirty_chunk_meshes` goes. The `gpu.csv` breakdown columns answer this from one normal play session — read them before changing anything else here
 - document reproducible startup and streaming benchmark scenes as a baseline
 - measure startup warmup and first-playable-frame timing under fixed scenes
