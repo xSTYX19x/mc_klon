@@ -1571,7 +1571,6 @@ Aus der Vorlage ausdrücklich **nicht** auf die Liste genommen:
     niedrig.
   - *Akzeptanz:* Test oben grün; `ore_density_stays_within_tolerance_across_
     presets` bleibt grün.
-- add more ore families once replacement/height targets are defined
 - introduce biome/material-aware replacement rules beyond plain stone
 - add richer height models if balancing needs more than uniform/triangle distributions
 - surface more worldgen metrics in the debug overlay
@@ -1638,10 +1637,9 @@ Alles hier gehört in die dokumentierte Phasenreihenfolge aus
   Beides in die Foliage-Phase (7) neben Blumen/Pilze; `apply_flowers_to_column`
   (`chunkgen_worker.rs:1474`) ist die direkte Vorlage inklusive
   Untergrundprüfung und Patch-Radius. Beide brauchen erst die Blöcke
-- **Kiesstrände** und **Kies-/Erdtaschen unter Tage** aus der Vorlage. Kies
-  und Erde existieren als Blöcke; es fehlt die Strandregel in den
-  Surface-Rules, die Taschen passen als weitere Einträge in den
-  datengetriebenen Erz-Pass
+- **Kiesstrände** aus der Vorlage. Kies existiert als Block; es fehlt die
+  Strandregel in den Surface-Rules. (Die Kies- und Erdtaschen unter Tage
+  setzt der Erz-Pass seit 2026-11-16.)
 - **Winterwelten als Welterstellungs-Option mit 25 % Chance**.
   `WorldEnvironment::Winter` und der Schnee-/Eis-Pass
   (`apply_winter_surface_to_column`, `chunkgen_worker.rs:1705`) existieren
@@ -1655,20 +1653,6 @@ Alles hier gehört in die dokumentierte Phasenreihenfolge aus
 - **Nicht gefrorenes Wasser an Kiesstränden** in Winterwelten — eine Ausnahme in
   `winter_surface_supports_snow` (`chunkgen_worker.rs:1685`), sobald Kiesstrände
   existieren
-- **Erzfamilien Diamant und Redstone** (kein Lapis, der kam mit Beta 1.2)
-  in die vier Preset-Tabellen in
-  `worldgen/ores.rs`. Deckt den bereits offenen Punkt "add more ore families
-  once replacement/height targets are defined" oben inhaltlich ab: die
-  Vorlage liefert die fehlende Zielvorgabe. Die Blöcke gibt es seit
-  2026-11-16 (`BlockId::DiamondOre`, `BlockId::RedstoneOre`); der Pass ist
-  datengetrieben, es kommen nur Zeilen in `FLATISH_/CLASSIC_FLATTER_/
-  RD161348_LIKE_/HILLY_ORE_TABLE` dazu (feste Arraylänge, heute
-  `[OreFeatureConfig; 3]`). Der Test
-  `ore_density_stays_within_tolerance_across_presets` (Toleranz 1.6x) gilt
-  auch für die neuen Erze, die Höhenbänder müssen also pro Preset an der
-  Terrain-Hülle ausgerichtet werden, wie bei Kohle in
-  `docs/planning/worldgen.md` beschrieben. `LitRedstoneOre` setzt der
-  Worldgen nie
 - **Meere: Wasserfüllung bis `sea_level`** (neu 2026-09-28)
   - *Ist:* Es gibt **keinen** Meeres-/Ozean-Füllschritt: `sea_level` begrenzt
     nur Lava-Seen und Quellstarts (`render/chunkgen_worker.rs:396`,

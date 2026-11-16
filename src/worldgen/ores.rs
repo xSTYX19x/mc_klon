@@ -50,9 +50,8 @@ impl HeightAnchor {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OreHeightDistribution {
-    /// Vocabulary for a flat band; every current ore uses `Triangle`, so this
-    /// is only constructed by tests today.
-    #[allow(dead_code)]
+    /// A flat band, as Alpha's `rand.nextInt(height)`; used by the pockets and
+    /// the deep ores.
     Uniform {
         min: HeightAnchor,
         max: HeightAnchor,
@@ -84,24 +83,24 @@ pub(crate) struct OreFeatureConfig {
 }
 
 impl OreFeatureConfig {
+    /// Largest step radius `carve_segmented_vein` can draw (exclusive bound).
+    fn max_step_radius(self) -> f32 {
+        self.vein_size as f32 / 16.0 + 1.0
+    }
+
+    /// How many chunks away a vein origin can still write into a column: the
+    /// vein's centre line reaches `vein_size / 8` from its origin and a step
+    /// sphere adds less than `max_step_radius`, so `3 * vein_size / 16 + 1`
+    /// blocks, plus the half-cell margins.
     fn source_radius_chunks(self) -> i32 {
-        (((self.vein_size as i32) + CHUNK_SIZE - 1) / CHUNK_SIZE).max(1)
+        let reach = (3 * self.vein_size as i32 + 15) / 16 + 2;
+        (CHUNK_SIZE - 1 + reach) / CHUNK_SIZE
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct OreFeatureProfile {
     pub(crate) entries: &'static [OreFeatureConfig],
-}
-
-impl OreFeatureProfile {
-    fn source_radius_chunks(self) -> i32 {
-        self.entries
-            .iter()
-            .map(|entry| entry.source_radius_chunks())
-            .max()
-            .unwrap_or(0)
-    }
 }
 
 // Per-preset ore tables.
@@ -179,27 +178,115 @@ const fn gold_ore(attempts_per_chunk: u32) -> OreFeatureConfig {
     }
 }
 
+// Alpha 1.0.17 (`ChunkProviderGenerate.populate`, 128-high world) scatters, per
+// chunk: 20 dirt and 10 gravel veins of size 32 at `y` 0..127, 8 redstone and 1
+// diamond vein of size 7 at `y` 0..15, all through `WorldGenMinable` (stone
+// only). Counts and sizes are kept; the heights are mapped onto each preset's
+// envelope instead of copied:
+// - Pockets span Alpha's whole world, i.e. all rock: here bottom to the
+//   envelope top, the same cap coal uses.
+// - The deep band is the bottom quarter of the rock below Alpha's lowest land
+//   (16 of sea level 64): here a quarter of the preset's envelope floor.
+// Alpha places dirt and gravel before the ores; here they come last, so the
+// calibrated coal/iron/gold placement above stays exactly as it was (placing
+// them first takes about 13% of the rock and cut those ores by 13-20%).
+
+const fn uniform_from_bottom(max_y: i32) -> OreHeightDistribution {
+    OreHeightDistribution::Uniform {
+        min: HeightAnchor::AboveBottom(0),
+        max: HeightAnchor::Absolute(max_y),
+    }
+}
+
+const fn dirt_pocket(max_y: i32) -> OreFeatureConfig {
+    OreFeatureConfig {
+        name: "dirt_pocket",
+        ore_block: BlockId::Dirt,
+        replace_rule: OreReplaceRule::AnyOf(&REPLACE_STONE),
+        vein_size: 32,
+        attempts_per_chunk: 20,
+        chance_per_attempt_256: 256,
+        height_distribution: uniform_from_bottom(max_y),
+        exposed_policy: ExposedOrePolicy::Allow,
+        salt: 0x3708_75D8_F1C0_C7E6,
+    }
+}
+
+const fn gravel_pocket(max_y: i32) -> OreFeatureConfig {
+    OreFeatureConfig {
+        name: "gravel_pocket",
+        ore_block: BlockId::Gravel,
+        replace_rule: OreReplaceRule::AnyOf(&REPLACE_STONE),
+        vein_size: 32,
+        attempts_per_chunk: 10,
+        chance_per_attempt_256: 256,
+        height_distribution: uniform_from_bottom(max_y),
+        exposed_policy: ExposedOrePolicy::Allow,
+        salt: 0xF3FD_0A38_6051_1C24,
+    }
+}
+
+const fn redstone_ore(max_y: i32) -> OreFeatureConfig {
+    OreFeatureConfig {
+        name: "redstone_ore_deep",
+        ore_block: BlockId::RedstoneOre,
+        replace_rule: OreReplaceRule::AnyOf(&REPLACE_STONE),
+        vein_size: 7,
+        attempts_per_chunk: 8,
+        chance_per_attempt_256: 256,
+        height_distribution: uniform_from_bottom(max_y),
+        exposed_policy: ExposedOrePolicy::Allow,
+        salt: 0xC4D0_F0E4_B781_13FA,
+    }
+}
+
+const fn diamond_ore(max_y: i32) -> OreFeatureConfig {
+    OreFeatureConfig {
+        name: "diamond_ore_deep",
+        ore_block: BlockId::DiamondOre,
+        replace_rule: OreReplaceRule::AnyOf(&REPLACE_STONE),
+        vein_size: 7,
+        attempts_per_chunk: 1,
+        chance_per_attempt_256: 256,
+        height_distribution: uniform_from_bottom(max_y),
+        exposed_policy: ExposedOrePolicy::Allow,
+        salt: 0xD710_CE0C_BAF4_1691,
+    }
+}
+
 /// `base_height` 78, `height_amp` 14 - measured surface envelope 69..95.
-const FLATISH_ORE_TABLE: [OreFeatureConfig; 3] = [
+const FLATISH_ORE_TABLE: [OreFeatureConfig; 7] = [
     coal_ore(53, 95, 8),
     iron_ore(40, 95, 12),
     gold_ore(6),
+    redstone_ore(16),
+    diamond_ore(16),
+    dirt_pocket(95),
+    gravel_pocket(95),
 ];
 
 /// `base_height` 84, `height_amp` 20 - measured surface envelope 73..104.
-const CLASSIC_FLATTER_ORE_TABLE: [OreFeatureConfig; 3] = [
+const CLASSIC_FLATTER_ORE_TABLE: [OreFeatureConfig; 7] = [
     coal_ore(59, 104, 8),
     iron_ore(40, 104, 12),
     gold_ore(6),
+    redstone_ore(17),
+    diamond_ore(17),
+    dirt_pocket(104),
+    gravel_pocket(104),
 ];
 
 /// `base_height` 86, `height_amp` 26, active cliffs - measured envelope 67..107.
 /// The cliff presets lose more of the deep band to carvers, so gold gets one
 /// extra attempt (6 -> 7) to land next to the flat presets' yield.
-const RD161348_LIKE_ORE_TABLE: [OreFeatureConfig; 3] = [
+const RD161348_LIKE_ORE_TABLE: [OreFeatureConfig; 7] = [
     coal_ore(61, 107, 8),
     iron_ore(40, 107, 12),
     gold_ore(7),
+    redstone_ore(16),
+    diamond_ore(16),
+    dirt_pocket(107),
+    gravel_pocket(107),
 ];
 
 /// `base_height` 90, `height_amp` 34, strongest cliffs - measured envelope
@@ -207,10 +294,14 @@ const RD161348_LIKE_ORE_TABLE: [OreFeatureConfig; 3] = [
 /// `RD161348_LIKE_ORE_TABLE`; coal and iron need no attempt change once their
 /// band tracks the envelope, because the taller column and the wider band grow
 /// together.
-const HILLY_ORE_TABLE: [OreFeatureConfig; 3] = [
+const HILLY_ORE_TABLE: [OreFeatureConfig; 7] = [
     coal_ore(65, 125, 8),
     iron_ore(40, 125, 12),
     gold_ore(7),
+    redstone_ore(18),
+    diamond_ore(18),
+    dirt_pocket(125),
+    gravel_pocket(125),
 ];
 
 pub(crate) fn ore_profile_for_preset(preset: WorldgenPreset) -> OreFeatureProfile {
@@ -231,8 +322,10 @@ pub(crate) fn apply_ores_to_column(
     target_chunk_z: i32,
 ) {
     let profile = ore_profile_for_preset(preset);
-    let source_radius = profile.source_radius_chunks();
     for ore in profile.entries {
+        // Per ore, not the profile maximum: the size-32 pockets must not make
+        // every small vein sample the wider source ring too.
+        let source_radius = ore.source_radius_chunks();
         for source_chunk_z in (target_chunk_z - source_radius)..=(target_chunk_z + source_radius) {
             for source_chunk_x in
                 (target_chunk_x - source_radius)..=(target_chunk_x + source_radius)
@@ -319,6 +412,25 @@ fn carve_segmented_vein(
     let target_max_x = target_min_x + CHUNK_SIZE - 1;
     let target_min_z = target_chunk_z * CHUNK_SIZE;
     let target_max_z = target_min_z + CHUNK_SIZE - 1;
+    let min_world_y = clamped_min_y(world_cfg);
+    let max_world_y = clamped_max_y(world_cfg);
+
+    // Most veins sampled from neighbouring source chunks never touch this
+    // column. Every step lies on the start..end line with a radius below
+    // `max_step_radius`, so if that whole extent misses, skip the step maths
+    // but still draw the steps' radius values: the source chunk's RNG feeds
+    // its later veins.
+    let max_radius = ore.max_step_radius();
+    if (start_x.max(end_x) + max_radius).floor() < target_min_x as f32
+        || (start_x.min(end_x) - max_radius).floor() > target_max_x as f32
+        || (start_z.max(end_z) + max_radius).floor() < target_min_z as f32
+        || (start_z.min(end_z) - max_radius).floor() > target_max_z as f32
+    {
+        for _ in 0..vein_steps {
+            next_f32(rng);
+        }
+        return;
+    }
 
     for step in 0..vein_steps {
         let t = if vein_steps <= 1 {
@@ -334,17 +446,15 @@ fn carve_segmented_vein(
             continue;
         }
 
-        let min_x = (center_x - radius).floor() as i32;
-        let max_x = (center_x + radius).floor() as i32;
-        let min_y = (center_y - radius).floor() as i32;
-        let max_y = (center_y + radius).floor() as i32;
-        let min_z = (center_z - radius).floor() as i32;
-        let max_z = (center_z + radius).floor() as i32;
-        if max_x < target_min_x
-            || min_x > target_max_x
-            || max_z < target_min_z
-            || min_z > target_max_z
-        {
+        // Only cells of this column inside the world can be written; the rest
+        // of a sphere that pokes into a neighbour is not iterated at all.
+        let min_x = ((center_x - radius).floor() as i32).max(target_min_x);
+        let max_x = ((center_x + radius).floor() as i32).min(target_max_x);
+        let min_y = ((center_y - radius).floor() as i32).max(min_world_y);
+        let max_y = ((center_y + radius).floor() as i32).min(max_world_y);
+        let min_z = ((center_z - radius).floor() as i32).max(target_min_z);
+        let max_z = ((center_z + radius).floor() as i32).min(target_max_z);
+        if min_x > max_x || min_y > max_y || min_z > max_z {
             continue;
         }
 
@@ -365,15 +475,12 @@ fn carve_segmented_vein(
                     if norm_xy_sq + norm_z * norm_z >= 1.0 {
                         continue;
                     }
-                    try_place_ore(
+                    place_ore_cell(
                         column,
-                        world_cfg,
-                        target_chunk_x,
-                        target_chunk_z,
-                        world_x,
+                        world_x - target_min_x,
                         world_y,
-                        world_z,
-                        ore,
+                        world_z - target_min_z,
+                        &ore,
                     );
                 }
             }
@@ -381,52 +488,25 @@ fn carve_segmented_vein(
     }
 }
 
-fn try_place_ore(
+/// Places `ore` in a cell the caller already clamped to this column.
+#[inline]
+fn place_ore_cell(
     column: &mut ColumnBuffer,
-    world_cfg: WorldConfig,
-    target_chunk_x: i32,
-    target_chunk_z: i32,
-    world_x: i32,
-    world_y: i32,
-    world_z: i32,
-    ore: OreFeatureConfig,
+    local_x: i32,
+    y: i32,
+    local_z: i32,
+    ore: &OreFeatureConfig,
 ) {
-    let Some((local_x, local_y, local_z)) =
-        world_to_local_target(target_chunk_x, target_chunk_z, world_x, world_y, world_z)
-    else {
-        return;
-    };
-    if world_y < clamped_min_y(world_cfg) || world_y > clamped_max_y(world_cfg) {
-        return;
-    }
-    let current = column.get_block(local_x, local_y, local_z);
-    if !ore.replace_rule.matches(current) {
+    let index = ColumnBuffer::index(local_x, y, local_z);
+    if !ore.replace_rule.matches(column.blocks[index]) {
         return;
     }
     if ore.exposed_policy == ExposedOrePolicy::HiddenOnly
-        && block_is_exposed_to_air(column, local_x, local_y, local_z)
+        && block_is_exposed_to_air(column, local_x, y, local_z)
     {
         return;
     }
-    column.set_block(local_x, local_y, local_z, ore.ore_block);
-}
-
-fn world_to_local_target(
-    target_chunk_x: i32,
-    target_chunk_z: i32,
-    world_x: i32,
-    world_y: i32,
-    world_z: i32,
-) -> Option<(i32, i32, i32)> {
-    let local_x = world_x - target_chunk_x * CHUNK_SIZE;
-    let local_z = world_z - target_chunk_z * CHUNK_SIZE;
-    if !(0..CHUNK_SIZE).contains(&local_x)
-        || !(0..CHUNK_SIZE).contains(&local_z)
-        || !(0..ColumnBuffer::HEIGHT).contains(&world_y)
-    {
-        return None;
-    }
-    Some((local_x, world_y, local_z))
+    column.blocks[index] = ore.ore_block;
 }
 
 fn block_is_exposed_to_air(column: &ColumnBuffer, x: i32, y: i32, z: i32) -> bool {
@@ -563,14 +643,70 @@ mod tests {
     #[test]
     fn ore_generation_is_deterministic_for_same_column() {
         let world_cfg = WorldConfig::default();
-        let preset = WorldgenPreset::Rd161348Like;
-        let mut a = stone_column();
-        let mut b = stone_column();
+        for preset in ALL_PRESETS {
+            let mut a = stone_column();
+            let mut b = stone_column();
 
-        apply_ores_to_column(&mut a, world_cfg, preset, 3, -2);
-        apply_ores_to_column(&mut b, world_cfg, preset, 3, -2);
+            apply_ores_to_column(&mut a, world_cfg, preset, 3, -2);
+            apply_ores_to_column(&mut b, world_cfg, preset, 3, -2);
 
-        assert_eq!(a.blocks, b.blocks);
+            assert_eq!(a.blocks, b.blocks, "{preset:?}");
+            // Not vacuous: every family of the table lands in this column.
+            for entry in ore_profile_for_preset(preset).entries {
+                assert!(
+                    a.blocks.contains(&entry.ore_block),
+                    "{preset:?}: {} placed nothing",
+                    entry.name
+                );
+            }
+        }
+    }
+
+    /// Pockets and veins only ever eat stone: the bedrock floor, open caves and
+    /// the fluids carvers leave behind come out of the ore pass unchanged.
+    #[test]
+    fn pockets_never_replace_bedrock_air_or_fluid() {
+        let protected = [
+            BlockId::Bedrock,
+            BlockId::Air,
+            BlockId::WaterStill,
+            BlockId::WaterFlowing,
+            BlockId::LavaStill,
+            BlockId::LavaFlowing,
+        ];
+        // Every other cell is stone, the rest cycles through `protected`, so
+        // each size-32 pocket overlaps hundreds of protected cells.
+        let mut before = ColumnBuffer::new();
+        for y in 0..ColumnBuffer::HEIGHT {
+            for z in 0..CHUNK_SIZE {
+                for x in 0..CHUNK_SIZE {
+                    let cell = (x + z * 3 + y * 7) as usize;
+                    let block = if cell.is_multiple_of(2) {
+                        BlockId::Stone
+                    } else {
+                        protected[(cell / 2) % protected.len()]
+                    };
+                    before.set_block(x, y, z, block);
+                }
+            }
+        }
+
+        for preset in ALL_PRESETS {
+            let mut after = before.clone();
+            apply_ores_to_column(&mut after, WorldConfig::default(), preset, 3, -2);
+            let (mut dirt, mut gravel) = (0, 0);
+            for (index, (&was, &now)) in before.blocks.iter().zip(&after.blocks).enumerate() {
+                if was != BlockId::Stone {
+                    assert_eq!(now, was, "{preset:?}: cell {index} {was:?} became {now:?}");
+                }
+                match now {
+                    BlockId::Dirt => dirt += 1,
+                    BlockId::Gravel => gravel += 1,
+                    _ => {}
+                }
+            }
+            assert!(dirt > 0 && gravel > 0, "{preset:?}: no pockets placed");
+        }
     }
 
     #[test]
@@ -621,30 +757,55 @@ mod tests {
         }
     }
 
+    const ORE_NAMES: [&str; 7] = [
+        "coal",
+        "iron",
+        "gold",
+        "redstone",
+        "diamond",
+        "dirt pocket",
+        "gravel pocket",
+    ];
+
+    /// Surface rules, lake seals and springs also place dirt (and the surface
+    /// some gravel) near the top of a column, so pocket blocks are only counted
+    /// this far below the column's highest non-air block.
+    const POCKET_COUNT_DEPTH: i32 = 10;
+
     /// Counts ore blocks in a fully generated square of columns, i.e. after
     /// terrain, carvers and the ore pass - the ore pass alone cannot show this,
     /// because the effect being guarded is a height band intersecting *rock*.
+    /// Indexed like `ORE_NAMES`.
     fn ore_counts_for_preset(
         seed: u64,
         preset: WorldgenPreset,
         ring_lo: i32,
         ring_hi: i32,
-    ) -> [u32; 3] {
+    ) -> [u32; 7] {
         let cfg = WorldConfig {
             seed,
             ..WorldConfig::default()
         };
-        let mut counts = [0_u32; 3];
+        let mut counts = [0_u32; 7];
         for cz in ring_lo..=ring_hi {
             for cx in ring_lo..=ring_hi {
                 let column = generate_streaming_column_for_test(cfg, preset, cx, cz);
-                for y in 0..ColumnBuffer::HEIGHT {
-                    for z in 0..CHUNK_SIZE {
-                        for x in 0..CHUNK_SIZE {
+                for z in 0..CHUNK_SIZE {
+                    for x in 0..CHUNK_SIZE {
+                        let top = (0..ColumnBuffer::HEIGHT)
+                            .rev()
+                            .find(|&y| column.get_block(x, y, z) != BlockId::Air)
+                            .unwrap_or(0);
+                        for y in 0..ColumnBuffer::HEIGHT {
+                            let deep = y + POCKET_COUNT_DEPTH < top;
                             match column.get_block(x, y, z) {
                                 BlockId::CoalOre => counts[0] += 1,
                                 BlockId::IronOre => counts[1] += 1,
                                 BlockId::GoldOre => counts[2] += 1,
+                                BlockId::RedstoneOre => counts[3] += 1,
+                                BlockId::DiamondOre => counts[4] += 1,
+                                BlockId::Dirt if deep => counts[5] += 1,
+                                BlockId::Gravel if deep => counts[6] += 1,
                                 _ => {}
                             }
                         }
@@ -662,20 +823,22 @@ mod tests {
     /// to y=207 while `Flatish` tops out near y=95, so most coal attempts landed
     /// in air and the four presets came out 1.93x apart on coal (1777 vs 3428
     /// over 25 columns, seed 132211). With the per-preset bands the measured
-    /// spread is 1.17-1.23x for coal, 1.18-1.30x for iron and 1.24-1.41x for
-    /// gold across the two seeds below, so 1.6x is headroom that still fails on
-    /// a return to one shared table.
+    /// spread across the two seeds below is 1.17-1.23x for coal, 1.18-1.30x
+    /// for iron, 1.24-1.41x for gold, 1.07-1.10x for redstone, 1.21-1.49x for
+    /// diamond, 1.11x for dirt and 1.14-1.20x for gravel pockets, so 1.6x is
+    /// headroom that still fails on a return to one shared table. Diamond's
+    /// spread is sampling noise (about 16 veins per preset here); redstone
+    /// shares its band and shows the systematic part.
     #[test]
     fn ore_density_stays_within_tolerance_across_presets() {
         const MAX_SPREAD: f32 = 1.6;
-        const ORE_NAMES: [&str; 3] = ["coal", "iron", "gold"];
         // 4x4 columns per preset; large enough that the per-column noise does
-        // not dominate, small enough to keep the whole test around 2.5 s.
+        // not dominate, small enough to keep the test around 8 s in a debug build.
         const RING_LO: i32 = -2;
         const RING_HI: i32 = 1;
 
         for seed in [132_211_u64, 0x5EED_0001] {
-            let per_preset: Vec<[u32; 3]> = ALL_PRESETS
+            let per_preset: Vec<[u32; 7]> = ALL_PRESETS
                 .iter()
                 .map(|preset| ore_counts_for_preset(seed, *preset, RING_LO, RING_HI))
                 .collect();
@@ -729,4 +892,3 @@ mod tests {
         );
     }
 }
-

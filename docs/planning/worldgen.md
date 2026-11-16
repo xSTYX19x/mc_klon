@@ -23,11 +23,21 @@ Current guarantees:
 - dedicated feature pass after base terrain and carvers
 - per-ore config for replacement, vein size, attempts, height distribution, exposure policy, and salt
 - deterministic generation for a world seed and preset
-- seam-stable cross-border veins by sampling neighboring source chunks
+- seam-stable cross-border veins by sampling neighboring source chunks (per
+  ore, as far as its vein can reach; veins that miss the column skip their
+  step maths but still draw their RNG values)
 
-Current initial ore table (coal, iron, gold), split per preset:
-`FLATISH_ORE_TABLE`, `CLASSIC_FLATTER_ORE_TABLE`, `RD161348_LIKE_ORE_TABLE`,
-`HILLY_ORE_TABLE` in `worldgen/ores.rs`.
+Current ore table, split per preset: coal, iron, gold, redstone, diamond, then
+dirt and gravel pockets, in `FLATISH_ORE_TABLE`, `CLASSIC_FLATTER_ORE_TABLE`,
+`RD161348_LIKE_ORE_TABLE`, `HILLY_ORE_TABLE` in `worldgen/ores.rs`.
+
+Redstone, diamond and the pockets take Alpha 1.0.17's counts and vein sizes
+(8x7, 1x7, 20x32, 10x32 per chunk, stone only). Their heights are mapped, not
+copied: the pockets span bottom to the envelope top (coal's cap), and the deep
+band is a quarter of the preset's envelope floor, as Alpha's `y` 0..15 is a
+quarter of the rock below its lowest land. Alpha places the pockets before the
+ores; here they come last so the calibrated coal/iron/gold placement is
+unchanged.
 
 A preset changes *where* ore sits, not *how much* of it a world holds. An ore's
 height band only yields ore where it intersects rock, so a band anchored above a
@@ -38,7 +48,9 @@ whose bands sit fully inside rock everywhere, stayed within 1.25x.
 
 Each table therefore carries its preset's terrain envelope as the band cap plus
 the attempt count that re-normalises the density. Measured spread afterwards:
-coal 1.17-1.23x, iron 1.18-1.30x, gold 1.24-1.41x over two seeds. Guarded by
+coal 1.17-1.23x, iron 1.18-1.30x, gold 1.24-1.41x, redstone 1.07-1.10x, diamond
+1.21-1.49x (sampling noise), dirt 1.11x, gravel 1.14-1.20x over two seeds.
+Guarded by
 `worldgen::ores::tests::ore_density_stays_within_tolerance_across_presets`
 (tolerance 1.6x) and `..::every_preset_gets_its_own_ore_table`.
 

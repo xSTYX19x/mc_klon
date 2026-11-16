@@ -104,6 +104,7 @@ That direction is now active in the code:
 - foliage pass (flowers + mushrooms)
 - final grass settle pass: no generated grass sits under a skylight blocker or fluid, so random ticks do not rewrite fresh terrain after loading
 - ore generation as a dedicated deterministic feature pass after carvers
+- ore families: coal, iron, gold, redstone, diamond, plus dirt and gravel pockets underground (Alpha counts, heights mapped per preset)
 - current ore profile is data-driven per ore type:
   - replacement rule
   - vein size
