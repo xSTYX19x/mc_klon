@@ -1521,27 +1521,24 @@ Aus der Vorlage ausdrücklich **nicht** auf die Liste genommen:
 - **Preset-Unterschiede und Phasenreihenfolge dokumentieren** (neu formuliert
   2026-09-28; bisher "document preset differences and worldgen phase order
   where contributors will find it quickly")
-  - *Ist:* Die Phasenliste steht in `docs/planning/worldgen.md:65-77` und in
-    `docs/architecture/runtime-contracts.md` ("Ore Generation Pipeline"),
-    ist gegenüber dem Code (`render/chunkgen_worker.rs:1742-1855`) aber
-    unvollständig: Surface-Rules laufen *innerhalb* der Terrain-Phase
-    (`worldgen/pipeline.rs:203-234`), Phase 5 enthält eine Dirt→Gras-Promotion
-    und eine Sand-Bereinigung (`chunkgen_worker.rs:961`, `:1171`), es gibt eine
-    Winterphase zwischen Foliage und dem (dort schon eingetragenen)
-    abschließenden Gras-Ausgleich und **keine Meeresfüllung** (siehe
-    a1.0.17-Abgleich unten). Preset-Parameter stehen nur im Code
-    (`worldgen/terrain.rs:40-124`).
+  - *Ist:* Seit 2026-11-16 nennt "Worldgen Phase Order" in
+    `docs/planning/worldgen.md` alle 9 Phasen wie im Code
+    (`StreamingWorldColumnGenerator`), mit Surface-Rules und Meeresfüllung in
+    der Terrain-Phase; `docs/architecture/runtime-contracts.md` verweist
+    darauf; die README nennt den Default (`ClassicFlatter`) richtig.
+    Preset-Parameter stehen weiter nur im Code (`worldgen/terrain.rs`,
+    `WorldGenConfig::from_preset_with_sea_level`).
   - *Ziel:* Ein Contributor findet Phasen, Presets und deren Unterschiede an
     einer Stelle.
   - *Vorbild:* — (Doku).
-  - *Vorgehen:* 1) "Worldgen Phase Order" in `docs/planning/worldgen.md` an den
-    Code angleichen. 2) Tabelle Preset × (base_height, height_amp, cliff_amp,
-    octaves, Erz-Hülle). 3) README korrigieren. 4) Beim Umzug nach `worldgen/`
-    die Liste als Doc-Kommentar an die Phasenliste hängen.
-  - *Dateien:* `docs/planning/worldgen.md`, `README.md`, `worldgen/terrain.rs`.
+  - *Vorgehen:* 1) Tabelle Preset × (base_height, height_amp, cliff_amp,
+    octaves, Erz-Hülle) in `docs/planning/worldgen.md`. 2) Beim Umzug nach
+    `worldgen/` die Liste als Doc-Kommentar an die Phasenliste hängen.
+  - *Dateien:* `docs/planning/worldgen.md`, `worldgen/terrain.rs`.
   - *Abhängigkeiten:* keine.
   - *Priorität/Aufwand/Impact:* **P2**, S, niedrig.
-  - *Akzeptanz:* Die Doku nennt alle 9 Phasen und den richtigen Default.
+  - *Akzeptanz:* Die Preset-Tabelle in `docs/planning/worldgen.md` stimmt mit
+    `WorldGenConfig::from_preset_with_sea_level` überein.
 
 ### Medium priority
 - **Nahtsichere `HiddenOnly`-Prüfung für Erze** (neu formuliert 2026-09-28;
@@ -1629,17 +1626,10 @@ Alles hier gehört in die dokumentierte Phasenreihenfolge aus
   `worldgen/ores.rs`). Kein neuer Nachbearbeitungspass, sondern dieselbe
   Technik. Blockiert zusätzlich durch Spawner (Block-Entity) und Truhen
   (Inhalt) — der Raum selbst kann aber vorher stehen
-- **Ton**: Klumpen in Wassernähe. Passt in die vorhandene Shoreline-/
-  Material-Cleanup-Phase (5), nicht in einen eigenen Pass —
-  `apply_shoreline_pass_to_column` (`chunkgen_worker.rs:1046`) kennt die Wassernähe
-  bereits
 - **Zuckerrohr** an Stränden, **Kaktus** auf Sand (beide max. 3 hoch).
   Beides in die Foliage-Phase (7) neben Blumen/Pilze; `apply_flowers_to_column`
   (`chunkgen_worker.rs:1474`) ist die direkte Vorlage inklusive
   Untergrundprüfung und Patch-Radius. Beide brauchen erst die Blöcke
-- **Kiesstrände** aus der Vorlage. Kies existiert als Block; es fehlt die
-  Strandregel in den Surface-Rules. (Die Kies- und Erdtaschen unter Tage
-  setzt der Erz-Pass seit 2026-11-16.)
 - **Winterwelten als Welterstellungs-Option mit 25 % Chance**.
   `WorldEnvironment::Winter` und der Schnee-/Eis-Pass
   (`apply_winter_surface_to_column`, `chunkgen_worker.rs:1705`) existieren
@@ -1650,42 +1640,6 @@ Alles hier gehört in die dokumentierte Phasenreihenfolge aus
   `PrecipitationKind::Snow` greift. Der Random-Tick-Pfad ist da
   (`RandomTicksSystem`), der Niederschlagszustand auch
   (`State::active_precipitation_kind`, `render/state.rs:6228`)
-- **Nicht gefrorenes Wasser an Kiesstränden** in Winterwelten — eine Ausnahme in
-  `winter_surface_supports_snow` (`chunkgen_worker.rs:1685`), sobald Kiesstrände
-  existieren
-- **Meere: Wasserfüllung bis `sea_level`** (neu 2026-09-28)
-  - *Ist:* Es gibt **keinen** Meeres-/Ozean-Füllschritt: `sea_level` begrenzt
-    nur Lava-Seen und Quellstarts (`render/chunkgen_worker.rs:396`,
-    `:473-474`), die Surface-Rules setzen am Meeresspiegel lediglich Erde statt
-    Gras (`worldgen/surface_rules.rs:34-42`). Terrain unterhalb von
-    `sea_level` (möglich z. B. bei `Hilly`: `base_height` 90, `height_amp` 34,
-    `worldgen/terrain.rs:40-124`) bleibt eine trockene Senke. Die Vorlage hat
-    Ozeane.
-  - *Ziel:* Alle Luft über dem Terrain unterhalb von `sea_level` ist Wasser
-    (unter Tage durch die Carver begrenzt); Strände und Kiesstrände an der
-    Küste.
-  - *Vorbild:* Vanilla bis 1.17 ("unter dem Meeresspiegel ist Wasser"), ab 1.18
-    Aquifere. Übertragung: im heutigen Preset-Modell ein Füllschritt in der
-    Terrain-Phase; im Multi-Noise-Preset übernehmen Aquifere.
-  - *Vorgehen:* 1) In `WorldgenPipeline::generate_chunk`
-    (`worldgen/pipeline.rs:203-234`) Luft ≤ `sea_level` oberhalb der
-    Oberfläche mit `WaterStill` + `fluid_data_make_static` füllen. 2) Carver
-    schneiden nicht ins Meer (die Wasser-Prüfung existiert,
-    `worldgen/carvers/caves.rs:411`, `worldgen/carvers/ravine.rs:307`).
-    3) Ufer-Pass (`chunkgen_worker.rs:1046`) auf echte Küsten anwenden und die
-    Kiesstrände oben dort andocken. 4) Fluid-Bootstrap für große statische
-    Wasserflächen beim Laden prüfen (seit 2026-11-16 überspringt er ruhende
-    statische Zellen; das Meerwasser muss dafür mit
-    `fluid_data_make_static(0, false)` entstehen, sonst plant er jede Zelle
-    ein).
-  - *Dateien:* `worldgen/pipeline.rs`, `render/chunkgen_worker.rs`,
-    `worldgen/carvers/*`.
-  - *Abhängigkeiten:* keine; im Multi-Noise-Preset durch Aquifere ersetzt.
-  - *Priorität/Aufwand/Impact:* **P2**, S-M, hoch (Weltbild der Vorlage).
-  - *Akzeptanz:* Senken unter `sea_level` sind geflutet, keine schwebenden
-    Wasserflächen; die Fluid-Debug-Zähler (F3) zeigen beim Laden keine
-    Update-Welle.
-
 ### Biome & Multi-Noise-Terrain
 
 Neu 2026-09-28. Zielbild laut Maintainer: Biome nach dem modernen

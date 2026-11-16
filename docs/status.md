@@ -98,6 +98,8 @@ That direction is now active in the code:
 - presets: `Flatish`, `ClassicFlatter`, `Rd161348Like`, `Hilly`
 - new worlds are unbounded: the classic size (Small/Normal/Huge) only sets the area generated before play starts; the boundary-ocean ring and its fog limit exist only in worlds saved with `boundary_ocean`
 - terrain + density + surface rules
+- sea: every cell below `sea_level` that the terrain leaves empty is static water (dirt floor, never grass); carvers never cut next to or under it, also across chunk edges; water lakes below sea level keep the sea
+- Alpha beaches in `sea_level - 4 ..= sea_level + 1`: sand or the rarer gravel by two low-frequency noises (a gravel beach sits a block lower), clay patches in sand under water; in winter worlds water touching gravel stays liquid
 - streaming generates the base terrain per column: the y-independent heightmap is computed once per column and all-air sections are skipped (`WorldgenPipeline::generate_column`)
 - carvers (caves/ravines)
 - lakes/springs and shoreline post-processing

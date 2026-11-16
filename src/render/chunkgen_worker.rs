@@ -20,7 +20,7 @@ use crate::world::fluids::{
 use crate::world::{CHUNK_SIZE, Chunk, ChunkBlocks, ChunkCoord, WORLD_MAX_Y, block_data_arc};
 use crate::worldgen::{
     ColumnBuffer, GenContext, TerrainGenerator, TerrainSampler, WorldGenConfig, WorldgenPreset,
-    carvers::Carvers, ores::apply_ores_to_column,
+    carvers::Carvers, noise::NoiseSampler, ores::apply_ores_to_column,
 };
 
 const WATER_FEATURE_CHANCE_PER_CHUNK_256: u32 = 24;
@@ -42,6 +42,25 @@ const SHORELINE_MAX_SLOPE: i32 = 2;
 const SHORELINE_MAX_TOP_ABOVE_WATER: i32 = 2;
 const SHORELINE_MAX_WATER_ABOVE_TOP: i32 = 1;
 const SHORELINE_FILL_DEPTH: i32 = 3;
+/// Alpha's beach band (`replaceBlocksForBiome`): columns whose surface lies in
+/// `sea_level - 4 ..= sea_level + 1` may become sand or gravel beach.
+const BEACH_BAND_BELOW_SEA: i32 = 4;
+const BEACH_BAND_ABOVE_SEA: i32 = 1;
+/// Alpha's beach noises are 4 octaves whose frequency halves (and amplitude
+/// doubles) per octave from 1/32, so the coarsest octave dominates.
+const BEACH_NOISE_FREQ: f32 = 1.0 / 256.0;
+const BEACH_NOISE_OCTAVES: u8 = 4;
+const SAND_BEACH_THRESHOLD: f32 = 0.0;
+/// Rarer than sand, and sand wins where both apply (as in Alpha).
+const GRAVEL_BEACH_THRESHOLD: f32 = 0.2;
+const GRAVEL_NOISE_OFFSET: (f32, f32) = (3071.0, -5113.0);
+/// Below the beach surface block, as deep as the surface dirt layer.
+const BEACH_FILL_DEPTH: i32 = 3;
+const CLAY_NOISE_FREQ: f32 = 1.0 / 24.0;
+const CLAY_NOISE_OCTAVES: u8 = 2;
+const CLAY_THRESHOLD: f32 = 0.3;
+const CLAY_NOISE_OFFSET: (f32, f32) = (-7919.0, 2843.0);
+const COAST_NOISE_SALT: u32 = 0xC0A5_7B3D;
 const WATER_SPRING_MIN_SURFACE_Y: i32 = 30;
 const WATER_SPRING_PATH_MIN: i32 = 8;
 const WATER_SPRING_PATH_MAX: i32 = 24;
@@ -712,6 +731,7 @@ fn apply_lake_carve_and_fill_to_chunk(
     coord: ChunkCoord,
     terrain: &TerrainSampler,
     lake: LakeCandidate,
+    sea_level: i32,
 ) {
     let chunk_y0 = coord.y * CHUNK_SIZE;
     let chunk_y1 = chunk_y0 + CHUNK_SIZE - 1;
@@ -756,8 +776,18 @@ fn apply_lake_carve_and_fill_to_chunk(
                 let write_air_max = air_y_max.min(chunk_y1);
                 for world_y in write_air_min..=write_air_max {
                     let local_y = world_y - chunk_y0;
-                    chunk.set(local_x, local_y, local_z, BlockId::Air);
-                    chunk.set_data(local_x, local_y, local_z, 0);
+                    // A lake below sea level opens into the sea: its clearance
+                    // stays (or becomes) sea water instead of cutting a hole.
+                    if is_water_block(chunk.get(local_x, local_y, local_z)) {
+                        continue;
+                    }
+                    if world_y < sea_level {
+                        chunk.set(local_x, local_y, local_z, BlockId::WaterStill);
+                        chunk.set_data(local_x, local_y, local_z, fluid_data_make_static(0, false));
+                    } else {
+                        chunk.set(local_x, local_y, local_z, BlockId::Air);
+                        chunk.set_data(local_x, local_y, local_z, 0);
+                    }
                 }
             }
         }
@@ -928,12 +958,13 @@ fn apply_streaming_lakes_and_fluids(
     coord: ChunkCoord,
     terrain_sampler: &TerrainSampler,
     nearby_water_features: &NearbyWaterFeatures,
+    sea_level: i32,
 ) {
     for &lake in &nearby_water_features.water_lakes {
-        apply_lake_carve_and_fill_to_chunk(chunk, coord, terrain_sampler, lake);
+        apply_lake_carve_and_fill_to_chunk(chunk, coord, terrain_sampler, lake, sea_level);
     }
     for &lake in &nearby_water_features.lava_lakes {
-        apply_lake_carve_and_fill_to_chunk(chunk, coord, terrain_sampler, lake);
+        apply_lake_carve_and_fill_to_chunk(chunk, coord, terrain_sampler, lake, sea_level);
     }
 
     for spring in &nearby_water_features.springs {
@@ -1064,16 +1095,35 @@ fn place_shoreline_sand_block(
     count_sand_placement_in_chunk(shoreline_sand_by_chunk, y);
 }
 
-fn apply_shoreline_pass_to_column(column: &mut ColumnBuffer) -> Vec<u32> {
+/// `column_top_solid_y` of every column, computed once for the shoreline
+/// passes. They change surface materials but not heights, except a gravel
+/// beach lowering its surface, which updates its entry.
+type ColumnTops = [Option<i32>; (CHUNK_SIZE * CHUNK_SIZE) as usize];
+
+fn column_tops(column: &ColumnBuffer) -> ColumnTops {
+    let mut tops = [None; (CHUNK_SIZE * CHUNK_SIZE) as usize];
+    for local_z in 0..CHUNK_SIZE {
+        for local_x in 0..CHUNK_SIZE {
+            tops[column_xz_index(local_x, local_z)] = column_top_solid_y(column, local_x, local_z);
+        }
+    }
+    tops
+}
+
+/// Sand rims around lakes. Water below `sea_level` is the sea, whose shore
+/// `apply_beaches_to_column` decides instead.
+fn apply_shoreline_pass_to_column(
+    column: &mut ColumnBuffer,
+    top_y_cache: &ColumnTops,
+    sea_level: i32,
+) -> Vec<u32> {
     let cache_len = (CHUNK_SIZE * CHUNK_SIZE) as usize;
-    let mut top_y_cache = vec![None::<i32>; cache_len];
     let mut water_surface_cache = vec![None::<i32>; cache_len];
     let mut shoreline_sand_by_chunk = vec![0u32; ColumnBuffer::chunk_count_y() as usize];
 
     for local_z in 0..CHUNK_SIZE {
         for local_x in 0..CHUNK_SIZE {
             let idx = column_xz_index(local_x, local_z);
-            top_y_cache[idx] = column_top_solid_y(column, local_x, local_z);
             water_surface_cache[idx] = column_water_surface_y(column, local_x, local_z);
         }
     }
@@ -1134,6 +1184,9 @@ fn apply_shoreline_pass_to_column(column: &mut ColumnBuffer) -> Vec<u32> {
                     let Some(water_y) = water_surface_cache[column_xz_index(nx, nz)] else {
                         continue;
                     };
+                    if water_y < sea_level {
+                        continue;
+                    }
                     if water_y < top_y - SHORELINE_MAX_TOP_ABOVE_WATER
                         || water_y > top_y + SHORELINE_MAX_WATER_ABOVE_TOP
                     {
@@ -1187,6 +1240,141 @@ fn apply_shoreline_pass_to_column(column: &mut ColumnBuffer) -> Vec<u32> {
     }
 
     shoreline_sand_by_chunk
+}
+
+/// Alpha's beaches (`ChunkProviderGenerate.replaceBlocksForBiome`): a column
+/// whose surface lies in the beach band becomes sand where the sand noise is
+/// positive, otherwise gravel where the rarer gravel noise is high. A gravel
+/// beach loses its surface block (water at `sea_level - 1`, air above), so it
+/// sits a block below the land around it; the gravel starts underneath.
+fn apply_beaches_to_column(
+    column: &mut ColumnBuffer,
+    tops: &mut ColumnTops,
+    noise: &NoiseSampler,
+    sea_level: i32,
+    (chunk_x, chunk_z): (i32, i32),
+    shoreline_sand_by_chunk: &mut [u32],
+) {
+    let band = (sea_level - BEACH_BAND_BELOW_SEA)..=(sea_level + BEACH_BAND_ABOVE_SEA);
+    for local_z in 0..CHUNK_SIZE {
+        for local_x in 0..CHUNK_SIZE {
+            let Some(top_y) = tops[column_xz_index(local_x, local_z)] else {
+                continue;
+            };
+            if !band.contains(&top_y)
+                || !matches!(
+                    column_get_block(column, local_x, top_y, local_z),
+                    BlockId::Grass | BlockId::Dirt
+                )
+                || !column_get_block(column, local_x, top_y - 1, local_z).is_solid()
+            {
+                continue;
+            }
+            let world_x = (chunk_x * CHUNK_SIZE + local_x) as f32;
+            let world_z = (chunk_z * CHUNK_SIZE + local_z) as f32;
+            let beach_noise = |dx: f32, dz: f32| {
+                noise.fbm2(
+                    world_x + dx,
+                    world_z + dz,
+                    BEACH_NOISE_FREQ,
+                    BEACH_NOISE_OCTAVES,
+                    2.0,
+                    0.5,
+                )
+            };
+
+            if beach_noise(0.0, 0.0) > SAND_BEACH_THRESHOLD {
+                for y in (top_y - BEACH_FILL_DEPTH..=top_y).rev() {
+                    if !beach_cell_replaceable(column, local_x, y, local_z) {
+                        break;
+                    }
+                    place_shoreline_sand_block(
+                        column,
+                        shoreline_sand_by_chunk,
+                        local_x,
+                        y,
+                        local_z,
+                    );
+                }
+                continue;
+            }
+            if beach_noise(GRAVEL_NOISE_OFFSET.0, GRAVEL_NOISE_OFFSET.1) <= GRAVEL_BEACH_THRESHOLD {
+                continue;
+            }
+            let mut gravel_top = top_y;
+            // Never lower a surface that has water on it: it would hang.
+            if top_y >= sea_level - 1
+                && column_get_block(column, local_x, top_y + 1, local_z) == BlockId::Air
+            {
+                if top_y < sea_level {
+                    column.set_block(local_x, top_y, local_z, BlockId::WaterStill);
+                    column.set_data(local_x, top_y, local_z, fluid_data_make_static(0, false));
+                } else {
+                    column_set_block(column, local_x, top_y, local_z, BlockId::Air);
+                }
+                gravel_top = top_y - 1;
+                tops[column_xz_index(local_x, local_z)] = Some(gravel_top);
+            }
+            for y in (top_y - BEACH_FILL_DEPTH..=gravel_top).rev() {
+                if !beach_cell_replaceable(column, local_x, y, local_z) {
+                    break;
+                }
+                column_set_block(column, local_x, y, local_z, BlockId::Gravel);
+            }
+        }
+    }
+}
+
+/// Beach material replaces the surface dirt layer, and only where it rests on
+/// something solid (both sand and gravel are falling blocks).
+fn beach_cell_replaceable(column: &ColumnBuffer, local_x: i32, y: i32, local_z: i32) -> bool {
+    y > 0
+        && matches!(
+            column_get_block(column, local_x, y, local_z),
+            BlockId::Grass | BlockId::Dirt
+        )
+        && column_get_block(column, local_x, y - 1, local_z).is_solid()
+}
+
+/// Clay patches near water: sand under water turns to clay, top to bottom of
+/// the sand layer, where a smaller-scale noise is high. Alpha scatters size-32
+/// clay veins that only replace sand around water; noise patches give the same
+/// picture without veins that would need the neighbouring columns.
+fn apply_clay_to_column(
+    column: &mut ColumnBuffer,
+    tops: &ColumnTops,
+    noise: &NoiseSampler,
+    chunk_x: i32,
+    chunk_z: i32,
+) {
+    for local_z in 0..CHUNK_SIZE {
+        for local_x in 0..CHUNK_SIZE {
+            let Some(top_y) = tops[column_xz_index(local_x, local_z)] else {
+                continue;
+            };
+            if column_get_block(column, local_x, top_y, local_z) != BlockId::Sand
+                || !is_water_block(column_get_block(column, local_x, top_y + 1, local_z))
+            {
+                continue;
+            }
+            let clay = noise.fbm2(
+                (chunk_x * CHUNK_SIZE + local_x) as f32 + CLAY_NOISE_OFFSET.0,
+                (chunk_z * CHUNK_SIZE + local_z) as f32 + CLAY_NOISE_OFFSET.1,
+                CLAY_NOISE_FREQ,
+                CLAY_NOISE_OCTAVES,
+                2.0,
+                0.5,
+            );
+            if clay <= CLAY_THRESHOLD {
+                continue;
+            }
+            let mut y = top_y;
+            while y > 0 && column_get_block(column, local_x, y, local_z) == BlockId::Sand {
+                column_set_block(column, local_x, y, local_z, BlockId::Clay);
+                y -= 1;
+            }
+        }
+    }
 }
 
 fn remove_unsupported_sand_in_column(column: &mut ColumnBuffer) {
@@ -1717,6 +1905,21 @@ fn winter_surface_supports_snow(block: BlockId) -> bool {
         )
 }
 
+/// Water resting on or beside gravel stays liquid in winter worlds. In Alpha the
+/// gravel-beach rule writes water into the beach surface after the terrain
+/// phase has frozen the sea, so the water at gravel beaches is never ice. Only
+/// neighbours inside this column are visible here.
+fn water_touches_gravel(column: &ColumnBuffer, local_x: i32, y: i32, local_z: i32) -> bool {
+    [(0, -1, 0), (1, 0, 0), (-1, 0, 0), (0, 0, 1), (0, 0, -1)]
+        .into_iter()
+        .any(|(dx, dy, dz)| {
+            let (nx, nz) = (local_x + dx, local_z + dz);
+            (0..CHUNK_SIZE).contains(&nx)
+                && (0..CHUNK_SIZE).contains(&nz)
+                && column.get_block(nx, y + dy, nz) == BlockId::Gravel
+        })
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct WinterColumnPassStats {
     snow_layers: u32,
@@ -1736,6 +1939,9 @@ fn apply_winter_surface_to_column(column: &mut ColumnBuffer) -> WinterColumnPass
                 if matches!(block, BlockId::WaterStill | BlockId::WaterFlowing)
                     && above == BlockId::Air
                 {
+                    if water_touches_gravel(column, local_x, y, local_z) {
+                        break;
+                    }
                     column_set_block(column, local_x, y, local_z, BlockId::Ice);
                     stats.ice_blocks = stats.ice_blocks.saturating_add(1);
                     break;
@@ -1793,7 +1999,7 @@ impl StreamingWorldColumnGenerator {
         ctx.report_progress("Base terrain fill", 0, 7);
         let stage_started = Instant::now();
         let mut section = Chunk::new_empty();
-        terrain_generator.generate_column(
+        let sea_guard = terrain_generator.generate_column(
             cx,
             cz,
             min_chunk_y..=max_chunk_y,
@@ -1805,7 +2011,7 @@ impl StreamingWorldColumnGenerator {
         // 2) Caves / carvers
         ctx.report_progress("Caves", 1, 7);
         let stage_started = Instant::now();
-        Carvers::carve_column(ctx.seed, cx, cz, out, cfg.sea_level);
+        Carvers::carve_column(ctx.seed, cx, cz, out, &sea_guard);
         stage_timings.carvers = stage_started.elapsed();
 
         // 3) Ores
@@ -1831,6 +2037,7 @@ impl StreamingWorldColumnGenerator {
                 coord,
                 terrain_sampler,
                 &nearby_water_features,
+                cfg.sea_level,
             );
 
             // 4) Post-fixes
@@ -1845,7 +2052,18 @@ impl StreamingWorldColumnGenerator {
 
         let stage_started = Instant::now();
         apply_surface_dirt_to_grass_in_column(out);
-        let shoreline_sand_by_chunk = apply_shoreline_pass_to_column(out);
+        let coast_noise = NoiseSampler::new(worldgen_seed32(cfg.seed) ^ COAST_NOISE_SALT);
+        let mut tops = column_tops(out);
+        let mut shoreline_sand_by_chunk = apply_shoreline_pass_to_column(out, &tops, cfg.sea_level);
+        apply_beaches_to_column(
+            out,
+            &mut tops,
+            &coast_noise,
+            cfg.sea_level,
+            (cx, cz),
+            &mut shoreline_sand_by_chunk,
+        );
+        apply_clay_to_column(out, &tops, &coast_noise, cx, cz);
         remove_unsupported_sand_in_column(out);
         stage_timings.shoreline = stage_started.elapsed();
         ctx.report_progress("Shoreline", 5, 7);
@@ -2529,6 +2747,13 @@ mod tests {
     use std::time::Duration;
 
     use super::{
+        BEACH_BAND_ABOVE_SEA, BEACH_BAND_BELOW_SEA, BEACH_NOISE_FREQ, BEACH_NOISE_OCTAVES,
+        CLAY_NOISE_FREQ, CLAY_NOISE_OCTAVES, CLAY_NOISE_OFFSET, CLAY_THRESHOLD, COAST_NOISE_SALT,
+        GRAVEL_BEACH_THRESHOLD, GRAVEL_NOISE_OFFSET, NoiseSampler, SAND_BEACH_THRESHOLD,
+        TerrainSampler, WorldGenConfig, apply_clay_to_column, column_top_solid_y, column_tops,
+        is_water_block, worldgen_seed32,
+    };
+    use super::{
         CHUNK_SIZE, ColumnAcquireDisposition, ColumnCoordKey, ColumnGenerationDescriptor,
         ColumnGenerationStageTimings, GeneratedColumn, GeneratedColumnCoordinator, WORLD_MAX_Y,
         WinterColumnPassStats, WorldConfig, apply_winter_surface_to_column,
@@ -2774,6 +2999,225 @@ mod tests {
         assert_eq!(column.get_block(7, 62, 8), BlockId::Ice);
         assert_eq!(stats.snow_layers, 1);
         assert_eq!(stats.ice_blocks, 1);
+    }
+
+    #[test]
+    fn winter_leaves_water_touching_gravel_liquid() {
+        let mut column = ColumnBuffer::new();
+        // On gravel, beside gravel, and on stone.
+        column.set_block(2, 62, 2, BlockId::Gravel);
+        column.set_block(2, 63, 2, BlockId::WaterStill);
+        column.set_block(9, 62, 9, BlockId::Stone);
+        column.set_block(9, 63, 9, BlockId::WaterStill);
+        column.set_block(10, 63, 9, BlockId::Gravel);
+        column.set_block(6, 62, 6, BlockId::Stone);
+        column.set_block(6, 63, 6, BlockId::WaterStill);
+
+        let stats = apply_winter_surface_to_column(&mut column);
+
+        assert_eq!(column.get_block(2, 63, 2), BlockId::WaterStill);
+        assert_eq!(column.get_block(9, 63, 9), BlockId::WaterStill);
+        assert_eq!(column.get_block(6, 63, 6), BlockId::Ice);
+        assert_eq!(stats.ice_blocks, 1);
+    }
+
+    #[test]
+    fn clay_replaces_only_sand_under_water() {
+        let noise = NoiseSampler::new(worldgen_seed32(132_211) ^ COAST_NOISE_SALT);
+        let clay_at = |cx: i32, x: i32| {
+            noise.fbm2(
+                (cx * CHUNK_SIZE + x) as f32 + CLAY_NOISE_OFFSET.0,
+                CLAY_NOISE_OFFSET.1,
+                CLAY_NOISE_FREQ,
+                CLAY_NOISE_OCTAVES,
+                2.0,
+                0.5,
+            ) > CLAY_THRESHOLD
+        };
+        let cx = (0..512)
+            .find(|&cx| clay_at(cx, 4) && clay_at(cx, 5))
+            .expect("no clay patch along z = 0");
+        let mut column = ColumnBuffer::new();
+        for x in [4, 5] {
+            for y in 1..=60 {
+                column.set_block(x, y, 0, BlockId::Stone);
+            }
+            column.set_block(x, 61, 0, BlockId::Sand);
+            column.set_block(x, 62, 0, BlockId::Sand);
+        }
+        column.set_block(4, 63, 0, BlockId::WaterStill);
+
+        let tops = column_tops(&column);
+        apply_clay_to_column(&mut column, &tops, &noise, cx, 0);
+
+        assert_eq!(column.get_block(4, 62, 0), BlockId::Clay);
+        assert_eq!(column.get_block(4, 61, 0), BlockId::Clay);
+        assert_eq!(column.get_block(4, 60, 0), BlockId::Stone);
+        assert_eq!(
+            column.get_block(5, 62, 0),
+            BlockId::Sand,
+            "dry sand turned to clay"
+        );
+    }
+
+    const SEA_LEVEL: i32 = 64;
+    const SEA_SEEDS: [u64; 3] = [132_211, 7, 31_337];
+
+    /// Hilly chunk columns within `radius` chunks whose heightmap reaches below
+    /// sea level, deepest first. The presets rarely get that low, so this
+    /// scans wide and coarse.
+    fn hilly_sea_chunks(seed: u64, radius: i32) -> Vec<(i32, i32)> {
+        let sampler = TerrainSampler::new(WorldGenConfig::from_preset_with_sea_level(
+            worldgen_seed32(seed),
+            WorldgenPreset::Hilly,
+            SEA_LEVEL,
+        ));
+        let mut found = Vec::new();
+        for cz in -radius..=radius {
+            for cx in -radius..=radius {
+                let min_height = (0..4)
+                    .map(|i| {
+                        sampler.height_at(cx * 16 + (i % 2) * 8 + 4, cz * 16 + (i / 2) * 8 + 4, 255)
+                    })
+                    .min()
+                    .unwrap();
+                if min_height < SEA_LEVEL - 2 {
+                    found.push((min_height, cx, cz));
+                }
+            }
+        }
+        found.sort();
+        found.into_iter().map(|(_, cx, cz)| (cx, cz)).collect()
+    }
+
+    /// "Meere" acceptance after every pass (carvers, lakes, beaches): no sea
+    /// water hangs over air or stands beside it, across chunk edges included,
+    /// and none of it would wake the fluid simulation on load.
+    #[test]
+    fn sea_water_never_hangs_or_borders_air() {
+        for seed in SEA_SEEDS {
+            let cfg = WorldConfig {
+                seed,
+                ..WorldConfig::default()
+            };
+            let (cx, cz) = hilly_sea_chunks(seed, 48)[0];
+            let mut columns = std::collections::HashMap::new();
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    let column = generate_streaming_column_for_test(
+                        cfg,
+                        WorldgenPreset::Hilly,
+                        cx + dx,
+                        cz + dz,
+                    );
+                    columns.insert((cx + dx, cz + dz), column);
+                }
+            }
+            let block_at = |wx: i32, y: i32, wz: i32| {
+                columns[&(wx.div_euclid(16), wz.div_euclid(16))].get_block(
+                    wx.rem_euclid(16),
+                    y,
+                    wz.rem_euclid(16),
+                )
+            };
+            let center = &columns[&(cx, cz)];
+            let mut water = 0;
+            for z in 0..CHUNK_SIZE {
+                for x in 0..CHUNK_SIZE {
+                    let (wx, wz) = (cx * 16 + x, cz * 16 + z);
+                    for y in 1..SEA_LEVEL {
+                        if !is_water_block(center.get_block(x, y, z)) {
+                            continue;
+                        }
+                        water += 1;
+                        assert!(fluid_data_is_worldgen_static(center.get_data(x, y, z)));
+                        assert_ne!(
+                            center.get_block(x, y - 1, z),
+                            BlockId::Air,
+                            "seed {seed}: water hangs at ({wx}, {y}, {wz})"
+                        );
+                        for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                            assert_ne!(
+                                block_at(wx + dx, y, wz + dz),
+                                BlockId::Air,
+                                "seed {seed}: water at ({wx}, {y}, {wz}) borders air"
+                            );
+                        }
+                    }
+                }
+            }
+            assert!(water > 0, "seed {seed}: chunk ({cx}, {cz}) has no sea");
+        }
+    }
+
+    /// Alpha's beach band, `sea_level - 4 ..= sea_level + 1`, one lower for a
+    /// gravel beach that lost its surface block.
+    fn beach_tops(column: &ColumnBuffer) -> (u32, u32) {
+        let band = (SEA_LEVEL - BEACH_BAND_BELOW_SEA - 1)..=(SEA_LEVEL + BEACH_BAND_ABOVE_SEA);
+        let (mut sand, mut gravel) = (0, 0);
+        for z in 0..CHUNK_SIZE {
+            for x in 0..CHUNK_SIZE {
+                let Some(top) = column_top_solid_y(column, x, z).filter(|y| band.contains(y))
+                else {
+                    continue;
+                };
+                match column.get_block(x, top, z) {
+                    BlockId::Sand => sand += 1,
+                    BlockId::Gravel => gravel += 1,
+                    _ => {}
+                }
+            }
+        }
+        (sand, gravel)
+    }
+
+    /// Both beach kinds generate on every seed. The beach noises vary over
+    /// hundreds of blocks, so one sea can be all sand or all gravel: the sea
+    /// chunks are picked by the noise at their centre.
+    #[test]
+    fn hilly_coasts_get_sand_and_gravel_beaches() {
+        for seed in SEA_SEEDS {
+            let cfg = WorldConfig {
+                seed,
+                ..WorldConfig::default()
+            };
+            let noise = NoiseSampler::new(worldgen_seed32(seed) ^ COAST_NOISE_SALT);
+            let beach_noise = |cx: i32, cz: i32, offset: (f32, f32)| {
+                noise.fbm2(
+                    (cx * 16 + 8) as f32 + offset.0,
+                    (cz * 16 + 8) as f32 + offset.1,
+                    BEACH_NOISE_FREQ,
+                    BEACH_NOISE_OCTAVES,
+                    2.0,
+                    0.5,
+                )
+            };
+            let chunks = hilly_sea_chunks(seed, 96);
+            let sandy = chunks
+                .iter()
+                .filter(|&&(cx, cz)| beach_noise(cx, cz, (0.0, 0.0)) > SAND_BEACH_THRESHOLD);
+            let gravelly = chunks.iter().filter(|&&(cx, cz)| {
+                beach_noise(cx, cz, (0.0, 0.0)) <= SAND_BEACH_THRESHOLD
+                    && beach_noise(cx, cz, GRAVEL_NOISE_OFFSET) > GRAVEL_BEACH_THRESHOLD
+            });
+            let found = |candidates: &mut dyn Iterator<Item = &(i32, i32)>, gravel: bool| {
+                candidates.take(3).any(|&(cx, cz)| {
+                    let column =
+                        generate_streaming_column_for_test(cfg, WorldgenPreset::Hilly, cx, cz);
+                    let (sand_tops, gravel_tops) = beach_tops(&column);
+                    if gravel {
+                        gravel_tops > 0
+                    } else {
+                        sand_tops > 0
+                    }
+                })
+            };
+            assert!(found(&mut { sandy }, false), "seed {seed}: no sand beach");
+            assert!(
+                found(&mut { gravelly }, true),
+                "seed {seed}: no gravel beach"
+            );
+        }
     }
 
     /// Numbers for `docs/TODO.md` "Worldgen: 2D-Terrain-Noise pro Spalte statt

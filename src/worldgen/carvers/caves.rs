@@ -4,7 +4,7 @@ use crate::blocks::BlockId;
 use crate::world::fluids::fluid_data_make;
 use crate::worldgen::java_random::JavaRandom;
 
-use super::ChunkColumn;
+use super::{CarveTarget, ChunkColumn};
 
 pub(crate) struct CaveCarver;
 
@@ -15,7 +15,7 @@ impl CaveCarver {
         world_seed: u64,
         target_chunk_x: i32,
         target_chunk_z: i32,
-        column: &mut ChunkColumn,
+        target: &mut CarveTarget,
     ) {
         let world_seed_i64 = world_seed as i64;
         let mut rand = JavaRandom::new(world_seed_i64);
@@ -33,7 +33,7 @@ impl CaveCarver {
                     source_chunk_z,
                     target_chunk_x,
                     target_chunk_z,
-                    column,
+                    target,
                 );
             }
         }
@@ -45,7 +45,7 @@ impl CaveCarver {
         source_chunk_z: i32,
         target_chunk_x: i32,
         target_chunk_z: i32,
-        column: &mut ChunkColumn,
+        target: &mut CarveTarget,
     ) {
         let inner0 = rand.next_int_bound(15);
         let inner1 = rand.next_int_bound(inner0 + 1);
@@ -66,7 +66,7 @@ impl CaveCarver {
                     rand.next_long(),
                     target_chunk_x,
                     target_chunk_z,
-                    column,
+                    target,
                     x,
                     y,
                     z,
@@ -85,7 +85,7 @@ impl CaveCarver {
                     rand.next_long(),
                     target_chunk_x,
                     target_chunk_z,
-                    column,
+                    target,
                     TunnelParams {
                         x,
                         y,
@@ -106,7 +106,7 @@ impl CaveCarver {
         seed: i64,
         target_chunk_x: i32,
         target_chunk_z: i32,
-        column: &mut ChunkColumn,
+        target: &mut CarveTarget,
         x: f64,
         y: f64,
         z: f64,
@@ -117,7 +117,7 @@ impl CaveCarver {
             &mut random,
             target_chunk_x,
             target_chunk_z,
-            column,
+            target,
             TunnelParams {
                 x,
                 y,
@@ -136,18 +136,18 @@ impl CaveCarver {
         seed: i64,
         target_chunk_x: i32,
         target_chunk_z: i32,
-        column: &mut ChunkColumn,
+        target: &mut CarveTarget,
         params: TunnelParams,
     ) {
         let mut random = JavaRandom::new(seed);
-        Self::add_tunnel_with_rng(&mut random, target_chunk_x, target_chunk_z, column, params);
+        Self::add_tunnel_with_rng(&mut random, target_chunk_x, target_chunk_z, target, params);
     }
 
     fn add_tunnel_with_rng(
         random: &mut JavaRandom,
         target_chunk_x: i32,
         target_chunk_z: i32,
-        column: &mut ChunkColumn,
+        target: &mut CarveTarget,
         mut params: TunnelParams,
     ) {
         let chunk_center_x = (target_chunk_x * 16 + 8) as f64;
@@ -199,7 +199,7 @@ impl CaveCarver {
                     random.next_long(),
                     target_chunk_x,
                     target_chunk_z,
-                    column,
+                    target,
                     TunnelParams {
                         x: params.x,
                         y: params.y,
@@ -216,7 +216,7 @@ impl CaveCarver {
                     random.next_long(),
                     target_chunk_x,
                     target_chunk_z,
-                    column,
+                    target,
                     TunnelParams {
                         x: params.x,
                         y: params.y,
@@ -278,6 +278,8 @@ impl CaveCarver {
                     continue;
                 }
 
+                let column = &mut *target.column;
+                let water = target.water;
                 if Self::scan_water_abort(column, x_min, x_max, y_min, y_max, z_min, z_max) {
                     step += 1;
                     if started_from_room {
@@ -318,6 +320,9 @@ impl CaveCarver {
                                 carved_grass = true;
                             }
                             if !is_replaceable(current, above) {
+                                continue;
+                            }
+                            if water.borders_water(column, local_x, world_y, local_z) {
                                 continue;
                             }
 

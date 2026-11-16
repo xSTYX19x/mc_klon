@@ -239,6 +239,16 @@ impl TerrainSampler {
 
         height.round().clamp(0.0, world_max_y as f32) as i32
     }
+
+    /// A lower bound for `height_at`: the valley-floor clamp, pushed through
+    /// the steps after it (the cliff term only adds, the compression and the
+    /// rounding are monotone).
+    pub fn lowest_height(&self, world_max_y: i32) -> i32 {
+        let base_height = self.cfg.base_height as f32;
+        let valley_floor = (self.cfg.sea_level - self.cfg.valley_floor_offset) as f32;
+        let compressed = base_height + (valley_floor - base_height) * 0.96;
+        compressed.round().clamp(0.0, world_max_y as f32) as i32
+    }
 }
 
 #[cfg(test)]

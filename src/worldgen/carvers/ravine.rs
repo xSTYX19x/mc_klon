@@ -4,7 +4,7 @@ use crate::blocks::BlockId;
 use crate::world::fluids::fluid_data_make;
 use crate::worldgen::java_random::JavaRandom;
 
-use super::ChunkColumn;
+use super::{CarveTarget, ChunkColumn};
 
 pub(crate) struct RavineCarver;
 
@@ -15,7 +15,7 @@ impl RavineCarver {
         world_seed: u64,
         target_chunk_x: i32,
         target_chunk_z: i32,
-        column: &mut ChunkColumn,
+        target: &mut CarveTarget,
     ) {
         let world_seed_i64 = world_seed as i64;
         let mut rand = JavaRandom::new(world_seed_i64);
@@ -33,7 +33,7 @@ impl RavineCarver {
                     source_chunk_z,
                     target_chunk_x,
                     target_chunk_z,
-                    column,
+                    target,
                 );
             }
         }
@@ -45,7 +45,7 @@ impl RavineCarver {
         source_chunk_z: i32,
         target_chunk_x: i32,
         target_chunk_z: i32,
-        column: &mut ChunkColumn,
+        target: &mut CarveTarget,
     ) {
         if rand.next_int_bound(50) != 0 {
             return;
@@ -63,7 +63,7 @@ impl RavineCarver {
             rand.next_long(),
             target_chunk_x,
             target_chunk_z,
-            column,
+            target,
             TunnelParams {
                 x,
                 y,
@@ -82,7 +82,7 @@ impl RavineCarver {
         seed: i64,
         target_chunk_x: i32,
         target_chunk_z: i32,
-        column: &mut ChunkColumn,
+        target: &mut CarveTarget,
         mut params: TunnelParams,
     ) {
         let mut random = JavaRandom::new(seed);
@@ -180,6 +180,8 @@ impl RavineCarver {
                     continue;
                 }
 
+                let column = &mut *target.column;
+                let water = target.water;
                 if Self::scan_water_abort(column, x_min, x_max, y_min, y_max, z_min, z_max) {
                     step += 1;
                     if started_from_room {
@@ -214,6 +216,9 @@ impl RavineCarver {
                                 carved_grass = true;
                             }
                             if !is_replaceable(current) {
+                                continue;
+                            }
+                            if water.borders_water(column, local_x, world_y, local_z) {
                                 continue;
                             }
 

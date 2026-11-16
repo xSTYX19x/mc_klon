@@ -35,7 +35,9 @@ impl SurfaceRules {
         let _ = (ctx.x, ctx.z);
 
         if y == ctx.top_y {
-            if !shoreline {
+            // Below sea level the surface is sea floor: dirt here, sand,
+            // gravel or clay once the shoreline pass has run.
+            if !shoreline && ctx.top_y >= ctx.sea_level {
                 BlockId::Grass
             } else {
                 BlockId::Dirt

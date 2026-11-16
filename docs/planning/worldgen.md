@@ -6,9 +6,10 @@ Status: 2026-03-07
 
 - presets (`Flatish`, `ClassicFlatter`, `Rd161348Like`, `Hilly`)
 - seeded terrain + density/surface rules
-- carvers (caves/ravines)
+- sea: everything below `sea_level` above the terrain is static water
+- carvers (caves/ravines), kept out of water
 - lakes/springs in the chunkgen worker
-- shoreline post-processing
+- shoreline post-processing: lake sand rims, Alpha sand/gravel beaches, clay
 - sea level in `WorldConfig` and `world.meta`
 - boundary-ocean visualization for hard world borders (preset-dependent)
 - foliage pass (flowers/mushrooms)
@@ -62,6 +63,14 @@ See "Worldgen" in `docs/TODO.md`.
 
 `WorldConfig::sea_level` is a worldgen *input*, not a ceiling for water:
 
+- **the sea** fills every cell below it (`y < sea_level`, so the surface plane
+  is at `sea_level`, like the boundary-ocean ring) that the terrain leaves
+  empty, during the terrain phase, as static water
+  (`fluid_data_make_static(0, false)`) that the fluid bootstrap leaves
+  dormant; the surface under it is dirt (sand, gravel or clay after the
+  shoreline phase), never grass
+- **beaches** use Alpha's band `sea_level - 4 ..= sea_level + 1`
+
 - **lava** is bounded by it — `make_lava_lake_candidate` clamps every lava lake
   to `sea_level - 2`
 - **springs/rivers** deliberately start *above* it
@@ -76,16 +85,28 @@ which runs two sea levels so the lava bound cannot be met by a constant.
 
 ## Worldgen Phase Order
 
-The current target order is:
+The order in `StreamingWorldColumnGenerator` (`render/chunkgen_worker.rs`):
 
-1. terrain/base stone
-2. carvers
-3. ores
-4. lakes/springs + post-fixes
-5. shoreline/material cleanup
+1. terrain (`WorldgenPipeline::generate_column`): density → stone, then the
+   surface rules (bedrock at y 0, grass/dirt top, dirt layer; dirt instead of
+   grass below sea level), then the sea fill below `sea_level`. It also hands
+   the carvers a `SeaGuard`: where sea water can sit across each column edge.
+2. carvers (caves, ravines): besides Alpha's per-step water abort, a cell with
+   water above or beside it is never carved (`carvers::WaterGuard`), across
+   column edges via the `SeaGuard`, so sea water never hangs over air or
+   stands beside it
+3. ores (incl. dirt/gravel pockets)
+4. lakes/springs + post-fixes (per section): a water lake below sea level
+   keeps the sea in its air clearance; grass under water becomes dirt
+5. shoreline/material cleanup: exposed dirt → grass, sand rims around lakes
+   (water above `sea_level` only), Alpha beaches (sand vs. the rarer gravel by
+   two low-frequency noises; a gravel beach loses its surface block), clay
+   patches in sand under water, unsupported sand removed
 6. trees
 7. foliage/decorations
-8. grass settle (always last): grass under a skylight blocker or a fluid becomes dirt, using the same rule as the grass random tick (`blocks::grass_survives_under`), so freshly generated terrain causes no random-tick edits after loading
+8. winter surface (winter worlds only): snow layers, ice on exposed water
+   except water touching gravel (Alpha's gravel beaches stay liquid)
+9. grass settle (always last): grass under a skylight blocker or a fluid becomes dirt, using the same rule as the grass random tick (`blocks::grass_survives_under`), so freshly generated terrain causes no random-tick edits after loading
 
 If future passes are added, they should fit into this ordered pipeline instead of bypassing it.
 

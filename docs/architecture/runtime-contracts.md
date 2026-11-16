@@ -94,15 +94,18 @@ Rules:
 
 Ore generation is a dedicated feature pass, not a terrain-noise side effect.
 
-Current pass order in the column generator:
+Current pass order in the column generator (details in
+`docs/planning/worldgen.md`, "Worldgen Phase Order"):
 
-1. base terrain fill
-2. carvers
+1. terrain: base fill, surface rules, sea fill below `sea_level`
+2. carvers (never next to or under water)
 3. ores
 4. lakes/springs and post-fixes
-5. shoreline
+5. shoreline: lake sand, beaches, clay
 6. trees
 7. foliage
+8. winter surface (winter worlds only)
+9. grass settle
 
 Per-ore configuration currently supports:
 

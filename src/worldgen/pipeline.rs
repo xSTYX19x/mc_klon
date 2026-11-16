@@ -2,10 +2,14 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use crate::blocks::BlockId;
+use crate::world::fluids::fluid_data_make_static;
 use crate::world::{CHUNK_SIZE, Chunk, ChunkCoord};
 
 use super::TerrainSampler;
-use super::density::cache::{DensityChunkCache, GRID_COLUMNS, smoothed_height};
+use super::carvers::SeaGuard;
+use super::density::cache::{
+    DENSITY_SAMPLE_STEP, DensityChunkCache, GRID_COLUMNS, smoothed_height,
+};
 use super::density::{DensityFn, EvalContext};
 use super::surface_rules::{SurfaceContext, SurfaceRules};
 
@@ -14,6 +18,8 @@ const COLUMN_COUNT: usize = (CHUNK_SIZE as usize) * (CHUNK_SIZE as usize);
 const CHUNK_Y_STRIDE: usize = (CHUNK_SIZE as usize) * (CHUNK_SIZE as usize);
 /// Raw-height samples per axis for one column: x/z from -1 to 17.
 const RAW_HEIGHT_AXIS: usize = CHUNK_SIZE as usize + 3;
+/// Density-grid points per horizontal axis (5 for 16-wide chunks).
+const GRID_AXIS: usize = CHUNK_SIZE as usize / DENSITY_SAMPLE_STEP as usize + 1;
 
 /// The y-independent part of terrain generation for one chunk column: the
 /// smoothed heightmap at every block column (for the surface rules) and at the
@@ -22,6 +28,8 @@ struct ColumnTerrain {
     top_y: [i32; COLUMN_COUNT],
     grid_heights: [f32; GRID_COLUMNS],
     grid_max_height: f32,
+    /// `TerrainSampler::lowest_height`: no grid height anywhere is below it.
+    lowest_height: f32,
 }
 
 #[derive(Clone)]
@@ -160,7 +168,51 @@ impl WorldgenPipeline {
             top_y,
             grid_heights,
             grid_max_height,
+            lowest_height: sampler.lowest_height(*max_y) as f32,
         })
+    }
+
+    /// Bounds the sea just across each edge of the column for the carvers.
+    ///
+    /// The terrain surface is the bilinear interpolation of the density-grid
+    /// heights, and a cell below sea level holds water exactly where it is not
+    /// solid, i.e. at or above that surface. Across the +x/+z edges the
+    /// neighbour's cell lies on this column's last grid line, so its surface is
+    /// known. Across the -x/-z edges it is 3/4 this column's first grid line
+    /// plus 1/4 a grid point outside, which is at least `lowest_height`. Each
+    /// bound is lowered by a block so float rounding cannot cut it short.
+    fn sea_guard(&self, column: &ColumnTerrain) -> SeaGuard {
+        let grid = |gx: usize, gz: usize| column.grid_heights[gx + gz * GRID_AXIS];
+        let step = DENSITY_SAMPLE_STEP as usize;
+        let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+        // Surface along grid line `fixed` of one axis, at cell `i` of the other.
+        let along_x_line = |gx: usize, i: usize| {
+            let t = (i % step) as f32 / step as f32;
+            lerp(grid(gx, i / step), grid(gx, i / step + 1), t)
+        };
+        let along_z_line = |gz: usize, i: usize| {
+            let t = (i % step) as f32 / step as f32;
+            lerp(grid(i / step, gz), grid(i / step + 1, gz), t)
+        };
+        let outside = |edge_surface: f32| 0.75 * edge_surface + 0.25 * column.lowest_height;
+        let lowest_water_y = |surface: f32| (surface - 1.0).floor() as i32;
+
+        // Edges in `SeaGuard` order: -x, +x, -z, +z.
+        let lowest = [
+            std::array::from_fn(|i| lowest_water_y(outside(along_x_line(0, i)))),
+            std::array::from_fn(|i| lowest_water_y(along_x_line(GRID_AXIS - 1, i))),
+            std::array::from_fn(|i| lowest_water_y(outside(along_z_line(0, i)))),
+            std::array::from_fn(|i| lowest_water_y(along_z_line(GRID_AXIS - 1, i))),
+        ];
+        // The surface inside the column interpolates its grid heights, so it is
+        // nowhere below their minimum; a block of margin covers the rounding.
+        let grid_min = column
+            .grid_heights
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min);
+        let column_may_hold_water = lowest_water_y(grid_min) < self.sea_level;
+        SeaGuard::new(self.sea_level, lowest, column_may_hold_water)
     }
 
     /// One section on its own; see `ChunkGenerator::generate_chunk`.
@@ -174,15 +226,21 @@ impl WorldgenPipeline {
     /// `scratch`, and hands each to `emit`. The y-independent terrain (the
     /// smoothed heightmap) is computed once for the column instead of once per
     /// section; the output is identical to calling `generate_chunk` per section.
-    pub fn generate_column(
+    /// Returns where sea water may sit across the column's edges, for the
+    /// carvers.
+    pub(crate) fn generate_column(
         &self,
         chunk_x: i32,
         chunk_z: i32,
         chunk_ys: RangeInclusive<i32>,
         scratch: &mut Chunk,
         mut emit: impl FnMut(i32, &Chunk),
-    ) {
+    ) -> SeaGuard {
         let column = self.column_terrain(chunk_x, chunk_z);
+        let sea_guard = match &column {
+            Some(column) => self.sea_guard(column),
+            None => SeaGuard::without_neighbours(self.sea_level),
+        };
         for chunk_y in chunk_ys {
             let coord = ChunkCoord {
                 x: chunk_x,
@@ -192,6 +250,7 @@ impl WorldgenPipeline {
             self.generate_section(coord, scratch, column.as_ref());
             emit(chunk_y, scratch);
         }
+        sea_guard
     }
 
     fn generate_section(&self, coord: ChunkCoord, out: &mut Chunk, column: Option<&ColumnTerrain>) {
@@ -212,6 +271,7 @@ impl WorldgenPipeline {
                 // Below zero, trilinear interpolation cannot reach a positive
                 // density anywhere in the section: it is all air.
                 if column.grid_max_height - (chunk_world_y0 as f32) < 0.0 {
+                    self.flood_below_sea_level(out, chunk_world_y0, None);
                     out.recompute_cached_block_classification();
                     return;
                 }
@@ -227,6 +287,9 @@ impl WorldgenPipeline {
         };
         let mut solid_mask = [false; CHUNK_VOLUME];
         let mut top_local_per_column = [-1_i32; COLUMN_COUNT];
+        // Solid cells below sea level; when they fill the whole range there is
+        // nothing to flood, which is the case for nearly every section.
+        let mut solid_below_sea = 0_usize;
 
         for local_z in 0..CHUNK_SIZE {
             for local_x in 0..CHUNK_SIZE {
@@ -245,6 +308,9 @@ impl WorldgenPipeline {
                     let idx = column_base_idx + (local_y as usize) * CHUNK_Y_STRIDE;
                     solid_mask[idx] = true;
                     local_top = local_y;
+                    if world_y < self.sea_level {
+                        solid_below_sea += 1;
+                    }
                 }
                 top_local_per_column[column_idx] = local_top;
             }
@@ -306,7 +372,47 @@ impl WorldgenPipeline {
                 }
             }
         }
+        let flood_cells = self.flood_local_ys(chunk_world_y0).len() * COLUMN_COUNT;
+        if solid_below_sea < flood_cells {
+            self.flood_below_sea_level(out, chunk_world_y0, Some(&solid_mask));
+        }
         out.recompute_cached_block_classification();
+    }
+
+    /// The sea: every cell below `sea_level` that the terrain left empty is
+    /// still water. Static, so the fluid bootstrap leaves it dormant on load.
+    /// Carvers run afterwards and keep out of it (`carvers::WaterGuard`).
+    /// The section's local y range that lies inside the world and below
+    /// `sea_level`.
+    fn flood_local_ys(&self, chunk_world_y0: i32) -> std::ops::Range<i32> {
+        let flood_top = self.sea_level.min(self.max_y + 1) - chunk_world_y0;
+        let flood_bottom = self.min_y - chunk_world_y0;
+        flood_bottom.max(0)..flood_top.min(CHUNK_SIZE)
+    }
+
+    fn flood_below_sea_level(
+        &self,
+        out: &mut Chunk,
+        chunk_world_y0: i32,
+        solid_mask: Option<&[bool; CHUNK_VOLUME]>,
+    ) {
+        let local_ys = self.flood_local_ys(chunk_world_y0);
+        if local_ys.is_empty() {
+            return;
+        }
+        let blocks = out.blocks.make_flat_mut();
+        let data = Arc::make_mut(&mut out.block_data);
+        let sea_data = fluid_data_make_static(0, false);
+        for local_y in local_ys {
+            let layer = (local_y as usize) * CHUNK_Y_STRIDE;
+            for idx in layer..layer + COLUMN_COUNT {
+                if solid_mask.is_some_and(|mask| mask[idx]) {
+                    continue;
+                }
+                blocks[idx] = BlockId::WaterStill;
+                data[idx] = sea_data;
+            }
+        }
     }
 }
 
