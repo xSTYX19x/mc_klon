@@ -235,13 +235,18 @@ fn should_emit_bottom_slab_face(
     if !neighbor.is_voxel_filled() {
         return true;
     }
-    if matches!(
-        texture_lookup.model_for(current),
-        BlockModel::LayerBottom { .. }
-    ) && current == neighbor
+    if let BlockModel::LayerBottom { height_px } = texture_lookup.model_for(current)
+        && current == neighbor
         && matches!(face, Face::North | Face::South | Face::East | Face::West)
     {
-        return false;
+        // Snow beside snow: the side only shows where this one is taller.
+        let own = texture_lookup
+            .layer_height_px_in(current, height_px, || world.get_block_data(current_pos));
+        let theirs = texture_lookup
+            .layer_height_px_in(neighbor, height_px, || world.get_block_data(neighbor_pos));
+        if theirs >= own {
+            return false;
+        }
     }
 
     let neighbor_info = texture_lookup.info_for(neighbor);
@@ -287,106 +292,140 @@ fn append_partial_blocks_in_chunk(
         for z in 0..CHUNK_SIZE {
             for x in 0..CHUNK_SIZE {
                 let id = chunk.get(x, y, z);
-                let info = texture_lookup.info_for(id);
-                let layer_height = match info.model {
-                    BlockModel::SlabBottom => 8u8,
-                    BlockModel::LayerBottom { height_px } => height_px,
-                    BlockModel::InsetSides { inset_px } => {
-                        if requested_layers.contains_render_layer(info.render_layer) {
-                            append_inset_sides_block(
-                                world,
-                                texture_lookup,
-                                (id, inset_px),
-                                [x, y, z],
-                                chunk_origin,
-                                chunk_offset,
-                                &faces,
-                                layered,
-                            );
-                        }
-                        continue;
-                    }
-                    _ => continue,
-                };
-                if !id.is_voxel_filled() {
-                    continue;
-                }
-                let render_layer = info.render_layer;
-                if !requested_layers.contains_render_layer(render_layer) {
-                    continue;
-                }
-                let top = texture_lookup.is_top_in(id, || chunk.get_data(x, y, z));
-                let layer_height_f = layer_height as f32 / 16.0;
-                let render_bounds = if top {
-                    RenderBounds::top_layer(layer_height_f)
-                } else {
-                    RenderBounds::bottom_layer(layer_height_f)
-                };
-                let base_y = render_bounds.min[1];
-
-                let world_pos = chunk_origin + IVec3::new(x, y, z);
-                for (face, quad) in faces {
-                    if !should_emit_bottom_slab_face(
+                if matches!(
+                    texture_lookup.model_for(id),
+                    BlockModel::SlabBottom | BlockModel::LayerBottom { .. } | BlockModel::InsetSides { .. }
+                ) {
+                    append_partial_block(
                         world,
+                        chunk,
                         texture_lookup,
-                        world_pos,
-                        id,
-                        face,
-                        top,
-                    ) {
-                        continue;
-                    }
-
-                    let mesh = layered.mesh_mut(render_layer);
-                    let base_index = mesh.vertices.len() as u32;
-                    let tex_layer = texture_lookup.layer_for(id, face);
-                    let tint_kind = texture_lookup.tint_kind_for(id, face);
-                    let mut quad_uvs = face_uvs_for_quad(face, quad);
-                    if matches!(face, Face::North | Face::South | Face::East | Face::West) {
-                        for uv in &mut quad_uvs {
-                            uv[1] *= layer_height_f;
-                        }
-                    }
-
-                    for (corner_index, p) in quad.iter().enumerate() {
-                        let vertex_local = [
-                            p[0] as f32,
-                            base_y + p[1] as f32 * layer_height_f,
-                            p[2] as f32,
-                        ];
-                        let (shade, light_packed) = face_vertex_shade_and_light(
-                            world,
-                            world_pos,
-                            face,
-                            render_bounds,
-                            vertex_local,
-                        );
-                        mesh.vertices.push(WorldVertex {
-                            position: [
-                                x as f32 + vertex_local[0] + chunk_offset[0],
-                                y as f32 + vertex_local[1] + chunk_offset[1],
-                                z as f32 + vertex_local[2] + chunk_offset[2],
-                            ],
-                            uv: pack_uv(quad_uvs[corner_index][0], quad_uvs[corner_index][1]),
-                            tex_layer,
-                            shade: pack_shade(shade),
-                            tint_kind: tint_kind as u8,
-                            light_packed: light_packed as u8,
-                            _pad: 0,
-                        });
-                    }
-
-                    mesh.indices.extend_from_slice(&[
-                        base_index,
-                        base_index + 1,
-                        base_index + 2,
-                        base_index,
-                        base_index + 2,
-                        base_index + 3,
-                    ]);
+                        (id, [x, y, z]),
+                        (chunk_origin, chunk_offset),
+                        requested_layers,
+                        &faces,
+                        layered,
+                    );
                 }
             }
         }
+    }
+}
+
+/// One block of `append_partial_blocks_in_chunk`. Kept out of line and cold:
+/// in the scan loop, any per-block code here slowed the pass by 2-5 %
+/// (`greedy_ao_merge_report`), and partial blocks are rare outside winter.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn append_partial_block(
+    world: &impl BlockAccess,
+    chunk: &crate::world::Chunk,
+    texture_lookup: &BlockTextureLookup,
+    (id, [x, y, z]): (BlockId, [i32; 3]),
+    (chunk_origin, chunk_offset): (IVec3, [f32; 3]),
+    requested_layers: MeshLayerMask,
+    faces: &[(Face, [[i32; 3]; 4]); 6],
+    layered: &mut LayeredChunkGeometry,
+) {
+    let info = texture_lookup.info_for(id);
+    let layer_height = match info.model {
+        BlockModel::SlabBottom => 8u8,
+        BlockModel::LayerBottom { height_px } => texture_lookup
+            .layer_height_px_in(id, height_px, || chunk.get_data(x, y, z)),
+        BlockModel::InsetSides { inset_px } => {
+            if requested_layers.contains_render_layer(info.render_layer) {
+                append_inset_sides_block(
+                    world,
+                    texture_lookup,
+                    (id, inset_px),
+                    [x, y, z],
+                    chunk_origin,
+                    chunk_offset,
+                    faces,
+                    layered,
+                );
+            }
+            return;
+        }
+        _ => return,
+    };
+    if !id.is_voxel_filled() {
+        return;
+    }
+    let render_layer = info.render_layer;
+    if !requested_layers.contains_render_layer(render_layer) {
+        return;
+    }
+    let top = texture_lookup.is_top_in(id, || chunk.get_data(x, y, z));
+    let layer_height_f = layer_height as f32 / 16.0;
+    let render_bounds = if top {
+        RenderBounds::top_layer(layer_height_f)
+    } else {
+        RenderBounds::bottom_layer(layer_height_f)
+    };
+    let base_y = render_bounds.min[1];
+
+    let world_pos = chunk_origin + IVec3::new(x, y, z);
+    for &(face, quad) in faces {
+        if !should_emit_bottom_slab_face(
+            world,
+            texture_lookup,
+            world_pos,
+            id,
+            face,
+            top,
+        ) {
+            continue;
+        }
+
+        let mesh = layered.mesh_mut(render_layer);
+        let base_index = mesh.vertices.len() as u32;
+        let tex_layer = texture_lookup.layer_for(id, face);
+        let tint_kind = texture_lookup.tint_kind_for(id, face);
+        let mut quad_uvs = face_uvs_for_quad(face, quad);
+        if matches!(face, Face::North | Face::South | Face::East | Face::West) {
+            for uv in &mut quad_uvs {
+                uv[1] *= layer_height_f;
+            }
+        }
+
+        for (corner_index, p) in quad.iter().enumerate() {
+            let vertex_local = [
+                p[0] as f32,
+                base_y + p[1] as f32 * layer_height_f,
+                p[2] as f32,
+            ];
+            let (shade, light_packed) = face_vertex_shade_and_light(
+                world,
+                world_pos,
+                face,
+                render_bounds,
+                vertex_local,
+            );
+            mesh.vertices.push(WorldVertex {
+                position: [
+                    x as f32 + vertex_local[0] + chunk_offset[0],
+                    y as f32 + vertex_local[1] + chunk_offset[1],
+                    z as f32 + vertex_local[2] + chunk_offset[2],
+                ],
+                uv: pack_uv(quad_uvs[corner_index][0], quad_uvs[corner_index][1]),
+                tex_layer,
+                shade: pack_shade(shade),
+                tint_kind: tint_kind as u8,
+                light_packed: light_packed as u8,
+                _pad: 0,
+            });
+        }
+
+        mesh.indices.extend_from_slice(&[
+            base_index,
+            base_index + 1,
+            base_index + 2,
+            base_index,
+            base_index + 2,
+            base_index + 3,
+        ]);
     }
 }
 
@@ -2727,6 +2766,45 @@ mod simd_uv_tests {
                 [(side, 4.0), (front, 5.0)],
                 "{path}: north side of the pair"
             );
+        }
+    }
+
+    /// Snow is as tall as its layers, and between two snow cells only the
+    /// taller one's side shows.
+    #[test]
+    fn snow_meshes_at_its_layer_height_and_hides_sides_behind_taller_snow() {
+        use crate::blocks::BlockId;
+        use crate::blocks::state::SNOW_LAYERS;
+
+        let mut world = World::new();
+        let low = IVec3::new(4, 5, 4);
+        let high = low + IVec3::X;
+        for pos in [low, high] {
+            world.set_block(pos - IVec3::Y, BlockId::Stone).unwrap();
+        }
+        world
+            .set_block_state(low, SNOW_LAYERS.with(BlockId::Snow.into(), 2))
+            .unwrap();
+        world
+            .set_block_state(high, SNOW_LAYERS.with(BlockId::Snow.into(), 4))
+            .unwrap();
+        for (path, layered) in mesh_both_paths(&world) {
+            let quads: Vec<&[WorldVertex]> = layered.opaque.vertices.chunks_exact(4).collect();
+            let flat_at = |y: f32, x0: f32| {
+                quads.iter().any(|quad| {
+                    quad.iter().all(|v| {
+                        (v.position[1] - y).abs() < 1e-4 && (x0..=x0 + 1.0).contains(&v.position[0])
+                    })
+                })
+            };
+            assert!(flat_at(5.25, 4.0), "{path}: two layers end at 2/8 block");
+            assert!(flat_at(5.5, 5.0), "{path}: four layers end at half a block");
+            let shared: Vec<f32> = quads
+                .iter()
+                .filter(|quad| quad.iter().all(|v| (v.position[0] - 5.0).abs() < 1e-4))
+                .map(|quad| quad.iter().map(|v| v.position[1]).fold(f32::MIN, f32::max))
+                .collect();
+            assert_eq!(shared, [5.5], "{path}: only the taller snow's side at x = 5");
         }
     }
 

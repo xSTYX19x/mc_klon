@@ -1,12 +1,15 @@
 use glam::IVec3;
 
-use crate::blocks::{BlockRegistry, BlockState};
+use crate::blocks::{BlockRegistry, BlockState, RandomTickContext};
+use crate::world::PrecipitationKind;
 use crate::sim::{ActiveSimColumns, ColumnCoord, SimSystem};
 use crate::util::rng::{Rng64, hash64};
 use crate::world::{CHUNK_SIZE, ChunkCoord, World};
 
 pub(crate) struct RandomTicksSystem {
     pub(crate) ticks_per_chunk: u32,
+    /// Set by `State` before each tick (`set_precipitation`).
+    precipitation: Option<PrecipitationKind>,
     active_chunks: Vec<ChunkCoord>,
     sampled_last_tick: usize,
     callbacks_last_tick: usize,
@@ -16,10 +19,16 @@ impl RandomTicksSystem {
     pub(crate) fn new(ticks_per_chunk: u32) -> Self {
         Self {
             ticks_per_chunk,
+            precipitation: None,
             active_chunks: Vec::new(),
             sampled_last_tick: 0,
             callbacks_last_tick: 0,
         }
+    }
+
+    /// The precipitation the next ticks see (snow layers grow while it snows).
+    pub(crate) fn set_precipitation(&mut self, precipitation: Option<PrecipitationKind>) {
+        self.precipitation = precipitation;
     }
 
     pub(crate) fn debug_counters(&self) -> (u32, usize, usize) {
@@ -92,6 +101,10 @@ impl SimSystem for RandomTicksSystem {
         );
 
         let world_seed = world.seed();
+        let ctx = RandomTickContext {
+            tick_index,
+            precipitation: self.precipitation,
+        };
         for coord in self.active_chunks.iter().copied() {
             // Most sections (stone, air, plain dirt) hold nothing with a random
             // tick, so drawing samples there only costs time. The count is read
@@ -119,7 +132,7 @@ impl SimSystem for RandomTicksSystem {
                 let block = world.get_block(world_pos);
                 if let Some(random_tick) = BlockRegistry::get().random_tick_for(block) {
                     let state = BlockState::new(block, world.get_block_data(world_pos));
-                    random_tick(world, world_pos, state, tick_index);
+                    random_tick(world, world_pos, state, &ctx);
                     self.callbacks_last_tick += 1;
                 }
                 self.sampled_last_tick += 1;
@@ -161,7 +174,7 @@ mod tests {
                 let block = world.get_block(pos);
                 if let Some(random_tick) = registry.random_tick_for(block) {
                     let state = BlockState::new(block, world.get_block_data(pos));
-                    random_tick(world, pos, state, tick_index);
+                    random_tick(world, pos, state, &RandomTickContext::at(tick_index));
                 }
             }
         }

@@ -4,25 +4,28 @@ use std::fmt;
 use glam::{IVec3, Vec3};
 
 use crate::registry::NamespacedKey;
-use crate::world::World;
 use crate::world::block_updates_system::BlockTicks;
+use crate::world::{PrecipitationKind, World};
 use crate::world::fluids::FluidKind;
 
 mod falling;
 pub(crate) mod placement;
 pub(crate) mod plants;
 pub(crate) mod state;
+pub(crate) mod winter;
 
 use placement::{OnPlaceFn, front_toward_placer, slab_on_place};
 use plants::{
     cactus_neighbor_changed, cactus_on_place, column_plant_random_tick, mushroom_random_tick,
     sugar_cane_neighbor_changed, sugar_cane_on_place,
 };
+use winter::{ice_random_tick, snow_on_place, snow_random_tick};
 pub(crate) use state::BlockState;
 use state::views::{Facing4, Half};
 use state::{
     FLUID_PROPERTIES, FURNACE_FACING, FURNACE_PROPERTIES, PLANT_AGE_PROPERTIES, Property,
-    PropertySpec, SAPLING_PROPERTIES, SAPLING_STAGE, SLAB_HALF, SLAB_PROPERTIES, StateForm,
+    PropertySpec, SAPLING_PROPERTIES, SAPLING_STAGE, SLAB_HALF, SLAB_PROPERTIES, SNOW_LAYERS,
+    SNOW_PROPERTIES, StateForm,
 };
 
 pub(crate) const TEX_STONE: &str = "minecraft:textures/block/stone.png";
@@ -110,13 +113,36 @@ pub(crate) const TEXTURE_SELF_TEST_KEYS: [&str; 3] = [
     "minecraft:textures/block/torch.png",
 ];
 
+/// Ground slipperiness of ordinary blocks (`BlockSpec::slipperiness`).
+pub(crate) const DEFAULT_SLIPPERINESS: f32 = 0.6;
+
 pub(crate) const TINT_NONE: u32 = 0;
 pub(crate) const TINT_GRASS_TOP: u32 = 1;
 pub(crate) const TINT_WATER: u32 = 2;
 
 /// A block's random-tick hook: the world, the block's position, its current
-/// state there, and the tick index.
-pub(crate) type RandomTickFn = fn(&mut World, IVec3, BlockState, u64);
+/// state there, and what else the tick knows.
+pub(crate) type RandomTickFn = fn(&mut World, IVec3, BlockState, &RandomTickContext);
+
+/// What a random tick knows besides the world: the tick, and the precipitation
+/// falling right now (`State::active_precipitation_kind`, handed over by
+/// `RandomTicksSystem`; there is no weather system yet).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RandomTickContext {
+    pub(crate) tick_index: u64,
+    pub(crate) precipitation: Option<PrecipitationKind>,
+}
+
+#[cfg(test)]
+impl RandomTickContext {
+    /// A dry tick.
+    pub(crate) const fn at(tick_index: u64) -> Self {
+        Self {
+            tick_index,
+            precipitation: None,
+        }
+    }
+}
 
 /// A block's reaction to a change in a neighboring cell, or in its own cell
 /// (`from == pos`, a block arriving — Vanilla `onPlace`): the world, the
@@ -303,6 +329,16 @@ impl BlockAabb {
         Self { min, max }
     }
 
+    /// This box from the floor up, `layers` times as tall (at most the cell).
+    const fn stacked(self, layers: u8) -> Self {
+        let height = self.max[1] as u16 * layers as u16;
+        let height = if height > 16 { 16 } else { height as u8 };
+        Self {
+            min: [self.min[0], 0, self.min[2]],
+            max: [self.max[0], height, self.max[2]],
+        }
+    }
+
     pub(crate) fn world_bounds(self, cell: IVec3) -> (Vec3, Vec3) {
         let base = Vec3::new(cell.x as f32, cell.y as f32, cell.z as f32);
         let min = base
@@ -359,6 +395,14 @@ impl CollisionShape {
     pub(crate) const fn moved_to_top_half(self) -> Self {
         match self {
             CollisionShape::SlabBottom => CollisionShape::SlabTop,
+            other => other,
+        }
+    }
+
+    /// A one-layer box stacked `layers` high (snow, `StateForm::layers`).
+    pub(crate) const fn stacked(self, layers: u8) -> Self {
+        match self {
+            CollisionShape::Aabb(bounds) => CollisionShape::Aabb(bounds.stacked(layers)),
             other => other,
         }
     }
@@ -604,6 +648,9 @@ struct BlockSpec {
     /// Drops onto the first solid block below when unsupported (sand,
     /// gravel). Stands in for both hooks above with the ones in `falling.rs`.
     falls: bool,
+    /// Vanilla's ground slipperiness: walking speed carries over between
+    /// ticks by `slipperiness × 0.91`; 0.6 for most blocks, 0.98 for ice.
+    slipperiness: f32,
     /// Position in the creative palette (`CLASSIC_PALETTE`); `None` keeps the
     /// block out of it.
     creative_order: Option<u16>,
@@ -646,6 +693,7 @@ impl BlockSpec {
             on_neighbor_changed: None,
             on_scheduled_tick: None,
             falls: false,
+            slipperiness: DEFAULT_SLIPPERINESS,
             creative_order: None,
             properties: &[],
             form: StateForm::FIXED,
@@ -803,6 +851,18 @@ impl BlockSpec {
     /// upper half of the cell. The property must be in `with_properties`.
     const fn with_shape_half(mut self, half: Property<Half>) -> Self {
         self.form = self.form.with_half(half);
+        self
+    }
+
+    /// Shape and model are `layers` times the model's `height_px` tall. The
+    /// property must be in `with_properties`.
+    const fn with_layers(mut self, layers: Property<u8>) -> Self {
+        self.form = self.form.with_layers(layers);
+        self
+    }
+
+    const fn with_slipperiness(mut self, slipperiness: f32) -> Self {
+        self.slipperiness = slipperiness;
         self
     }
 
@@ -1297,7 +1357,10 @@ blocks! {
     .with_creative_order(34),
     Ice => BlockSpec::cube("minecraft:ice", "Ice", TEX_ICE, [0.74, 0.86, 0.96])
         .with_layer(RenderLayer::Transparent)
-        .non_occluding(),
+        .non_occluding()
+        .with_slipperiness(0.98)
+        .with_random_tick(ice_random_tick)
+        .with_creative_order(57),
     Snow => BlockSpec::new(
         "minecraft:snow", "Snow",
         BlockModelSpec::LayerBottomTopSideBottom {
@@ -1308,7 +1371,12 @@ blocks! {
         },
         [0.96, 0.97, 1.0],
     )
-    .non_occluding(),
+    .non_occluding()
+    .with_properties(&SNOW_PROPERTIES)
+    .with_layers(SNOW_LAYERS)
+    .with_on_place(snow_on_place)
+    .with_random_tick(snow_random_tick)
+    .with_creative_order(56),
     DiamondOre => BlockSpec::cube(
         "minecraft:diamond_ore", "Diamond Ore", TEX_DIAMOND_ORE, [0.46, 0.54, 0.54],
     )
@@ -1955,6 +2023,23 @@ impl BlockTextureLookup {
         }
     }
 
+    /// Height in pixels of a `LayerBottom` block in that state: the model's
+    /// `height_px` times the `layers` count for blocks with one (snow).
+    #[inline(always)]
+    pub(crate) fn layer_height_px_in(
+        &self,
+        block: BlockId,
+        height_px: u8,
+        data: impl FnOnce() -> u8,
+    ) -> u8 {
+        let form = self.forms[block.to_u8() as usize];
+        if form.has_layers() {
+            (u16::from(height_px) * u16::from(form.layers(data()))).min(16) as u8
+        } else {
+            height_px
+        }
+    }
+
     /// Whether `block` sits in the upper half of its cell in that state.
     #[inline(always)]
     pub(crate) fn is_top_in(&self, block: BlockId, data: impl FnOnce() -> u8) -> bool {
@@ -2068,6 +2153,11 @@ impl BlockId {
         block_spec_for(self).solid
     }
 
+    /// Vanilla's ground slipperiness (`BlockSpec::slipperiness`).
+    pub(crate) fn slipperiness(self) -> f32 {
+        block_spec_for(self).slipperiness
+    }
+
     /// The block's hooks in the block-update system; falling blocks use the
     /// fall hooks.
     pub(crate) fn behavior(self) -> BlockBehavior {
@@ -2155,7 +2245,8 @@ pub(crate) fn grass_survives_under(above: BlockId) -> bool {
         ))
 }
 
-fn grass_random_tick(world: &mut World, pos: IVec3, _state: BlockState, tick_index: u64) {
+fn grass_random_tick(world: &mut World, pos: IVec3, _state: BlockState, ctx: &RandomTickContext) {
+    let tick_index = ctx.tick_index;
     let above = pos + IVec3::Y;
     if !World::in_bounds(above)
         || world
@@ -2439,7 +2530,8 @@ fn place_sapling_tree(world: &mut World, sapling_pos: IVec3, trunk: &[IVec3], le
     }
 }
 
-fn sapling_random_tick(world: &mut World, pos: IVec3, state: BlockState, tick_index: u64) {
+fn sapling_random_tick(world: &mut World, pos: IVec3, state: BlockState, ctx: &RandomTickContext) {
+    let tick_index = ctx.tick_index;
     if !World::in_bounds(pos) || world.get_block(pos) != BlockId::Sapling {
         return;
     }
@@ -2569,8 +2661,8 @@ mod tests {
         TEX_CRAFTING_TABLE_FRONT, TEX_FURNACE_FRONT, TEX_FURNACE_FRONT_ON, block_spec_for,
         grass_random_tick, sapling_random_tick,
     };
-    use crate::blocks::BlockState;
     use crate::blocks::state::SAPLING_STAGE;
+    use crate::blocks::{BlockState, RandomTickContext};
     use crate::world::{CHUNK_SIZE, Chunk, ChunkCoord, World};
 
     #[test]
@@ -2706,7 +2798,7 @@ mod tests {
         world.set_block(pos, BlockId::Grass).unwrap();
         world.set_block(above, BlockId::Stone).unwrap();
 
-        grass_random_tick(&mut world, pos, BlockId::Grass.into(), 0);
+        grass_random_tick(&mut world, pos, BlockId::Grass.into(), &RandomTickContext::at(0));
 
         assert_eq!(world.get_block(pos), BlockId::Dirt);
     }
@@ -2758,7 +2850,7 @@ mod tests {
         while world.get_block(sapling) == BlockId::Sapling {
             assert!(tick < 10_000, "the sapling never grew");
             let state = world.get_block_state(sapling);
-            sapling_random_tick(&mut world, sapling, state, tick);
+            sapling_random_tick(&mut world, sapling, state, &RandomTickContext::at(tick));
             tick += 1;
         }
         world.drain_block_changes(&mut journal);

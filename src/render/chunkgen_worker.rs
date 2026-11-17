@@ -12,6 +12,7 @@ use glam::IVec3;
 use crate::blocks::plants::{
     COLUMN_PLANT_MAX_HEIGHT, MUSHROOM_MAX_LIGHT, cactus_can_stay, sugar_cane_can_stay,
 };
+use crate::blocks::winter::ICE_MELT_MIN_BLOCK_LIGHT;
 use crate::blocks::{BlockId, grass_survives_under};
 use crate::meshing::{CpuMeshData, FULLBRIGHT_LIGHT_PACKED, Vertex};
 use crate::perf::trace as perf_trace;
@@ -2173,6 +2174,41 @@ fn water_touches_gravel(column: &ColumnBuffer, local_x: i32, y: i32, local_z: i3
         })
 }
 
+/// Whether a light source in this column could light the cell to `min_light`
+/// once the column is lit: block light loses one per step, so a source of
+/// level `L` within `L - min_light` steps might, walls ignored (errs towards
+/// yes). Keeps worldgen from freezing water that the ice melt rule would undo
+/// right after loading. Sources in the neighboring columns are not visible
+/// here.
+fn block_light_may_reach(
+    column: &ColumnBuffer,
+    local_x: i32,
+    y: i32,
+    local_z: i32,
+    min_light: u8,
+) -> bool {
+    let reach = 15 - i32::from(min_light);
+    for dy in -reach..=reach {
+        for dz in -reach..=reach {
+            for dx in -reach..=reach {
+                let steps = dx.abs() + dy.abs() + dz.abs();
+                if steps > reach {
+                    continue;
+                }
+                let (x, z) = (local_x + dx, local_z + dz);
+                if !(0..CHUNK_SIZE).contains(&x) || !(0..CHUNK_SIZE).contains(&z) {
+                    continue;
+                }
+                let emitted = i32::from(column.get_block(x, y + dy, z).emitted_light());
+                if emitted - steps >= i32::from(min_light) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct WinterColumnPassStats {
     snow_layers: u32,
@@ -2192,7 +2228,9 @@ fn apply_winter_surface_to_column(column: &mut ColumnBuffer) -> WinterColumnPass
                 if matches!(block, BlockId::WaterStill | BlockId::WaterFlowing)
                     && above == BlockId::Air
                 {
-                    if water_touches_gravel(column, local_x, y, local_z) {
+                    if water_touches_gravel(column, local_x, y, local_z)
+                        || block_light_may_reach(column, local_x, y, local_z, ICE_MELT_MIN_BLOCK_LIGHT)
+                    {
                         break;
                     }
                     column_set_block(column, local_x, y, local_z, BlockId::Ice);
@@ -3255,6 +3293,25 @@ mod tests {
         assert_eq!(column.get_block(7, 62, 8), BlockId::Ice);
         assert_eq!(stats.snow_layers, 1);
         assert_eq!(stats.ice_blocks, 1);
+    }
+
+    /// Water within reach of lava stays liquid, so the ice melt rule does
+    /// not undo the winter pass right after loading.
+    #[test]
+    fn winter_does_not_freeze_water_that_lava_would_melt() {
+        let mut column = ColumnBuffer::new();
+        for x in 2..=8 {
+            column.set_block(x, 62, 8, BlockId::WaterStill);
+        }
+        column.set_block(1, 62, 8, BlockId::LavaStill);
+        apply_winter_surface_to_column(&mut column);
+        // Lava 15 lights the water to 14, 13, 12 over the first three cells.
+        for x in 2..=4 {
+            assert_eq!(column.get_block(x, 62, 8), BlockId::WaterStill, "x {x}");
+        }
+        for x in 5..=8 {
+            assert_eq!(column.get_block(x, 62, 8), BlockId::Ice, "x {x}");
+        }
     }
 
     #[test]

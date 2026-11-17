@@ -5,7 +5,8 @@
 use glam::{IVec3, Vec3};
 
 use super::state::views::{Facing4, Half};
-use super::state::{FURNACE_FACING, SLAB_HALF};
+use super::state::{FURNACE_FACING, SLAB_HALF, SNOW_LAYERS};
+use super::winter::SNOW_MAX_LAYERS;
 use super::{BlockId, BlockState, Face, block_spec_for};
 use crate::world::World;
 use crate::world::raycast::RaycastHit;
@@ -39,6 +40,18 @@ impl PlaceContext {
         }
     }
 
+    /// `from_hit` for placing `block`: a clicked block that `block` merges
+    /// into (snow onto snow, `can_place_into`) is the target itself, as in
+    /// Vanilla.
+    pub(crate) fn for_placing(world: &World, hit: &RaycastHit, yaw: f32, block: BlockId) -> Self {
+        let mut ctx = Self::from_hit(hit, yaw);
+        let clicked = world.get_block_state(hit.hit_block_pos);
+        if clicked.id == block && can_place_into(clicked, block) {
+            ctx.place_pos = hit.hit_block_pos;
+        }
+        ctx
+    }
+
     /// The horizontal direction the player looks along, from the yaw alone so
     /// it stays defined when looking straight up or down.
     pub(crate) fn look_facing(&self) -> Facing4 {
@@ -51,6 +64,17 @@ impl PlaceContext {
         } else {
             Facing4::North
         }
+    }
+}
+
+/// Whether placing `block` may write into a cell holding `existing`: air and
+/// water take anything, a snow layer below the maximum takes more snow
+/// (Vanilla `canBeReplaced`).
+pub(crate) fn can_place_into(existing: BlockState, block: BlockId) -> bool {
+    match existing.id {
+        BlockId::Air | BlockId::WaterStill | BlockId::WaterFlowing => true,
+        BlockId::Snow => block == BlockId::Snow && SNOW_LAYERS.get(existing) < SNOW_MAX_LAYERS,
+        _ => false,
     }
 }
 

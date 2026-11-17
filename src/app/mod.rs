@@ -39,7 +39,8 @@ use crate::render::state::{
 use crate::settings::{AppSettings, InputAction, SettingsScope, keycode_label};
 use crate::storage::world_meta::{self, PlayerSpawn};
 use crate::world::ticking_areas::{TICKING_AREA_MAX_RADIUS_CHUNKS, TickingArea, TickingFlags};
-use crate::world::{FluidKind, World, WorldEnvironment};
+use crate::world::environment::EnvironmentChoice;
+use crate::world::{FluidKind, World};
 use crate::worldgen::ClassicLevelSize;
 
 const BLOCK_ACTION_REPEAT_COOLDOWN_TICKS: f32 = 4.0;
@@ -76,6 +77,9 @@ const PAUSE_MENU_ITEMS: [&str; 6] = [
     "Exit to main menu",
 ];
 const OPTIONS_ROOT_ITEMS: [&str; 3] = ["General / Gameplay", "Video / Graphics", "Controls"];
+const NEW_LEVEL_ROW_ENVIRONMENT: usize = 0;
+const NEW_LEVEL_ROW_GENERATE: usize = 1;
+const NEW_LEVEL_ROW_COUNT: usize = 3;
 const OPTIONS_GAMEPLAY_ROW_FOV: usize = 1;
 const TICKING_EDIT_FLAG_ROWS: [(u32, &str); 4] = [
     (TickingFlags::KEEP_LOADED, "Keep loaded"),
@@ -218,6 +222,11 @@ enum GameState {
     Paused {
         selected: usize,
     },
+    /// "Generate new level": pick the environment, then generate.
+    NewLevel {
+        selected: usize,
+        environment: EnvironmentChoice,
+    },
     Options(OptionsMenuState),
     WorldActions(WorldActionsMenuState),
     TickingAreas(TickingAreaMenuState),
@@ -240,6 +249,7 @@ enum GameState {
 enum MenuScreen {
     MainMenu,
     PauseMenu,
+    NewLevel,
     LoadLevel,
     WorldActions(PathBuf),
     Options(OptionsScreen),
@@ -701,6 +711,7 @@ impl App {
         match &self.game_state {
             GameState::MainMenu { .. } => Some(MenuScreen::MainMenu),
             GameState::Paused { .. } => Some(MenuScreen::PauseMenu),
+            GameState::NewLevel { .. } => Some(MenuScreen::NewLevel),
             GameState::LoadLevelMenu { .. } => Some(MenuScreen::LoadLevel),
             GameState::Options(options) => Some(MenuScreen::Options(options.screen)),
             GameState::WorldActions(menu) => Some(MenuScreen::WorldActions(menu.save_root.clone())),
@@ -1327,6 +1338,10 @@ impl App {
             MenuScreen::PauseMenu => GameState::Paused {
                 selected: entry.selected,
             },
+            MenuScreen::NewLevel => GameState::NewLevel {
+                selected: entry.selected,
+                environment: EnvironmentChoice::default(),
+            },
             MenuScreen::LoadLevel => {
                 let worlds = self.saved_world_menu_entries();
                 GameState::LoadLevelMenu {
@@ -1372,6 +1387,7 @@ impl App {
         match &self.game_state {
             GameState::MainMenu { .. } => MAIN_MENU_ITEMS.len(),
             GameState::Paused { .. } => PAUSE_MENU_ITEMS.len(),
+            GameState::NewLevel { .. } => NEW_LEVEL_ROW_COUNT,
             GameState::LoadLevelMenu { worlds, .. } => worlds.len().max(1) + 1,
             GameState::Options(options) => options.screen.item_count(),
             GameState::WorldActions(_) => WORLD_ACTION_ROW_COUNT,
@@ -1384,6 +1400,7 @@ impl App {
         match &self.game_state {
             GameState::MainMenu { selected } => Some(*selected),
             GameState::Paused { selected } => Some(*selected),
+            GameState::NewLevel { selected, .. } => Some(*selected),
             GameState::LoadLevelMenu { selected, .. } => Some(*selected),
             GameState::Options(options) => Some(options.selected),
             GameState::WorldActions(menu) => Some(menu.selected),
@@ -1396,6 +1413,9 @@ impl App {
         match &mut self.game_state {
             GameState::MainMenu { selected: current } => *current = selected,
             GameState::Paused { selected: current } => *current = selected,
+            GameState::NewLevel {
+                selected: current, ..
+            } => *current = selected,
             GameState::LoadLevelMenu {
                 selected: current, ..
             } => *current = selected,
@@ -1486,8 +1506,7 @@ impl App {
     }
 
     fn start_new_default_level_generation(&mut self) {
-        let request =
-            self.make_worldgen_request(ClassicLevelSize::Normal, WorldEnvironment::Temperate);
+        let request = self.make_worldgen_request(ClassicLevelSize::Normal, EnvironmentChoice::Random);
         if !self.start_new_level_generation(request) {
             crate::console_info!("new level generation is already running");
         }
@@ -1648,7 +1667,7 @@ impl App {
             _ => return,
         };
         match selected {
-            0 => self.start_new_default_level_generation(),
+            0 => self.push_menu_screen(MenuScreen::NewLevel),
             1 => self.push_menu_screen(MenuScreen::LoadLevel),
             2 => self.push_menu_screen(MenuScreen::Options(OptionsScreen::Root)),
             3 => event_loop.exit(),
@@ -1664,7 +1683,7 @@ impl App {
 
         match selected {
             0 => self.leave_pause(),
-            1 => self.start_new_default_level_generation(),
+            1 => self.push_menu_screen(MenuScreen::NewLevel),
             2 => self.push_menu_screen(MenuScreen::LoadLevel),
             3 => {
                 let spawn = self.current_player_spawn();
@@ -1693,6 +1712,45 @@ impl App {
                 .map(|entry| entry.summary.save_root.clone()),
             _ => None,
         }
+    }
+
+    fn activate_new_level_selected(&mut self) {
+        let GameState::NewLevel {
+            selected,
+            environment,
+        } = self.game_state
+        else {
+            return;
+        };
+        match selected {
+            NEW_LEVEL_ROW_ENVIRONMENT => {
+                self.apply_new_level_step(1);
+            }
+            NEW_LEVEL_ROW_GENERATE => {
+                let request = self.make_worldgen_request(ClassicLevelSize::Normal, environment);
+                if !self.start_new_level_generation(request) {
+                    crate::console_info!("new level generation is already running");
+                }
+            }
+            _ => {
+                self.pop_menu_screen();
+            }
+        }
+    }
+
+    /// Cycles the environment row; other rows have nothing to step.
+    fn apply_new_level_step(&mut self, delta: i32) -> bool {
+        let GameState::NewLevel {
+            selected: NEW_LEVEL_ROW_ENVIRONMENT,
+            environment,
+        } = &mut self.game_state
+        else {
+            return false;
+        };
+        let all = EnvironmentChoice::ALL;
+        let index = all.iter().position(|choice| choice == environment).unwrap_or(0);
+        *environment = all[(index as i32 + delta).rem_euclid(all.len() as i32) as usize];
+        true
     }
 
     fn activate_load_level_menu_selected(&mut self) {
@@ -1967,6 +2025,7 @@ impl App {
         match self.game_state {
             GameState::Options(_) => self.apply_selected_option_step(delta),
             GameState::TickingAreas(_) => self.apply_ticking_area_step(delta),
+            GameState::NewLevel { .. } => self.apply_new_level_step(delta),
             _ => false,
         }
     }
@@ -2365,6 +2424,28 @@ impl App {
                 sliders: MenuScreenContent::no_sliders(MAIN_MENU_ITEMS.len()),
                 show_panorama: true,
             }),
+            GameState::NewLevel {
+                selected,
+                environment,
+            } => {
+                let items = vec![
+                    format!("Environment: {}", environment.label()),
+                    "Generate".to_string(),
+                    "Back".to_string(),
+                ];
+                Some(MenuScreenContent {
+                    title: "Generate new level".to_string(),
+                    enabled: vec![true; items.len()],
+                    sliders: MenuScreenContent::no_sliders(items.len()),
+                    items,
+                    footer: Some(
+                        "Left/Right: environment. Random picks winter for 1 in 4 seeds."
+                            .to_string(),
+                    ),
+                    selected: *selected,
+                    show_panorama: self.is_main_menu(),
+                })
+            }
             GameState::LoadLevelMenu { selected, worlds } => {
                 let mut items = if worlds.is_empty() {
                     vec!["No saved levels found".to_string()]
@@ -2668,6 +2749,7 @@ impl App {
         match self.game_state {
             GameState::MainMenu { .. } => self.activate_main_menu_selected(event_loop),
             GameState::Paused { .. } => self.activate_pause_menu_selected(event_loop),
+            GameState::NewLevel { .. } => self.activate_new_level_selected(),
             GameState::LoadLevelMenu { .. } => self.activate_load_level_menu_selected(),
             GameState::Options(_) => self.activate_options_selected(),
             GameState::WorldActions(_) => self.activate_world_action_selected(),
@@ -2804,17 +2886,18 @@ impl App {
     fn make_worldgen_request(
         &self,
         classic_size: ClassicLevelSize,
-        environment: WorldEnvironment,
+        environment: EnvironmentChoice,
     ) -> WorldGenRequest {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
         let nanos = now.as_nanos() as u64;
+        let seed = nanos ^ (nanos.rotate_left(23));
         WorldGenRequest {
-            seed: nanos ^ (nanos.rotate_left(23)),
+            seed,
             params: WorldGenParams {
                 classic_size,
-                environment,
+                environment: environment.resolve(seed),
                 ..WorldGenParams::default()
             },
         }
@@ -4184,6 +4267,7 @@ impl ApplicationHandler for App {
                         | GameState::MainMenu { .. }
                         | GameState::LoadLevelMenu { .. }
                         | GameState::Paused { .. }
+                        | GameState::NewLevel { .. }
                         | GameState::Options(_)
                         | GameState::WorldActions(_)
                         | GameState::TickingAreas(_)

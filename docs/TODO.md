@@ -196,7 +196,10 @@ nächsten billiger macht:
     nicht** ab: `sky_params[0]` kommt ungefiltert aus
     `world_time.sky_brightness` (`:19807`). Kein Gewitter, kein Blitz, kein
     Wetterzyklus, kein Niederschlag je Biom; Wetter- und Zeitzustand werden
-    nicht gespeichert (siehe "Storage: Weltzeit und Wetterzustand").
+    nicht gespeichert (siehe "Storage: Weltzeit und Wetterzustand"). Seit
+    2026-11-17 sehen Random Ticks den aktiven Niederschlag
+    (`RandomTickContext::precipitation`, von `State` an `RandomTicksSystem`
+    gereicht): Schneeschichten wachsen bei Schneefall.
   - *Ziel:* Wetterzyklus mit zufälligen Dauern (klar/Regen/Gewitter),
     Niederschlagsart je Biom und Höhe (Regen/Schnee/keiner), Abdunklung des
     Himmelslichts im Shader, Blitz als kurzer Lichtblitz (als Entity später).
@@ -524,7 +527,9 @@ die 16 farbigen Wollblöcke (in der Vorlage nur weiß, Farben erst Beta 1.2),
 `Player::food_level`
 (`player/mod.rs:52`, gated heute `can_sprint_swim`, `:100`), die sechs
 Baum-Presets statt zwei Eichenformen, und `WorldEnvironment` als expliziter
-Weltparameter statt einer reinen Winter-Zufallsflagge.
+Weltparameter: "Generate new level" würfelt standardmäßig wie die Vorlage
+(1 von 4 Seeds Winter, `EnvironmentChoice::Random`), lässt aber auch
+Temperate oder Winter direkt wählen.
 
 ### Querschnitts-Voraussetzung: Block-States
 
@@ -641,8 +646,8 @@ Planken bzw. Stein — beim Modellbau bewusst so umsetzen.
   `CollisionShape::Aabb` höher als der Voxel, prüfen ob
   `move_with_collisions` das trägt), Leiter, Holz-/Eisentür (2 Blöcke hoch,
   `Half`+`Facing4`+`Open`), Schild (Boden/Wand + Textinhalt → Block-Entity),
-  Schneedecke mit Höhenstufen 1-8, Ackerboden und Weizenpflanze
-  mit Wachstumsstufen (Random-Tick; beides fehlt heute ganz).
+  Ackerboden und Weizenpflanze mit Wachstumsstufen (Random-Tick; beides fehlt
+  heute ganz).
 - **Feuer** (neu 2026-11-17; in der Vorlage enthalten, fehlt heute ganz)
   - *Ist:* Es gibt keinen Feuer-Block, keine Brennbarkeit in `BlockSpec` und
     keine Zündquelle. Die Texturen `fire_0`/`fire_1` (animiert, `.mcmeta`)
@@ -1596,16 +1601,17 @@ Alles hier gehört in die dokumentierte Phasenreihenfolge aus
   `worldgen/ores.rs`). Kein neuer Nachbearbeitungspass, sondern dieselbe
   Technik. Blockiert zusätzlich durch Spawner (Block-Entity) und Truhen
   (Inhalt) — der Raum selbst kann aber vorher stehen
-- **Winterwelten als Welterstellungs-Option mit 25 % Chance**.
-  `WorldEnvironment::Winter` und der Schnee-/Eis-Pass
-  (`apply_winter_surface_to_column`, `chunkgen_worker.rs:1705`) existieren
-  bereits und werden aus `world.meta` gelesen — offen ist nur die zufällige
-  Auswahl bei "Generate new level" statt einer expliziten Einstellung
-- **Schneefall lässt die Schneedecke wachsen**. Braucht den geschichteten
-  Schneeblock (Block-States) und einen Random-Tick, der nur bei aktivem
-  `PrecipitationKind::Snow` greift. Der Random-Tick-Pfad ist da
-  (`RandomTicksSystem`), der Niederschlagszustand auch
-  (`State::active_precipitation_kind`, `render/state.rs:6228`)
+- **Schneedecke: Wachstumsgrenze belegen** (neu 2026-11-17). Schneefall lässt
+  Schneeschichten per Random Tick wachsen, bis `SNOW_GROWTH_MAX_LAYERS`
+  (`blocks/winter.rs`, heute 4 = halber Block). Die Grenze in a1.0.17 ist
+  nicht dokumentiert; sobald ein Beleg da ist, die Konstante anpassen.
+- **Winter-Pass: Eis neben Lava aus der Nachbarspalte** (neu 2026-11-17). Der
+  Winter-Pass friert Wasser nicht ein, das Lava im Umkreis von 3 Blöcken über
+  Blocklicht 11 bringt (`block_light_may_reach`), sonst taut die Eis-Regel es
+  direkt nach dem Laden wieder auf. Er sieht nur die eigene Spalte: Lava
+  jenseits der Spaltengrenze bleibt unberücksichtigt, solches Eis schmilzt
+  dann beim ersten Random Tick. Selten (Oberflächen-Lava neben Wasser an
+  einer Grenze); beheben erst, wenn der Worldgen Nachbarspalten sieht.
 ### Biome & Multi-Noise-Terrain
 
 Neu 2026-09-28. Zielbild laut Maintainer: Biome nach dem modernen

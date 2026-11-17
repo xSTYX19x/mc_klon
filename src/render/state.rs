@@ -40,7 +40,7 @@ use super::texture_anim::{
     resize_rgba_nearest,
 };
 use crate::assets::AssetSource;
-use crate::blocks::placement::{PlaceContext, placement_state};
+use crate::blocks::placement::{PlaceContext, can_place_into, placement_state};
 use crate::blocks::state::FLUID_SOURCE;
 use crate::blocks::{
     BlockId, BlockModel, BlockRegistry, BlockState, BlockTextureLookup, CullGroup, Face,
@@ -131,6 +131,9 @@ const CLASSIC_RAIN_MIN_LENGTH: f32 = 4.0;
 const CLASSIC_RAIN_MAX_LENGTH: f32 = 9.0;
 const WINTER_SURFACE_COLUMNS_PER_TICK: usize = 8;
 const WINTER_SURFACE_MAX_CHANGES_PER_TICK: usize = 2;
+/// Water freezes only below this block light (Vanilla 10); ice melts above 11
+/// (`blocks::ICE_MELT_MIN_BLOCK_LIGHT`), the gap keeps the two from flickering.
+const WATER_FREEZE_MAX_BLOCK_LIGHT: u8 = 10;
 
 #[derive(Clone, Copy, Debug)]
 struct PendingBlockEdit {
@@ -15625,11 +15628,16 @@ impl State {
         if !neighbor.id.is_voxel_filled() {
             return true;
         }
-        if matches!(current_info.model, BlockModel::LayerBottom { .. })
+        if let BlockModel::LayerBottom { height_px } = current_info.model
             && current.id == neighbor.id
             && matches!(face, Face::North | Face::South | Face::East | Face::West)
         {
-            return false;
+            let lookup = &self.block_texture_lookup;
+            let own = lookup.layer_height_px_in(current.id, height_px, || current.data);
+            let theirs = lookup.layer_height_px_in(neighbor.id, height_px, || neighbor.data);
+            if theirs >= own {
+                return false;
+            }
         }
         let required = match face {
             Face::Up | Face::Down => FaceCoverage::Full,
@@ -18893,7 +18901,11 @@ impl State {
                 if matches!(block, BlockId::WaterStill | BlockId::WaterFlowing)
                     && above_block == BlockId::Air
                 {
-                    if self.try_apply_environment_block_change(pos, BlockId::Ice) {
+                    // Vanilla `canBlockFreeze`: no freezing near a light
+                    // source, or the ice melt rule would undo it at once.
+                    if self.world.get_light(pos).block < WATER_FREEZE_MAX_BLOCK_LIGHT
+                        && self.try_apply_environment_block_change(pos, BlockId::Ice)
+                    {
                         ice_placed = ice_placed.saturating_add(1);
                     }
                     break;
@@ -18952,6 +18964,14 @@ impl State {
         let mut sim_changes = std::mem::take(&mut self.world_block_change_scratch);
         self.world.drain_block_changes(&mut sim_changes);
         self.forward_block_changes(&sim_changes, None);
+        let precipitation = self.active_precipitation_kind();
+        if let Some(random_ticks) = self
+            .random_ticks_system_index
+            .and_then(|idx| self.sim_systems.get_mut(idx))
+            .and_then(|system| system.as_any_mut().downcast_mut::<RandomTicksSystem>())
+        {
+            random_ticks.set_precipitation(precipitation);
+        }
         let active_set = &self.active_sim_columns;
         let is_active = |x: i32, z: i32| active_set.contains(&ColumnCoord { x, z });
         let active = ActiveSimColumns {
@@ -19369,15 +19389,10 @@ impl State {
             return;
         };
 
-        let place_ctx = PlaceContext::from_hit(&hit, camera.yaw);
+        let place_ctx = PlaceContext::for_placing(&self.world, &hit, camera.yaw, selected_block);
         let place_pos = place_ctx.place_pos;
         slow_coord = Some(place_pos);
-        let target_block = self.world.get_block(place_pos);
-        let can_replace_target = matches!(
-            target_block,
-            BlockId::Air | BlockId::WaterStill | BlockId::WaterFlowing
-        );
-        if target_block == BlockId::Bedrock || !can_replace_target {
+        if !can_place_into(self.world.get_block_state(place_pos), selected_block) {
             maybe_log_slow_block_edit(
                 "place",
                 edit_started.elapsed().as_secs_f32() * 1000.0,

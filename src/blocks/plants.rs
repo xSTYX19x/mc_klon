@@ -5,7 +5,7 @@ use glam::IVec3;
 
 use super::placement::PlaceContext;
 use super::state::PLANT_AGE;
-use super::{BlockId, BlockState};
+use super::{BlockId, BlockState, RandomTickContext};
 use crate::world::World;
 use crate::world::block_updates_system::BlockTicks;
 use crate::world::fluids::is_water;
@@ -57,7 +57,7 @@ pub(super) fn column_plant_random_tick(
     world: &mut World,
     pos: IVec3,
     state: BlockState,
-    _tick_index: u64,
+    _ctx: &RandomTickContext,
 ) {
     let above = pos + IVec3::Y;
     if !World::in_bounds(above) || world.get_block(above) != BlockId::Air {
@@ -129,7 +129,7 @@ pub(super) fn mushroom_random_tick(
     world: &mut World,
     pos: IVec3,
     _state: BlockState,
-    _tick_index: u64,
+    _ctx: &RandomTickContext,
 ) {
     let light = world.get_light(pos);
     if light.sky.max(light.block) > MUSHROOM_MAX_LIGHT {
@@ -148,7 +148,7 @@ mod tests {
 
     fn tick(world: &mut World, pos: IVec3) {
         let state = world.get_block_state(pos);
-        column_plant_random_tick(world, pos, state, 0);
+        column_plant_random_tick(world, pos, state, &RandomTickContext::at(0));
     }
 
     /// Ticks the top block of the column at `base` until nothing changes for
@@ -314,7 +314,7 @@ mod tests {
             {
                 set(&mut world, pos, mushroom);
                 world.set_light_packed(pos, LightLevel::new(sky, block).pack());
-                mushroom_random_tick(&mut world, pos, mushroom.into(), 0);
+                mushroom_random_tick(&mut world, pos, mushroom.into(), &RandomTickContext::at(0));
                 let expected = if survives { mushroom } else { BlockId::Air };
                 assert_eq!(world.get_block(pos), expected, "{mushroom:?} sky {sky} block {block}");
             }

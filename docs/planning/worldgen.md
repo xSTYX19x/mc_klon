@@ -110,7 +110,9 @@ The order in `StreamingWorldColumnGenerator` (`render/chunkgen_worker.rs`):
    (borders count as possibly lit from the neighbor column), so their random
    tick removes nothing after loading
 8. winter surface (winter worlds only): snow layers, ice on exposed water
-   except water touching gravel (Alpha's gravel beaches stay liquid)
+   except water touching gravel (Alpha's gravel beaches stay liquid) and water
+   a light source in the column would melt again (ice melts above block light
+   11)
 9. grass settle (always last): grass under a skylight blocker or a fluid becomes dirt, using the same rule as the grass random tick (`blocks::grass_survives_under`), so freshly generated terrain causes no random-tick edits after loading
 
 If future passes are added, they should fit into this ordered pipeline instead of bypassing it.

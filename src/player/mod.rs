@@ -17,6 +17,7 @@ use crate::config::render::{WATER_OVERLAY_ALPHA_MAX, WATER_OVERLAY_ALPHA_MIN};
 use crate::input::CameraController;
 use crate::meshing::{fluid_kind_at_point, liquid_height_at_point};
 use crate::world::fluids::{flow_velocity_at_point, fluid_kind};
+use crate::blocks::{BlockId, DEFAULT_SLIPPERINESS};
 use crate::world::{FluidKind, World};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -415,6 +416,24 @@ pub(crate) fn snap_to_ground_with_height(
     }
 }
 
+/// How much of the normal ground acceleration and braking a block gives.
+/// Vanilla carries walking speed over by `slipperiness × 0.91` per tick on
+/// the ground; as a per-second rate that scales with the log of the factor:
+/// 1.0 for ordinary blocks, about 0.19 for ice.
+fn ground_grip(slipperiness: f32) -> f32 {
+    (slipperiness * 0.91).ln() / (DEFAULT_SLIPPERINESS * 0.91).ln()
+}
+
+/// The block the player stands on: the cell just below the feet, so a slab
+/// or snow layer counts rather than the block under it.
+fn block_under_feet(world: &World, feet: Vec3) -> BlockId {
+    world.get_block(IVec3::new(
+        feet.x.floor() as i32,
+        (feet.y - 0.01).floor() as i32,
+        feet.z.floor() as i32,
+    ))
+}
+
 fn exp_approach(current: f32, target: f32, rate: f32, dt: f32) -> f32 {
     let alpha = 1.0 - (-rate.max(0.0) * dt.max(0.0)).exp();
     current + (target - current) * alpha
@@ -639,6 +658,11 @@ pub(crate) fn update_walk_movement(
     } else {
         PLAYER_TUNING_MINECRAFT.walk_decel_air
     };
+    if player.on_ground {
+        let grip = ground_grip(block_under_feet(world, player.feet_position).slipperiness());
+        accel_rate *= grip;
+        decel_rate *= grip;
+    }
     if fluid_state.wading_kind().is_some() {
         accel_rate *= WADING_ACCEL_MULT;
         decel_rate += WADING_EXTRA_DRAG;
@@ -1509,6 +1533,44 @@ mod tests {
             "player dropped while sneaking: y={}",
             player.feet_position.y
         );
+    }
+
+    /// Running at walking speed onto a floor and letting go: on ice the
+    /// player slides much farther than on stone.
+    #[test]
+    fn players_slide_farther_on_ice_than_on_stone() {
+        let slide_on = |floor: BlockId| {
+            let mut world = World::new();
+            for x in -2..60 {
+                for z in -2..3 {
+                    world.set_block(IVec3::new(x, 10, z), floor).unwrap();
+                }
+            }
+            let mut player = Player::from_eye_position(Vec3::new(0.5, 11.0 + EYE_HEIGHT, 0.5));
+            player.mode = MoveMode::Walk;
+            player.on_ground = true;
+            player.walk_velocity = Vec3::new(PLAYER_TUNING_MINECRAFT.walk_speed, 0.0, 0.0);
+            let start = player.feet_position.x;
+            let camera = Camera::default();
+            let mut controller = CameraController::new();
+            for _ in 0..600 {
+                let fluid_state = PlayerFluidState::sample(&world, &player);
+                update_walk_movement(
+                    &world,
+                    &camera,
+                    &mut controller,
+                    &mut player,
+                    &fluid_state,
+                    1.0 / 60.0,
+                );
+            }
+            assert!(player.walk_velocity.x.abs() < 0.01, "{floor:?}: still sliding");
+            player.feet_position.x - start
+        };
+        let stone = slide_on(BlockId::Stone);
+        let ice = slide_on(BlockId::Ice);
+        assert!(stone > 0.0);
+        assert!(ice > stone * 3.0, "ice {ice} vs stone {stone}");
     }
 
     #[test]

@@ -36,21 +36,13 @@ impl BlockState {
     }
 
     pub(crate) fn collision_shape(self) -> CollisionShape {
-        let shape = block_spec_for(self.id).collision_shape();
-        if self.is_top_half() {
-            shape.moved_to_top_half()
-        } else {
-            shape
-        }
+        let spec = block_spec_for(self.id);
+        spec.form.collision_shape_in(spec.collision_shape(), self.data)
     }
 
     pub(crate) fn raycast_shape(self) -> CollisionShape {
-        let shape = block_spec_for(self.id).raycast_shape();
-        if self.is_top_half() {
-            shape.moved_to_top_half()
-        } else {
-            shape
-        }
+        let spec = block_spec_for(self.id);
+        spec.form.collision_shape_in(spec.raycast_shape(), self.data)
     }
 
     /// Visibility/AO occlusion shape. This is intentionally separate from
@@ -313,6 +305,12 @@ pub(crate) const FLUID_PROPERTIES: [PropertySpec; 4] = [
 pub(crate) const PLANT_AGE: Property<u8> = views::age(0, 15);
 pub(crate) const PLANT_AGE_PROPERTIES: [PropertySpec; 1] = [PLANT_AGE.spec()];
 
+/// Snow layers, 1..=8 (raw 0 is one layer, so snow saved before block states
+/// loads as a single layer). Eight layers stay a snow layer block; the full
+/// `snow_block` is a block of its own.
+pub(crate) const SNOW_LAYERS: Property<u8> = views::snow_layers(0);
+pub(crate) const SNOW_PROPERTIES: [PropertySpec; 1] = [SNOW_LAYERS.spec()];
+
 /// Which half of its cell a slab fills. Bottom is raw 0, so slabs saved before
 /// block states load as bottom slabs.
 pub(crate) const SLAB_HALF: Property<views::Half> = views::half(0);
@@ -333,12 +331,16 @@ pub(crate) struct StateForm {
     /// A `Facing4` the side faces turn with; the model's south face points
     /// along it.
     facing_shift: Option<u8>,
+    /// A `layers` count (snow): shape and model are that many times the
+    /// model's `height_px` tall.
+    layers_shift: Option<u8>,
 }
 
 impl StateForm {
     pub(crate) const FIXED: Self = Self {
         half_shift: None,
         facing_shift: None,
+        layers_shift: None,
     };
 
     pub(crate) const fn with_half(mut self, half: Property<views::Half>) -> Self {
@@ -349,6 +351,39 @@ impl StateForm {
     pub(crate) const fn with_facing(mut self, facing: Property<views::Facing4>) -> Self {
         self.facing_shift = Some(facing.spec().shift);
         self
+    }
+
+    pub(crate) const fn with_layers(mut self, layers: Property<u8>) -> Self {
+        self.layers_shift = Some(layers.spec().shift);
+        self
+    }
+
+    /// The `layers` count in `data`, 1 for blocks without one.
+    #[inline(always)]
+    pub(crate) fn layers(self, data: u8) -> u8 {
+        match self.layers_shift {
+            Some(shift) => views::snow_layers(shift).get_data(data),
+            None => 1,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) const fn has_layers(self) -> bool {
+        self.layers_shift.is_some()
+    }
+
+    /// A collision or selection shape in the state with data byte `data`.
+    pub(crate) fn collision_shape_in(self, shape: CollisionShape, data: u8) -> CollisionShape {
+        let shape = if self.is_top(data) {
+            shape.moved_to_top_half()
+        } else {
+            shape
+        };
+        if self.has_layers() {
+            shape.stacked(self.layers(data))
+        } else {
+            shape
+        }
     }
 
     #[inline(always)]
@@ -650,6 +685,13 @@ mod tests {
                 assert!(
                     spec.properties.contains(&facing4(shift).spec()),
                     "{}: facing is not in the schema",
+                    spec.key
+                );
+            }
+            if let Some(shift) = spec.form.layers_shift {
+                assert!(
+                    spec.properties.contains(&snow_layers(shift).spec()),
+                    "{}: layers are not in the schema",
                     spec.key
                 );
             }
