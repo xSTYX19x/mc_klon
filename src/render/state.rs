@@ -96,6 +96,7 @@ use crate::storage::{
 use crate::texture::{TextureArray, decode_png_rgba};
 use crate::texture_registry::TextureRegistry;
 use crate::world::block_entities_system::BlockEntitiesSystem;
+use crate::world::block_updates_system::BlockUpdatesSystem;
 use crate::world::fluids::{
     FLUID_FIXED_STEP_SECONDS, FLUID_MAX_TICKS_PER_FRAME, FluidDebugCounts, FluidKind,
     fluid_data_is_falling, fluid_data_is_source_origin, fluid_data_is_worldgen_static,
@@ -149,9 +150,6 @@ enum BlockChangeSource {
     Player,
     /// Sim systems and environment ticks: edit pipeline only.
     Simulation,
-    /// Producers that already ran their own side effects (fluid mesh
-    /// coalescer, inline sand drop): the batch is dropped so nothing runs twice.
-    HandledInline,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -329,19 +327,6 @@ enum SavedLoadApplyTaskOutcome {
     Failed(String),
 }
 
-#[derive(Clone, Copy, Debug)]
-struct PendingSandGravityCheck {
-    origin: IVec3,
-    checked_base: bool,
-    next_y: i32,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct SandGravityResolveStats {
-    scanned: usize,
-    dropped: usize,
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 struct BlockEditTimings {
     raycast_ms: f32,
@@ -349,7 +334,6 @@ struct BlockEditTimings {
     lighting_ms: f32,
     mark_dirty_ms: f32,
     fluid_notify_ms: f32,
-    sand_gravity_ms: f32,
     particles_ms: f32,
 }
 
@@ -1009,7 +993,6 @@ impl BlockEditTimings {
                 "block_edit.notify_fluid_on_block_change",
                 self.fluid_notify_ms,
             ),
-            ("block_edit.sand_gravity_resolve", self.sand_gravity_ms),
             ("block_edit.spawn_particles", self.particles_ms),
         ] {
             if ms > top.1 {
@@ -1405,7 +1388,6 @@ const MESH_UPLOAD_LOG_THRESHOLD: Duration = Duration::from_millis(4);
 const BLOCK_EDIT_SIDEFX_BUDGET_MS: f32 = 1.5;
 const BLOCK_EDIT_SIDEFX_MAX_EDITS_PER_FRAME: usize = 8;
 const BLOCK_EDIT_PARTICLES_MAX_SPAWN_PER_FRAME: usize = 64;
-const BLOCK_EDIT_SAND_SCAN_STEPS_PER_FRAME: usize = 32;
 const BLOCK_EDIT_LIGHTING_MAX_VOXELS_PER_STEP: u64 = 4_096;
 const BLOCK_EDIT_LIGHTING_STEP_BUDGET_MS: f32 = 0.75;
 const BLOCK_EDIT_LIGHTING_FRAME_BUDGET_MS: f32 = 1.5;
@@ -5583,8 +5565,6 @@ pub(crate) struct State {
     next_block_edit_lighting_batch_id: u64,
     deferred_block_edits: HashMap<ChunkCoord, Vec<DeferredBlockEdit>>,
     deferred_block_edits_total: usize,
-    pending_sand_gravity_checks: VecDeque<PendingSandGravityCheck>,
-    pending_sand_gravity_check_set: HashSet<IVec3>,
     highlight_mesh: Option<ChunkMesh>,
     outline_target: Option<OutlineTarget>,
     outline_vertex_buffer: wgpu::Buffer,
@@ -6202,8 +6182,6 @@ impl State {
         self.next_block_edit_lighting_batch_id = 1;
         self.deferred_block_edits.clear();
         self.deferred_block_edits_total = 0;
-        self.pending_sand_gravity_checks.clear();
-        self.pending_sand_gravity_check_set.clear();
         self.mesh_upload_queue.clear();
         self.inflight.clear();
         self.mesh_jobs_outstanding = 0;
@@ -6300,6 +6278,11 @@ impl State {
         let _ = self.with_block_entities_system_mut(|block_entities, world| {
             block_entities.reset(world);
         });
+        for system in &mut self.sim_systems {
+            if let Some(block_updates) = system.as_any_mut().downcast_mut::<BlockUpdatesSystem>() {
+                block_updates.reset();
+            }
+        }
         self.fluid_accum = 0.0;
         self.sim_tick_index = 0;
         self.fluid_debug_counts = FluidDebugCounts::default();
@@ -10536,8 +10519,6 @@ impl State {
             next_block_edit_lighting_batch_id: 1,
             deferred_block_edits: HashMap::new(),
             deferred_block_edits_total: 0,
-            pending_sand_gravity_checks: VecDeque::new(),
-            pending_sand_gravity_check_set: HashSet::new(),
             highlight_mesh: None,
             outline_target: None,
             outline_vertex_buffer,
@@ -10771,6 +10752,8 @@ impl State {
         state.register_sim_system(Box::new(fluids_runtime));
         state.register_sim_system(Box::new(BlockEntitiesSystem::new()));
         state.register_sim_system(Box::new(RandomTicksSystem::new(RANDOM_TICK_SPEED_DEFAULT)));
+        // Last, so what the systems before it change is notified this tick.
+        state.register_sim_system(Box::new(BlockUpdatesSystem::new()));
         state.rebuild_boundary_ocean_mesh();
         state
     }
@@ -17623,15 +17606,34 @@ impl State {
     fn apply_world_block_changes(&mut self, source: BlockChangeSource) {
         let mut changes = std::mem::take(&mut self.world_block_change_scratch);
         self.world.drain_block_changes(&mut changes);
+        self.forward_block_changes(&changes, None);
         self.enqueue_world_block_changes(&changes, source);
         changes.clear();
         self.world_block_change_scratch = changes;
     }
 
-    fn enqueue_world_block_changes(&mut self, changes: &[BlockChange], source: BlockChangeSource) {
-        if source == BlockChangeSource::HandledInline {
+    /// Hands a drained journal batch to every sim system except the one that
+    /// made it (`SimSystem::on_block_changes`).
+    fn forward_block_changes(&mut self, changes: &[BlockChange], producer: Option<usize>) {
+        Self::forward_block_changes_to(&mut self.sim_systems, changes, producer);
+    }
+
+    fn forward_block_changes_to(
+        systems: &mut [Box<dyn SimSystem>],
+        changes: &[BlockChange],
+        producer: Option<usize>,
+    ) {
+        if changes.is_empty() {
             return;
         }
+        for (idx, system) in systems.iter_mut().enumerate() {
+            if producer != Some(idx) {
+                system.on_block_changes(changes);
+            }
+        }
+    }
+
+    fn enqueue_world_block_changes(&mut self, changes: &[BlockChange], source: BlockChangeSource) {
         for change in changes {
             if change.old == change.new && !change.new.data_changes_form() {
                 // Data-only (e.g. a sapling's growth stage): nothing to remesh
@@ -17639,6 +17641,13 @@ impl State {
                 // or a furnace facing changes the mesh, so those go on.
                 self.mark_column_dirty_for_chunk(World::world_to_chunk_coord(change.pos));
                 continue;
+            }
+            if source == BlockChangeSource::Simulation {
+                // What the player paths do after their own edits: a falling
+                // block can empty the chunk it leaves or fill a fresh one.
+                let coord = World::world_to_chunk_coord(change.pos);
+                self.mark_chunk_user_only_if_unknown(coord);
+                self.sync_generated_empty_chunk_marker(coord);
             }
             self.enqueue_pending_block_edit(
                 change.pos,
@@ -17671,74 +17680,6 @@ impl State {
         }
     }
 
-    fn enqueue_pending_sand_gravity_check(&mut self, pos: IVec3) {
-        if !World::in_bounds(pos) {
-            return;
-        }
-        if self.pending_sand_gravity_check_set.insert(pos) {
-            self.pending_sand_gravity_checks
-                .push_back(PendingSandGravityCheck {
-                    origin: pos,
-                    checked_base: false,
-                    next_y: (pos.y + 1).clamp(0, WORLD_MAX_Y),
-                });
-        }
-    }
-
-    fn process_pending_sand_gravity_check(
-        &mut self,
-        mut check: PendingSandGravityCheck,
-        max_steps: usize,
-    ) -> (
-        PendingSandGravityCheck,
-        SandGravityResolveStats,
-        usize,
-        bool,
-    ) {
-        let mut stats = SandGravityResolveStats::default();
-        let mut steps_used = 0usize;
-        if max_steps == 0 || !World::in_bounds(check.origin) {
-            return (check, stats, 0, true);
-        }
-
-        if !check.checked_base {
-            check.checked_base = true;
-            if self.world.get_block(check.origin) == BlockId::Sand {
-                stats.scanned += 1;
-                steps_used += 1;
-                if self.try_drop_sand_block(check.origin) {
-                    stats.dropped += 1;
-                }
-                if steps_used >= max_steps {
-                    return (check, stats, steps_used, false);
-                }
-            }
-        }
-
-        let x = check.origin.x;
-        let z = check.origin.z;
-        let mut y = check.next_y.clamp(0, WORLD_MAX_Y);
-        while y <= WORLD_MAX_Y {
-            let pos = IVec3::new(x, y, z);
-            if self.world.get_block(pos) != BlockId::Sand {
-                check.next_y = y;
-                return (check, stats, steps_used, true);
-            }
-            stats.scanned += 1;
-            steps_used += 1;
-            if self.try_drop_sand_block(pos) {
-                stats.dropped += 1;
-            }
-            y += 1;
-            check.next_y = y;
-            if steps_used >= max_steps {
-                return (check, stats, steps_used, y > WORLD_MAX_Y);
-            }
-        }
-
-        (check, stats, steps_used, true)
-    }
-
     fn process_pending_block_edit_side_effects(&mut self) {
         let _trace_scope = perf_trace::scope("proc.process_pending_block_edit_sidefx.work");
         let started = Instant::now();
@@ -17748,17 +17689,12 @@ impl State {
         let mut particles_spawned = 0usize;
         let mut particle_events = 0usize;
         let mut fluid_notifies = 0usize;
-        let mut sand_checks_processed = 0usize;
-        let mut sand_steps_used = 0usize;
-        let mut sand_scanned = 0usize;
-        let mut sand_dropped = 0usize;
         let mut lighting_changes = Vec::<ClassifiedLightingBlockChange>::with_capacity(
             BLOCK_EDIT_SIDEFX_MAX_EDITS_PER_FRAME,
         );
         let mut lighting_geometry_only = 0usize;
         let mut edits_remaining_before =
             self.pending_player_block_edits.len() + self.pending_block_edits.len();
-        let mut sand_remaining_before = self.pending_sand_gravity_checks.len();
 
         while edits_processed < BLOCK_EDIT_SIDEFX_MAX_EDITS_PER_FRAME && started.elapsed() < budget
         {
@@ -17783,8 +17719,6 @@ impl State {
             self.notify_fluid_on_block_change(edit.pos, old, new);
             fluid_notifies += 1;
 
-            self.enqueue_pending_sand_gravity_check(edit.pos);
-
             // Spawn particles only for block destruction by the player.
             if edit.spawn_particles
                 && new == BlockId::Air
@@ -17799,53 +17733,23 @@ impl State {
             }
         }
 
-        while sand_steps_used < BLOCK_EDIT_SAND_SCAN_STEPS_PER_FRAME && started.elapsed() < budget {
-            let Some(check) = self.pending_sand_gravity_checks.pop_front() else {
-                break;
-            };
-            self.pending_sand_gravity_check_set.remove(&check.origin);
-            sand_checks_processed += 1;
-
-            let remaining_steps = BLOCK_EDIT_SAND_SCAN_STEPS_PER_FRAME - sand_steps_used;
-            let (next_check, stats, used_steps, complete) =
-                self.process_pending_sand_gravity_check(check, remaining_steps);
-            sand_steps_used += used_steps;
-            sand_scanned += stats.scanned;
-            sand_dropped += stats.dropped;
-
-            if !complete
-                && self
-                    .pending_sand_gravity_check_set
-                    .insert(next_check.origin)
-            {
-                self.pending_sand_gravity_checks.push_back(next_check);
-            }
-        }
-
         let (dirty_chunks_flushed, dirty_columns_flushed, dirty_marks_flushed) =
             self.flush_pending_block_edit_dirty_marks();
         self.enqueue_block_edit_lighting_repairs(&lighting_changes);
 
         let ms = started.elapsed().as_secs_f32() * 1000.0;
         edits_remaining_before = edits_remaining_before.saturating_sub(edits_processed);
-        sand_remaining_before = sand_remaining_before.saturating_sub(sand_checks_processed);
         perf_trace::record_duration_ms(
             "proc.process_pending_block_edit_sidefx.work",
             ms,
             &format!(
-                "edits_proc={} edits_q_before={} edits_q_after={} fluids={} particles_spawned={} particle_events={} sand_checks_proc={} sand_q_before={} sand_q_after={} sand_steps={} sand_scanned={} sand_dropped={} light_repairs={} light_geom_only={} dirty_chunks_flush={} dirty_cols_flush={} dirty_marks_flushed={}",
+                "edits_proc={} edits_q_before={} edits_q_after={} fluids={} particles_spawned={} particle_events={} light_repairs={} light_geom_only={} dirty_chunks_flush={} dirty_cols_flush={} dirty_marks_flushed={}",
                 edits_processed,
                 edits_remaining_before + edits_processed,
                 self.pending_player_block_edits.len() + self.pending_block_edits.len(),
                 fluid_notifies,
                 particles_spawned,
                 particle_events,
-                sand_checks_processed,
-                sand_remaining_before + sand_checks_processed,
-                self.pending_sand_gravity_checks.len(),
-                sand_steps_used,
-                sand_scanned,
-                sand_dropped,
                 lighting_changes.len(),
                 lighting_geometry_only,
                 dirty_chunks_flushed,
@@ -18066,65 +17970,6 @@ impl State {
                 }
             }
         }
-    }
-
-    fn try_drop_sand_block(&mut self, pos: IVec3) -> bool {
-        if !World::in_bounds(pos) || self.world.get_block(pos) != BlockId::Sand || pos.y <= 0 {
-            return false;
-        }
-
-        let mut landing = pos;
-        while landing.y > 0 {
-            let below = landing + IVec3::new(0, -1, 0);
-            if self.world.get_block(below).is_solid() {
-                break;
-            }
-            landing = below;
-        }
-
-        if landing == pos {
-            return false;
-        }
-
-        let replaced_state = self.world.get_block_state(landing);
-        let replaced = replaced_state.id;
-        if self
-            .world
-            .set_block_and_data_loaded_only(pos, BlockId::Air, 0)
-            .is_err()
-        {
-            return false;
-        }
-        if self
-            .world
-            .set_block_and_data_loaded_only(landing, BlockId::Sand, 0)
-            .is_err()
-        {
-            let _ = self
-                .world
-                .set_block_and_data_loaded_only(pos, BlockId::Sand, 0);
-            self.apply_world_block_changes(BlockChangeSource::HandledInline);
-            return false;
-        }
-        // The drop runs its own side effects below.
-        self.apply_world_block_changes(BlockChangeSource::HandledInline);
-        self.mark_chunk_user_only_if_unknown(World::world_to_chunk_coord(pos));
-        self.mark_chunk_user_only_if_unknown(World::world_to_chunk_coord(landing));
-        self.sync_generated_empty_chunk_marker(World::world_to_chunk_coord(pos));
-        self.sync_generated_empty_chunk_marker(World::world_to_chunk_coord(landing));
-        let source_lighting =
-            self.world
-                .classify_block_change_lighting(pos, BlockId::Sand, BlockId::Air);
-        let landing_lighting =
-            self.world
-                .classify_block_change_lighting(landing, replaced, BlockId::Sand);
-        self.notify_fluid_on_block_change(pos, BlockId::Sand, BlockId::Air);
-        let sand = BlockState::from(BlockId::Sand);
-        let _ = self.stage_block_edit_dirty_after_block_change(pos, sand, BlockId::Air.into());
-        self.notify_fluid_on_block_change(landing, replaced, BlockId::Sand);
-        let _ = self.stage_block_edit_dirty_after_block_change(landing, replaced_state, sand);
-        self.enqueue_block_edit_lighting_repairs(&[source_lighting, landing_lighting]);
-        true
     }
 
     fn dispatch_dirty_chunk_meshes_pass(
@@ -19094,6 +18939,7 @@ impl State {
         // gets the edit pipeline rather than being dropped with the fluids.
         let mut sim_changes = std::mem::take(&mut self.world_block_change_scratch);
         self.world.drain_block_changes(&mut sim_changes);
+        self.forward_block_changes(&sim_changes, None);
         let active_set = &self.active_sim_columns;
         let is_active = |x: i32, z: i32| active_set.contains(&ColumnCoord { x, z });
         let active = ActiveSimColumns {
@@ -19129,11 +18975,18 @@ impl State {
                 },
             );
             // Fluid changes keep their coalesced mesh path; everything else a
-            // system changed (random ticks, block entities) joins the batch.
+            // system changed (random ticks, block entities, block updates)
+            // joins the batch and goes to the other systems.
             let journaled_before = sim_changes.len();
             self.world.drain_block_changes(&mut sim_changes);
             if self.sim_systems[idx].as_any().is::<FluidsSystem>() {
                 sim_changes.truncate(journaled_before);
+            } else {
+                Self::forward_block_changes_to(
+                    &mut self.sim_systems,
+                    &sim_changes[journaled_before..],
+                    Some(idx),
+                );
             }
             let elapsed_ms = started.elapsed().as_secs_f32() * 1000.0;
             self.sim_system_last_frame_ms[idx] += elapsed_ms;
@@ -19141,7 +18994,9 @@ impl State {
                 self.sim_system_last_frame_ticks[idx].saturating_add(1);
         }
         self.apply_winter_surface_tick(tick_index);
+        let journaled_before = sim_changes.len();
         self.world.drain_block_changes(&mut sim_changes);
+        self.forward_block_changes(&sim_changes[journaled_before..], None);
         self.enqueue_world_block_changes(&sim_changes, BlockChangeSource::Simulation);
         sim_changes.clear();
         self.world_block_change_scratch = sim_changes;

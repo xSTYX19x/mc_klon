@@ -5,8 +5,10 @@ use glam::{IVec3, Vec3};
 
 use crate::registry::NamespacedKey;
 use crate::world::World;
+use crate::world::block_updates_system::BlockTicks;
 use crate::world::fluids::FluidKind;
 
+mod falling;
 pub(crate) mod placement;
 pub(crate) mod state;
 
@@ -106,6 +108,23 @@ pub(crate) const TINT_WATER: u32 = 2;
 /// A block's random-tick hook: the world, the block's position, its current
 /// state there, and the tick index.
 pub(crate) type RandomTickFn = fn(&mut World, IVec3, BlockState, u64);
+
+/// A block's reaction to a change in a neighboring cell, or in its own cell
+/// (`from == pos`, a block arriving — Vanilla `onPlace`): the world, the
+/// block's position and state, where the change happened, and the tick queue.
+/// Run by `world::block_updates_system`.
+pub(crate) type NeighborFn = fn(&mut World, IVec3, BlockState, IVec3, &mut BlockTicks);
+
+/// A tick the block scheduled for itself (`BlockTicks::schedule`): the world,
+/// the block's position and state, and the tick queue.
+pub(crate) type ScheduledTickFn = fn(&mut World, IVec3, BlockState, &mut BlockTicks);
+
+/// A block's hooks in the block-update system.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BlockBehavior {
+    pub(crate) on_neighbor_changed: Option<NeighborFn>,
+    pub(crate) on_scheduled_tick: Option<ScheduledTickFn>,
+}
 
 /// Declares every block in one place: each `Variant => spec` entry becomes a
 /// `BlockId` variant and the matching `BLOCK_SPECS` row, and `BLOCK_COUNT`
@@ -556,6 +575,12 @@ struct BlockSpec {
     /// Picks the placed state from the click (`placement::placement_state`);
     /// `None` places the default state.
     on_place: Option<OnPlaceFn>,
+    /// Block-update hooks (`BlockId::behavior`).
+    on_neighbor_changed: Option<NeighborFn>,
+    on_scheduled_tick: Option<ScheduledTickFn>,
+    /// Drops onto the first solid block below when unsupported (sand,
+    /// gravel). Stands in for both hooks above with the ones in `falling.rs`.
+    falls: bool,
     /// Position in the creative palette (`CLASSIC_PALETTE`); `None` keeps the
     /// block out of it.
     creative_order: Option<u16>,
@@ -595,6 +620,9 @@ impl BlockSpec {
             block_entity: None,
             random_tick: None,
             on_place: None,
+            on_neighbor_changed: None,
+            on_scheduled_tick: None,
+            falls: false,
             creative_order: None,
             properties: &[],
             form: StateForm::FIXED,
@@ -734,6 +762,12 @@ impl BlockSpec {
 
     const fn with_on_place(mut self, on_place: OnPlaceFn) -> Self {
         self.on_place = Some(on_place);
+        self
+    }
+
+    /// Unsupported, the block drops onto the first solid block below.
+    const fn falls(mut self) -> Self {
+        self.falls = true;
         self
     }
 
@@ -1062,6 +1096,7 @@ blocks! {
         .with_creative_order(42),
     Sand => BlockSpec::cube("minecraft:sand", "Sand", TEX_SAND, [0.85, 0.80, 0.55])
         .with_aliases(&["core:sand"])
+        .falls()
         .with_creative_order(16),
     Bricks => BlockSpec::cube("minecraft:bricks", "Bricks", TEX_BRICKS, [0.66, 0.31, 0.25])
         .with_creative_order(2),
@@ -1102,6 +1137,7 @@ blocks! {
     )
     .with_creative_order(10),
     Gravel => BlockSpec::cube("minecraft:gravel", "Gravel", TEX_GRAVEL, [0.55, 0.54, 0.52])
+        .falls()
         .with_creative_order(17),
     Sponge => BlockSpec::cube("minecraft:sponge", "Sponge", TEX_SPONGE, [0.86, 0.80, 0.27])
         .with_creative_order(18),
@@ -1946,6 +1982,19 @@ impl BlockId {
         block_spec_for(self).solid
     }
 
+    /// The block's hooks in the block-update system; falling blocks use the
+    /// fall hooks.
+    pub(crate) fn behavior(self) -> BlockBehavior {
+        let spec = block_spec_for(self);
+        if spec.falls {
+            return falling::FALLING_BEHAVIOR;
+        }
+        BlockBehavior {
+            on_neighbor_changed: spec.on_neighbor_changed,
+            on_scheduled_tick: spec.on_scheduled_tick,
+        }
+    }
+
     /// Whether the data byte changes this block's shape or model (slab half,
     /// furnace facing), so a data-only change needs a remesh.
     pub(crate) fn data_changes_form(self) -> bool {
@@ -2437,6 +2486,19 @@ mod tests {
     use crate::blocks::BlockState;
     use crate::blocks::state::SAPLING_STAGE;
     use crate::world::{CHUNK_SIZE, Chunk, ChunkCoord, World};
+
+    #[test]
+    fn only_sand_and_gravel_fall_and_they_use_the_fall_hooks() {
+        for spec in super::BLOCK_SPECS.iter() {
+            let falls = matches!(spec.variant, BlockId::Sand | BlockId::Gravel);
+            assert_eq!(spec.falls, falls, "{}", spec.key);
+            if falls {
+                let behavior = spec.variant.behavior();
+                assert!(behavior.on_neighbor_changed.is_some(), "{}", spec.key);
+                assert!(behavior.on_scheduled_tick.is_some(), "{}", spec.key);
+            }
+        }
+    }
 
     #[test]
     fn stone_slab_occludes_partially_and_stops_skylight() {

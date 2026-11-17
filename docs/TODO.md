@@ -49,8 +49,9 @@ nächsten billiger macht:
    Block-States") — steht seit 2026-11-16; offen sind Waterlogging und die
    Formfamilien (Punkt 4).
 4. Blockmodelle und Voxel-Shapes (→ "Rendering", erster Punkt).
-5. Block-Verhalten: Interaktions-Hooks (→ "Survival-Gameplay / Interaktion")
-   plus Neighbor-Updates und Scheduled Ticks (unten).
+5. Block-Verhalten: Interaktions-Hooks (→ "Survival-Gameplay / Interaktion");
+   Neighbor-Updates und Scheduled Ticks stehen seit 2026-11-17
+   (`world/block_updates_system.rs`).
 6. Spiellogik aus `State` lösen, deterministischer Tick, Interpolation (unten)
    — Voraussetzung für Entities.
 7. Entity-Fundament (→ "Content-Abgleich / Entities & Mobs").
@@ -64,10 +65,15 @@ nächsten billiger macht:
     Sim-System, nach dem Winter-Tick und nach Spieler-Edits
     (`apply_world_block_changes` / `enqueue_world_block_changes` mit
     `BlockChangeSource`) in die Edit-Pipeline; damit sehen Mesh, Licht und
-    Save-Dirty auch Random-Tick-Änderungen (Bäume, Gras). Noch nicht
-    angeglichen: (a) Fluid-Änderungen laufen weiter über den eigenen
-    Fluid-Mesh-Coalescer, der Sand-Fall über eigene Inline-Nebenwirkungen —
-    beide verwerfen ihre Journal-Einträge (`HandledInline`). (b)
+    Save-Dirty auch Random-Tick-Änderungen (Bäume, Gras). Seit 2026-11-17
+    geht jede geleerte Batch außerdem an die Sim-Systeme
+    (`forward_block_changes` → `SimSystem::on_block_changes`, nie an den
+    Erzeuger), und Sim-Änderungen pflegen die Chunk-Marker (`chunk_origin`,
+    `generated_empty_chunks`) wie die Spieler-Pfade; der Sand-Fall ist eine
+    gewöhnliche Sim-Änderung (`BlockUpdatesSystem`). Noch nicht angeglichen:
+    (a) Fluid-Änderungen laufen weiter über den eigenen Fluid-Mesh-Coalescer;
+    `fixed_sim_tick` kürzt sie aus der Batch, sie erreichen also weder die
+    Edit-Pipeline noch `on_block_changes`. (b)
     `pending_block_entity_block_changes` ist eine zweite Queue neben dem
     Journal, weil `BlockEntitiesSystem` sie innerhalb des Sim-Ticks leert.
     (c) Lighting-Klassifikation und Fluid-Notify laufen pro Position
@@ -87,18 +93,18 @@ nächsten billiger macht:
   - *Vorgehen:* 1) Batch-Pfad für viele Änderungen auf einmal (TNT, `/fill`,
     Baum): Dirty-Marken koalesziert `pending_block_edit_dirty_chunks` schon pro
     Chunk; Lighting-Klassifikation und Fluid-Notify brauchen eine
-    Region-Variante. 2) Fluids und Sand über denselben Abnehmer führen, mit
+    Region-Variante. 2) Fluids über denselben Abnehmer führen, mit
     Flags statt eigener Pfade (z. B. "koaleszierter Remesh" als Option der
     Pipeline). 3) Block-Entity-Änderungen aus dem Journal ableiten und die
     zweite Queue streichen.
   - *Dateien:* `world/mod.rs`, `world/block_entities_system.rs`,
-    `render/state.rs` (Edit-Pipeline, Fluid-Coalescer, `try_drop_sand_block`).
+    `render/state.rs` (Edit-Pipeline, Fluid-Coalescer).
   - *Abhängigkeiten:* keine. Voraussetzung für TNT, Redstone und Entities, die
     viele Blöcke ändern.
   - *Priorität/Aufwand/Impact:* **P2**, M, mittel.
   - *Akzeptanz:* `/fill` über 10 000 Blöcke erzeugt eine Lighting-Region pro
-    betroffenem Chunk statt 10 000 Einzelreparaturen; Fluid- und Sand-Pfad
-    verwerfen keine Journal-Einträge mehr.
+    betroffenem Chunk statt 10 000 Einzelreparaturen; der Fluid-Pfad verwirft
+    keine Journal-Einträge mehr.
 
 - **Block-Registry per Makro: `BlockId` auf `u16` umstellen**
   - *Ist:* Seit 2026-11-16 erzeugt das Makro `blocks!` (`blocks/mod.rs`,
@@ -132,49 +138,6 @@ nächsten billiger macht:
   - *Priorität/Aufwand/Impact:* **P3**, S, erst ab ~200 Blöcken relevant.
   - *Akzeptanz:* Ein Testblock mit ID ≥ 256 lässt sich setzen, speichern und
     laden; `cargo test` grün; ein Save von vorher lädt unverändert.
-
-- **Block-Verhalten: Neighbor-Updates und Scheduled Ticks für Blöcke**
-  - *Ist:* Es gibt nur Random Ticks (`RandomTickFn`, `blocks/mod.rs:81`; zwei
-    Nutzer: Gras `:741`, Setzling `:804`). Ein generischer
-    Neighbor-Update-Mechanismus fehlt (Suche nach
-    `neighbor_update|on_neighbor|scheduled_tick` leer); die nächsten
-    Verwandten sind fluid-spezifisch (`notify_fluid_on_block_change`,
-    `render/state.rs:18729`; `mark_transforming_with_neighbors`,
-    `world/fluids.rs:526-538`) plus der Sand-Check (`render/state.rs:17470-17536`).
-    Scheduled Ticks gibt es nur für Fluids, dort aber schon als gutes
-    Timing-Wheel (`FluidScheduler`, `world/fluids.rs:190`, `:210-217`, 512
-    Buckets, Dedupe über `scheduled_due`).
-  - *Ziel:* Fackeln fallen ab, wenn ihr Träger verschwindet; Kies fällt;
-    Zuckerrohr und Kaktus prüfen ihren Untergrund; Redstone und Türen reagieren
-    auf Nachbarn; Blöcke können sich "in N Ticks" selbst wecken — alles über
-    dieselbe Tabelle wie `random_tick`.
-  - *Vorbild:* Vanilla `neighborChanged`/`updateShape` und `LevelTicks<Block>`
-    (geplante Ticks mit Priorität); Lithium für die Tick-Queue-Struktur.
-    Rust-Übertragung: Funktionszeiger in `BlockSpec` (wie `random_tick`
-    heute), kein Trait-Objekt pro Block.
-  - *Vorgehen:* 1) `BlockSpec` bekommt `on_neighbor_changed:
-    Option<NeighborFn>` und `on_scheduled_tick: Option<ScheduledTickFn>`, beide
-    mit Signatur `fn(&mut World, IVec3, BlockState, …)`. 2) `FluidScheduler`
-    zu einem generischen `TickScheduler<K>` verallgemeinern und eine Instanz
-    für Blöcke anlegen; die Fluids behalten ihre. 3) Ein
-    `BlockUpdatesSystem: SimSystem` verarbeitet pro Tick die Änderungen aus
-    dem Welt-Journal (Punkt oben; das Journal leert seit 2026-11-16 `State`
-    nach jedem Sim-System, `apply_world_block_changes` — das System braucht
-    also die Batch von `State` oder einen eigenen Lesezeiger in `World`),
-    ruft für die 6 Nachbarn jeder Änderung `on_neighbor_changed`
-    auf (Tiefenlimit gegen Kettenreaktionen, Vanilla: 512) und arbeitet fällige
-    Scheduled Ticks mit Budget ab. 4) Sand-Check aus `State` hierher umziehen
-    und mit Kies zusammenführen (`falls: bool` in `BlockSpec`). 5) Pruning nach
-    aktiven Spalten wie beim Fluid-Scheduler.
-  - *Dateien:* `blocks/mod.rs`, `world/fluids.rs` (Scheduler extrahieren),
-    neues `world/block_updates_system.rs`, `render/state.rs` (Sand-Pfad).
-  - *Abhängigkeiten:* Welt-Änderungsjournal; Block-States (Fackel-Orientierung,
-    Zuckerrohr-Alter). Basis für "Redstone & Logik".
-  - *Priorität/Aufwand/Impact:* **P2**, M-L, hoch (Voraussetzung für rund 20
-    Inhaltspunkte).
-  - *Akzeptanz:* Tests ohne GPU: Block unter Sand entfernen → Sand fällt, Kies
-    ebenso; ein Block mit `schedule(pos, 10)` tickt genau in Tick +10; eine
-    Kettenreaktion bricht am Tiefenlimit ab.
 
 - **Spiellogik aus `State` lösen: `GameSim`, deterministischer Tick,
   Render-Interpolation**
@@ -680,39 +643,66 @@ Planken bzw. Stein — beim Modellbau bewusst so umsetzen.
   Kaktus (Kontaktschaden, nur auf Sand, keine direkten Nachbarblöcke),
   Zuckerrohr, Schneedecke mit Höhenstufen 1-8, Ackerboden und Weizenpflanze
   mit Wachstumsstufen (Random-Tick; beides fehlt heute ganz).
+- **Feuer** (neu 2026-11-17; in der Vorlage enthalten, fehlt heute ganz)
+  - *Ist:* Es gibt keinen Feuer-Block, keine Brennbarkeit in `BlockSpec` und
+    keine Zündquelle. Die Texturen `fire_0`/`fire_1` (animiert, `.mcmeta`)
+    liegen im Pack. Neighbor-Updates und Scheduled Ticks stehen
+    (`world/block_updates_system.rs`).
+  - *Ziel:* Feuer wie in a1.0.17: braucht einen Träger (festen Block darunter
+    oder einen brennbaren Nachbarn), sonst erlischt es; brennt nach einer
+    Weile aus; springt auf brennbare Blöcke in der Nähe über und kann sie
+    zerstören (Holz, Laub, Wolle, TNT später zündend). Seit a1.0.15 entzündet
+    Lava brennbare Blöcke in ihrer Nähe. Feuerzeug als Zündquelle gehört zu
+    den Items.
+  - *Vorbild:* Vanilla `FireBlock`: Scheduled Tick mit Zufallsverzögerung,
+    `age` (0-15) als Brenndauer, pro Block `igniteOdds` (Ausbreitung) und
+    `burnOdds` (Zerstörung); Lava zündet per Random Tick Luft neben
+    Brennbarem. Übertragung: zwei `u8`-Werte in `BlockSpec` statt einer
+    Java-Map, Feuer-Logik als Hooks wie `falling.rs`.
+  - *Vorgehen:* 1) `flammability` (Zünd- und Brennwert) in `BlockSpec`, im
+    Makro für Holz, Bretter, Laub, Wolle, Bücherregal, TNT gesetzt.
+    2) Feuer-Block mit `age`-Property (4 Bit), `on_neighbor_changed` prüft den
+    Träger, `on_scheduled_tick` altert, breitet aus und erlischt (Zufall aus
+    `util::rng`, deterministisch aus Seed, Position und Tick). 3) Modell:
+    gekreuzte und seitliche Flammen-Quads aus der Modell-Familie (Rendering
+    "Blockmodelle und Voxel-Shapes"), Licht 15, keine Kollision, nicht
+    auswählbar. 4) Lava-Random-Tick zündet brennbare Nachbarn.
+  - *Dateien:* `blocks/mod.rs`, neues `blocks/fire.rs`, Modell-Pfad in
+    `meshing/`, `world/fluids.rs` oder ein Random-Tick-Hook für Lava.
+  - *Abhängigkeiten:* Block-Update-Hooks (stehen), Blockmodelle und
+    Voxel-Shapes (Flammen-Quads), Feuerzeug aus "Items, Inventar & Crafting".
+  - *Priorität/Aufwand/Impact:* **P2**, M, mittel (Lava-Seen in der Welt
+    zünden Wälder, sobald es Feuer gibt — also mit dem Lava-Teil zusammen
+    ausliefern).
+  - *Akzeptanz:* Tests ohne GPU: Feuer ohne Träger erlischt; Feuer neben Holz
+    zündet es innerhalb einer festen Tickzahl bei gegebenem Seed; Lava neben
+    Laub entzündet es; Feuer auf Stein brennt aus.
 
 **Verhalten für schon vorhandene Blöcke:**
 
-- **Kies fällt wie Sand; Fallen in das Block-Update-System umziehen**
-  (neu formuliert 2026-09-28 — der alte Befund "Sand/Kies fallen … heute ohne
-  jede Logik" stimmt für Sand nicht mehr)
-  - *Ist:* Sand fällt bereits: jeder Edit stößt einen gebudgeteten Check an
-    (`enqueue_pending_sand_gravity_check`, `render/state.rs:17470-17482`,
-    ausgelöst `:17578`); `try_drop_sand_block` (`:17862-17914`) setzt den Block
-    **sofort** auf die Landeposition (erster `is_solid()`-Block darunter), ohne
-    Fall-Entity, mit Fluid-Notify, Dirty- und Licht-Reparatur für beide Zellen.
-    Die Bedingung ist fest auf `BlockId::Sand` verdrahtet (`:17863`) — Kies
-    fällt nicht. Der Pfad lebt in `State`, nicht in der Welt-/Sim-Schicht, und
-    nutzt weder den Random-Tick-Pfad noch einen generischen Nachbar-Trigger
-    (den es nicht gibt).
-  - *Ziel:* Sand und Kies (später z. B. Beton-Pulver) fallen über eine
-    Blockeigenschaft; mit dem Entity-System optional als sichtbare Fall-Entity.
-  - *Vorbild:* Vanilla `FallingBlock` (Scheduled Tick nach einem
-    Nachbar-Update, dann `FallingBlockEntity`). Der Sofort-Teleport ist eine
-    bewusste Zwischenstufe ohne Entity: optisch schlechter als eine
-    Fallanimation, aber ohne Entity-System machbar.
-  - *Vorgehen:* 1) Sofort: `falls: bool` in `BlockSpec`, Bedingung in
-    `try_drop_sand_block` darauf umstellen, Kies setzen. 2) Mit
-    "Architektur / Block-Verhalten: Neighbor-Updates und Scheduled Ticks" den
-    Check dorthin verschieben (2 Ticks Verzögerung wie in Vanilla). 3) Mit dem
-    Entity-System als Fall-Entity rendern (gehört an den Entity-Punkt unten).
-  - *Dateien:* `blocks/mod.rs`, `render/state.rs` (`:17470-17536`,
-    `:17862-17914`).
-  - *Abhängigkeiten:* Schritt 1 keine; Schritt 2 Block-Update-System;
-    Schritt 3 Entity-Fundament.
-  - *Priorität/Aufwand/Impact:* **P2** (Schritt 1: S), niedrig bis mittel.
-  - *Akzeptanz:* Kies unter einem entfernten Block fällt; das Sand-Verhalten
-    bleibt unverändert.
+- **Sand und Kies: Fall-Entity statt Sofort-Teleport**
+  - *Ist:* Seit 2026-11-17 fallen Sand und Kies über `falls` in `BlockSpec`
+    (`.falls()` in `blocks!`, Hooks in `blocks/falling.rs`): Eine Änderung in
+    der eigenen oder einer Nachbarzelle plant über das `BlockUpdatesSystem`
+    (`world/block_updates_system.rs`) einen Tick in 2 Ticks ein; ist die Zelle
+    darunter dann nicht fest, setzt der Tick den Block **sofort** auf den
+    ersten festen Block darunter (ersetzt dort Nicht-Festes wie Wasser oder
+    Blumen) — ohne Fall-Entity. Eine Säule folgt Block für Block im
+    2-Tick-Abstand, wie die Fall-Starts in Vanilla. Nebenwirkungen (Mesh,
+    Licht, Fluid-Notify, Chunk-Marker) laufen über die normale Edit-Pipeline.
+  - *Ziel:* Fallende Blöcke sind als Fall-Entity sichtbar und landen nach
+    ihrer Flugzeit statt sofort.
+  - *Vorbild:* Vanilla `FallingBlockEntity`: Der Scheduled Tick ersetzt den
+    Block durch Luft und erzeugt die Entity; sie setzt den Block bei der
+    Landung (oder droppt ihn als Item, wenn die Zelle belegt ist).
+  - *Vorgehen:* In `falling.rs` statt des Teleports die Entity erzeugen; die
+    Landung setzt den Block über das Journal, damit die Pipeline greift.
+    Gehört an den Entity-Punkt unten.
+  - *Dateien:* `blocks/falling.rs`, Entity-Modul.
+  - *Abhängigkeiten:* Entity-Fundament.
+  - *Priorität/Aufwand/Impact:* **P3**, S nach dem Entity-Fundament, niedrig.
+  - *Akzeptanz:* Ein entfernter Block unter einer Sandsäule lässt sichtbare
+    Fall-Entities fallen; der Endzustand gleicht dem heutigen.
 - TNT: existiert nur als Deko-Block (kein einziger Treffer außerhalb von
   `blocks/mod.rs`). Braucht Zündung + Explosionsradius. Die Explosion selbst ist
   ein Batch-`set_block` über eine Kugel plus Raycast-Dämpfung; wichtig für die
@@ -721,7 +711,9 @@ Planken bzw. Stein — beim Modellbau bewusst so umsetzen.
   *Korrektur 2026-09-28:* Dirty-Marken werden inzwischen pro Chunk koalesziert
   (`pending_block_edit_dirty_chunks`, `render/state.rs:5473`, Flush
   `:16368-16402`); pro Position laufen aber weiterhin Lighting-Klassifikation,
-  Fluid-Notify, Sand-Check und Partikel (`:17565-17590`). Für eine Explosion
+  Fluid-Notify und Partikel (`process_pending_block_edit_side_effects`) sowie
+  die Nachbar-Benachrichtigung im `BlockUpdatesSystem` (7 Zellen pro
+  Änderung, 1024 Änderungen pro Tick). Für eine Explosion
   braucht es die Batch-Variante aus "Architektur / Welt-Änderungsjournal",
   Schritt 4.
 - Schwamm: existiert nur als Deko-Block. Wasser im 5×5×5 entfernen beim Setzen;
@@ -733,8 +725,8 @@ Planken bzw. Stein — beim Modellbau bewusst so umsetzen.
 - Redstone-Erz umschalten: beide Zustände gibt es seit 2026-11-16 als eigene
   Blöcke (`RedstoneOre`, `LitRedstoneOre` mit Licht 9). Offen ist der Wechsel:
   Anklicken oder Betreten macht das Erz leuchtend, ein Random-Tick schaltet es
-  zurück. Hängt an den Interaktions-Hooks ("Survival-Gameplay / Interaktion")
-  und "Architektur / Block-Verhalten". Mit der Block-State-Schicht können
+  zurück. Hängt an den Interaktions-Hooks ("Survival-Gameplay / Interaktion");
+  das Betreten braucht das Entity-/Spieler-Kontaktereignis. Mit der Block-State-Schicht können
   beide zu einem Block mit `lit`-Property werden (alter Name als Alias).
 - **Monster-Spawner: Block-Entity und Spawn-Logik** (neu 2026-11-16)
   - *Ist:* Seit 2026-11-16 gibt es den Block (`BlockId::Spawner`,
@@ -1075,8 +1067,9 @@ schon genau richtig gebaut und muss nur gefüllt werden: `App::break_held` +
 
 *Neu formuliert 2026-09-28:* der bisherige Vorschlag (`on_use` in `BlockSpec`,
 Sneak überspringt) bleibt, ergänzt um Platzier-Kontext und Abbau-Hooks.
-Weltseitige Reaktionen (Nachbar-Updates, geplante Ticks) stehen unter
-"Architektur / Block-Verhalten".
+Weltseitige Reaktionen (Nachbar-Updates, geplante Ticks) laufen seit
+2026-11-17 über `on_neighbor_changed`/`on_scheduled_tick`
+(`world/block_updates_system.rs`).
 
 - *Ist:* Seit 2026-11-17 steht der Platzier-Kontext: `RaycastHit::hit_point`
   (Treffer in Weltkoordinaten), `blocks/placement.rs` mit `PlaceContext {
@@ -1144,9 +1137,9 @@ klassische Aufgabe: nicht über Kanten laufen, und `on_use` überspringen.
 ### Redstone & Logik
 
 Komplett nicht vorhanden. Hängt an Block-States (Signalstärke = 4 Bit in
-`block_data`). *Ergänzung 2026-09-28:* und an "Architektur / Block-Verhalten:
-Neighbor-Updates und Scheduled Ticks" — die dort vorgeschlagene generische
-Tick-Queue ist die verallgemeinerte Fassung der unten genannten Fluid-Queue.
+`block_data`). Neighbor-Updates und Scheduled Ticks gibt es seit 2026-11-17
+(`world/block_updates_system.rs`, `TickScheduler<K>` aus der Fluid-Queue
+verallgemeinert); Redstone hängt sich dort ein.
 
 - Redstone-Staub: in der Vorlage nur an oder aus; abgestufte Signalstärke mit
   sichtbarer Abdunklung kam erst mit Beta 1.3, eine Reichweitengrenze ist für
@@ -1155,13 +1148,12 @@ Tick-Queue ist die verallgemeinerte Fassung der unten genannten Fluid-Queue.
 - Redstone-Fackel als Inverter (Burnout ist für a1.0.17 nicht belegt).
 - Signalquellen: Hebel, Steinknopf, Holz-/Steindruckplatte.
 - Verbraucher: Eisentür, Holztür, TNT-Zündung.
-- Umsetzung: **kein** Tick-pro-Block-Scan. Ein `RedstoneSystem: SimSystem` mit
-  einer Update-Queue nach dem Muster von `FluidSystem::schedule_fluid_update`
-  (`world/fluids.rs:467`) — dort ist die verzögerte, positionsbasierte
-  Update-Queue inklusive Pruning nach Keep-Radius und aktiven Spalten schon
-  gebaut und bewährt. Redstone hat exakt dieselbe Zugriffsform (lokaler
-  Nachbarschafts-Neuberechnung mit Tick-Verzögerung), also die Struktur
-  übernehmen statt neu erfinden.
+- Umsetzung: **kein** Tick-pro-Block-Scan. Staub, Fackel, Hebel und Türen
+  reagieren über `on_neighbor_changed` und verzögern über
+  `BlockTicks::schedule` (`on_scheduled_tick`); Tiefenlimit (512), Budget und
+  Pruning nach aktiven Spalten bringt das `BlockUpdatesSystem` mit. Offen ist
+  nur, ob die Signalberechnung pro Tick gebündelt werden muss (Vanilla-Staub
+  ist für seine Update-Lawinen berüchtigt) — erst messen.
 - Bewusst nicht enthalten: Kolben, Schiebetüren (kamen später).
 
 ### Storage: Column-Payload v3 für Block-Entities und Entities
@@ -1955,7 +1947,9 @@ loading screen, where throughput legitimately outranks frame time.
     Entladen stand.
   - *Vorbild:* Vanilla speichert ausstehende Fluid-Ticks mit dem Chunk
     (`fluid_ticks`) und plant sie beim Laden wieder ein.
-  - *Vorgehen:* 1) Fällige Einträge der `FluidScheduler` pro Spalte beim
+  - *Vorgehen:* 1) Fällige Einträge der Fluid-`TickScheduler` (und der
+    Block-Ticks im `BlockUpdatesSystem`, die genauso verloren gehen: Sand über
+    einer entfernten Stütze schwebt dann bis zum nächsten Update) pro Spalte beim
     Entladen sammeln (relative Fälligkeit). 2) Als getaggten Block im
     Column-Payload v3 speichern. 3) Beim Laden einplanen und den Bootstrap für
     Spalten mit gespeicherten Ticks überspringen.
@@ -2250,7 +2244,7 @@ loading screen, where throughput legitimately outranks frame time.
     `rustc-hash` im Projekt). `World::get_block` macht pro Aufruf `div_euclid`
     und einen Hash-Lookup in `HashMap<ChunkCoord, Chunk>` (`world/mod.rs:39`,
     `:2855-2865`), ebenso `get_light_packed` (`:2887`). Heiße Nutzer:
-    Block-Edit-Reparatur, Fluid-Sim, Spieler-Kollision, Sand-Check, Random
+    Block-Edit-Reparatur, Fluid-Sim, Spieler-Kollision, Block-Updates, Random
     Ticks. Auch der Corner-Cache der Flüssigkeiten ist eine SipHash-
     `HashMap<IVec3, _>` pro Zelle (`meshing/liquids.rs:14-85`).
   - *Ziel:* Weniger Zeit in Hashing und Lookups, ohne Strukturumbau.
@@ -2414,9 +2408,8 @@ loading screen, where throughput legitimately outranks frame time.
   - *Dirty-Flags nur für betroffene Sektionen:* umgesetzt, inklusive
     Face-Signatur-Vergleich für Nachbarn (`render/state.rs:15562-15655`);
     Lücke nur bei Diagonalen, siehe Rendering "Mesher-Korrektheit".
-  - *Scheduled Ticks als Timing-Wheel:* für Fluids umgesetzt
-    (`world/fluids.rs:190-253`); Verallgemeinerung unter "Architektur /
-    Block-Verhalten".
+  - *Scheduled Ticks als Timing-Wheel:* für Fluids und Blöcke umgesetzt
+    (`world/tick_scheduler.rs`, `TickScheduler<K>`).
   - *ImmediatelyFast (HUD-/Text-Batching):* pro Overlay existiert schon ein
     Mesh (Bitmap-Font, `render/state.rs:4103`); die UI verursacht etwa 10-20
     Draws pro Frame plus einen pro sichtbarem Item-Preview (`:20701-20706`).

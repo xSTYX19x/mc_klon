@@ -127,9 +127,11 @@ That direction is now active in the code:
 - async save writer + async load worker
 - fixed simulation tick (20 TPS)
 - simulation distance separated from render distance
-- fluids, block entities, and random ticks run through the sim-system path
+- fluids, block entities, random ticks and block updates run through the sim-system path
 - random ticks skip sections without random-ticking blocks (per-section counter, like vanilla `isRandomlyTicking`)
 - world change journal: every `World::set_block*` change is journaled and drained into the block-edit pipeline (remesh, light, save-dirty), so random-tick changes like grown trees are rendered and saved
+- block updates (`world/block_updates_system.rs`): each drained journal batch also goes to the sim systems (`SimSystem::on_block_changes`, never back to its producer); the block-update system notifies the changed cell and its six neighbors through `on_neighbor_changed` and runs `on_scheduled_tick` from a timing wheel (`TickScheduler<K>`, shared with the fluids), with a chain-depth limit of 512 and a per-tick budget; scheduled ticks and pending updates of columns that leave the sim area are dropped
+- sand and gravel fall (`falls` in `BlockSpec`): two ticks after a change next to them they drop onto the first solid block below, at once (no falling entity yet); a column follows block by block
 
 ## Runtime Caveats That Are Still Real
 

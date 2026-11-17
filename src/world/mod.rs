@@ -9,6 +9,7 @@ use crate::world::ticking_areas::{TICKING_AREA_MAX_RADIUS_CHUNKS, TickingArea, T
 use crate::worldgen::{ChunkGenerator, DEFAULT_WORLDGEN_PRESET, TerrainGenerator, WorldgenPreset};
 
 pub(crate) mod block_access;
+pub(crate) mod block_updates_system;
 pub(crate) mod block_entities_storage;
 pub(crate) mod block_entities_system;
 pub(crate) mod block_entity_types;
@@ -20,6 +21,7 @@ pub(crate) mod fluids_system;
 pub(crate) mod manifest;
 pub(crate) mod random_ticks_system;
 pub(crate) mod raycast;
+pub(crate) mod tick_scheduler;
 pub(crate) mod ticking_areas;
 pub(crate) mod time;
 
@@ -3708,6 +3710,17 @@ impl World {
     /// so each batch can be attributed to its source.
     pub(crate) fn drain_block_changes(&mut self, out: &mut Vec<BlockChange>) {
         out.append(&mut self.block_changes);
+    }
+
+    /// How many changes are journaled and not yet drained. With
+    /// `block_changes_since` a sim system reads back what its own hooks just
+    /// changed, without taking the batch from whoever drains it.
+    pub(crate) fn block_change_count(&self) -> usize {
+        self.block_changes.len()
+    }
+
+    pub(crate) fn block_changes_since(&self, start: usize) -> &[BlockChange] {
+        &self.block_changes[start.min(self.block_changes.len())..]
     }
 
     pub(crate) fn drain_block_entity_block_changes(

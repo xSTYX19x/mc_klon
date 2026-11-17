@@ -1,6 +1,6 @@
 use std::any::Any;
 
-use crate::world::World;
+use crate::world::{BlockChange, World};
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct ColumnCoord {
@@ -31,6 +31,11 @@ pub trait SimSystem {
         _active: ActiveSimColumns<'_>,
     ) {
     }
+
+    /// A drained batch of journaled world changes, oldest first: player
+    /// edits, environment ticks and the other systems — never the system's
+    /// own changes, and never fluid flow, which keeps its own coalesced path.
+    fn on_block_changes(&mut self, _changes: &[BlockChange]) {}
 
     fn fixed_tick(
         &mut self,

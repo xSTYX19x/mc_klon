@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::blocks::BlockId;
 use crate::blocks::state::{FLUID_FALLING, FLUID_LEVEL, FLUID_SOURCE, FLUID_STATIC};
 
+use super::tick_scheduler::TickScheduler;
 use super::{CHUNK_SIZE, Chunk, ChunkCoord, SetBlockError, World};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,7 +175,6 @@ const MAX_WATER_UPDATES_PER_TICK: usize = 256;
 const MAX_LAVA_UPDATES_PER_TICK: usize = 128;
 pub(crate) const FLUID_MAX_TICKS_PER_FRAME: usize = 2;
 const FLUID_REBUILD_SETTLE_TICKS: usize = 96;
-const SCHEDULER_WHEEL_SIZE: usize = 512;
 
 pub(crate) const FLUID_CURRENT_PUSH_SPEED: f32 = 1.39;
 
@@ -194,104 +194,6 @@ const ALL_NEIGHBOR_DIRS: [IVec3; 6] = [
     IVec3::new(0, 0, -1),
 ];
 
-#[derive(Default)]
-struct FluidScheduler {
-    wheel: Vec<Vec<IVec3>>,
-    ready: VecDeque<IVec3>,
-    ready_set: HashSet<IVec3>,
-    scheduled_due: HashMap<IVec3, u64>,
-    scratch: Vec<IVec3>,
-}
-
-impl FluidScheduler {
-    fn new() -> Self {
-        Self {
-            wheel: vec![Vec::new(); SCHEDULER_WHEEL_SIZE],
-            ready: VecDeque::new(),
-            ready_set: HashSet::new(),
-            scheduled_due: HashMap::new(),
-            scratch: Vec::with_capacity(512),
-        }
-    }
-
-    fn clear(&mut self) {
-        for bucket in &mut self.wheel {
-            bucket.clear();
-        }
-        self.ready.clear();
-        self.ready_set.clear();
-        self.scheduled_due.clear();
-        self.scratch.clear();
-    }
-
-    fn has_pending(&self) -> bool {
-        !self.ready.is_empty() || !self.scheduled_due.is_empty()
-    }
-
-    fn schedule(&mut self, pos: IVec3, due_tick: u64) {
-        match self.scheduled_due.get(&pos).copied() {
-            Some(existing_due) if existing_due <= due_tick => return,
-            _ => {
-                self.scheduled_due.insert(pos, due_tick);
-                let bucket = (due_tick as usize) % self.wheel.len();
-                self.wheel[bucket].push(pos);
-            }
-        }
-    }
-
-    fn collect_ready(&mut self, current_tick: u64) {
-        let bucket_index = (current_tick as usize) % self.wheel.len();
-        let mut scratch = std::mem::take(&mut self.scratch);
-        scratch.clear();
-        scratch.append(&mut self.wheel[bucket_index]);
-
-        for pos in scratch.drain(..) {
-            let Some(&due_tick) = self.scheduled_due.get(&pos) else {
-                continue;
-            };
-
-            if due_tick == current_tick {
-                if self.ready_set.insert(pos) {
-                    self.ready.push_back(pos);
-                }
-            } else {
-                let target_bucket = (due_tick as usize) % self.wheel.len();
-                self.wheel[target_bucket].push(pos);
-            }
-        }
-
-        self.scratch = scratch;
-    }
-
-    fn pop_ready(&mut self) -> Option<IVec3> {
-        let pos = self.ready.pop_front()?;
-        self.ready_set.remove(&pos);
-        self.scheduled_due.remove(&pos);
-        Some(pos)
-    }
-
-    fn retain_positions<F: Fn(IVec3) -> bool>(&mut self, keep: F) {
-        for bucket in &mut self.wheel {
-            bucket.retain(|pos| keep(*pos));
-        }
-
-        let mut filtered_ready = VecDeque::with_capacity(self.ready.len());
-        while let Some(pos) = self.ready.pop_front() {
-            if keep(pos) {
-                filtered_ready.push_back(pos);
-            }
-        }
-        self.ready = filtered_ready;
-        self.ready_set.retain(|pos| keep(*pos));
-        self.scheduled_due.retain(|pos, _| keep(*pos));
-        self.scratch.retain(|pos| keep(*pos));
-    }
-
-    fn debug_counts(&self) -> (usize, usize) {
-        (self.ready.len(), self.scheduled_due.len())
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct StreamLock {
     kind: FluidKind,
@@ -300,8 +202,8 @@ struct StreamLock {
 }
 
 pub(crate) struct FluidSystem {
-    water_scheduler: FluidScheduler,
-    lava_scheduler: FluidScheduler,
+    water_scheduler: TickScheduler<IVec3>,
+    lava_scheduler: TickScheduler<IVec3>,
     // Dedupe queue for block-change-triggered rescheduling. We collect first and schedule with a
     // per-step budget to avoid bursts of thousands of scheduler inserts in one frame.
     transforming: VecDeque<IVec3>,
@@ -318,8 +220,8 @@ pub(crate) struct FluidSystem {
 impl FluidSystem {
     pub(crate) fn new() -> Self {
         Self {
-            water_scheduler: FluidScheduler::new(),
-            lava_scheduler: FluidScheduler::new(),
+            water_scheduler: TickScheduler::new(),
+            lava_scheduler: TickScheduler::new(),
             transforming: VecDeque::new(),
             transforming_set: HashSet::new(),
             stream_locks: HashMap::new(),
@@ -437,14 +339,14 @@ impl FluidSystem {
         }
     }
 
-    fn scheduler_mut(&mut self, kind: FluidKind) -> &mut FluidScheduler {
+    fn scheduler_mut(&mut self, kind: FluidKind) -> &mut TickScheduler<IVec3> {
         match kind {
             FluidKind::Water => &mut self.water_scheduler,
             FluidKind::Lava => &mut self.lava_scheduler,
         }
     }
 
-    fn scheduler(&self, kind: FluidKind) -> &FluidScheduler {
+    fn scheduler(&self, kind: FluidKind) -> &TickScheduler<IVec3> {
         match kind {
             FluidKind::Water => &self.water_scheduler,
             FluidKind::Lava => &self.lava_scheduler,
