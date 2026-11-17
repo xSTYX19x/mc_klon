@@ -263,7 +263,9 @@ fn should_emit_bottom_slab_face(
     !neighbor_covers_boundary(neighbor_shape, face.opposite(), required)
 }
 
-fn append_bottom_slabs_in_chunk(
+/// Slabs, layers and inset-sides blocks (cactus): every solid block the greedy
+/// pass leaves out, in one scan of the chunk.
+fn append_partial_blocks_in_chunk(
     world: &impl BlockAccess,
     chunk: &crate::world::Chunk,
     chunk_origin: IVec3,
@@ -289,6 +291,21 @@ fn append_bottom_slabs_in_chunk(
                 let layer_height = match info.model {
                     BlockModel::SlabBottom => 8u8,
                     BlockModel::LayerBottom { height_px } => height_px,
+                    BlockModel::InsetSides { inset_px } => {
+                        if requested_layers.contains_render_layer(info.render_layer) {
+                            append_inset_sides_block(
+                                world,
+                                texture_lookup,
+                                (id, inset_px),
+                                [x, y, z],
+                                chunk_origin,
+                                chunk_offset,
+                                &faces,
+                                layered,
+                            );
+                        }
+                        continue;
+                    }
                     _ => continue,
                 };
                 if !id.is_voxel_filled() {
@@ -370,6 +387,88 @@ fn append_bottom_slabs_in_chunk(
                 }
             }
         }
+    }
+}
+
+/// A corner of a cell-sized face quad; side faces are pulled `inset` blocks
+/// into the cell (`BlockModel::InsetSides`).
+#[inline(always)]
+pub(crate) fn inset_side_corner(face: Face, corner: [i32; 3], inset: f32) -> [f32; 3] {
+    let mut p = [corner[0] as f32, corner[1] as f32, corner[2] as f32];
+    match face {
+        Face::North => p[2] = inset,
+        Face::South => p[2] = 1.0 - inset,
+        Face::West => p[0] = inset,
+        Face::East => p[0] = 1.0 - inset,
+        Face::Up | Face::Down => {}
+    }
+    p
+}
+
+/// Cactus: full top and bottom faces, culled like cube faces; the four inset
+/// sides are never culled (their textures carry the thorns at the edges).
+/// Inset faces get light from the cells beside them but no AO, which only
+/// applies to faces on the cell boundary.
+// Kept out of line and cold: inlined, it slowed the per-voxel loop of
+// `append_partial_blocks_in_chunk` by ~5 % (`greedy_ao_merge_report`).
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn append_inset_sides_block(
+    world: &impl BlockAccess,
+    texture_lookup: &BlockTextureLookup,
+    (id, inset_px): (BlockId, u8),
+    [x, y, z]: [i32; 3],
+    chunk_origin: IVec3,
+    chunk_offset: [f32; 3],
+    faces: &[(Face, [[i32; 3]; 4]); 6],
+    layered: &mut LayeredChunkGeometry,
+) {
+    let info = texture_lookup.info_for(id);
+    let inset = inset_px as f32 / 16.0;
+    let world_pos = chunk_origin + IVec3::new(x, y, z);
+    let mesh = layered.mesh_mut(info.render_layer);
+    for &(face, quad) in faces {
+        if matches!(face, Face::Up | Face::Down)
+            && !should_emit_cube_face(world, texture_lookup, world_pos, id, face)
+        {
+            continue;
+        }
+        let base_index = mesh.vertices.len() as u32;
+        let tex_layer = texture_lookup.layer_for_info(info, face);
+        let tint_kind = texture_lookup.tint_kind_for_info(info, face);
+        let quad_uvs = face_uvs_for_quad(face, quad);
+        for (corner_index, p) in quad.iter().enumerate() {
+            let vertex_local = inset_side_corner(face, *p, inset);
+            let (shade, light_packed) = face_vertex_shade_and_light(
+                world,
+                world_pos,
+                face,
+                RenderBounds::UNIT_CUBE,
+                vertex_local,
+            );
+            mesh.vertices.push(WorldVertex {
+                position: [
+                    x as f32 + vertex_local[0] + chunk_offset[0],
+                    y as f32 + vertex_local[1] + chunk_offset[1],
+                    z as f32 + vertex_local[2] + chunk_offset[2],
+                ],
+                uv: pack_uv(quad_uvs[corner_index][0], quad_uvs[corner_index][1]),
+                tex_layer,
+                shade: pack_shade(shade),
+                tint_kind: tint_kind as u8,
+                light_packed: light_packed as u8,
+                _pad: 0,
+            });
+        }
+        mesh.indices.extend_from_slice(&[
+            base_index,
+            base_index + 1,
+            base_index + 2,
+            base_index,
+            base_index + 2,
+            base_index + 3,
+        ]);
     }
 }
 
@@ -973,7 +1072,7 @@ fn build_chunk_mesh_layered_naive_dense_internal(
     use super::liquids::append_liquids_in_chunk_pooled;
     use super::plants::append_cross_plants_in_chunk_pooled;
 
-    append_bottom_slabs_in_chunk(
+    append_partial_blocks_in_chunk(
         neighborhood,
         neighborhood.center_chunk(),
         chunk_origin,
@@ -1341,7 +1440,7 @@ fn build_chunk_mesh_greedy_layered_dense_internal(
     use super::liquids::append_liquids_in_chunk_pooled;
     use super::plants::append_cross_plants_in_chunk_pooled;
 
-    append_bottom_slabs_in_chunk(
+    append_partial_blocks_in_chunk(
         neighborhood,
         neighborhood.center_chunk(),
         chunk_origin,
@@ -1511,7 +1610,7 @@ fn build_chunk_mesh_layered_naive_internal(
     use super::liquids::append_liquids_in_chunk_pooled;
     use super::plants::append_cross_plants_in_chunk_pooled;
 
-    append_bottom_slabs_in_chunk(
+    append_partial_blocks_in_chunk(
         world,
         chunk,
         chunk_origin,
@@ -1870,7 +1969,7 @@ fn build_chunk_mesh_greedy_layered_internal(
     use super::liquids::append_liquids_in_chunk_pooled;
     use super::plants::append_cross_plants_in_chunk_pooled;
 
-    append_bottom_slabs_in_chunk(
+    append_partial_blocks_in_chunk(
         world,
         chunk,
         chunk_origin,

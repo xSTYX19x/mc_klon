@@ -12,7 +12,7 @@ Status: 2026-03-07
 - shoreline post-processing: lake sand rims, Alpha sand/gravel beaches, clay
 - sea level in `WorldConfig` and `world.meta`
 - boundary-ocean visualization for hard world borders (preset-dependent)
-- foliage pass (flowers/mushrooms)
+- foliage pass (flowers, sugar cane, cacti, mushrooms)
 - ore generation as its own deterministic feature pass
 
 ## Current Ore Feature Contract
@@ -103,7 +103,12 @@ The order in `StreamingWorldColumnGenerator` (`render/chunkgen_worker.rs`):
    two low-frequency noises; a gravel beach loses its surface block), clay
    patches in sand under water, unsupported sand removed
 6. trees
-7. foliage/decorations
+7. foliage/decorations: flowers; sugar cane at water edges and cacti on dry sand
+   (temperate worlds only), each block only where its survival rule
+   (`blocks::plants`) holds inside the column; mushrooms only where a backward
+   light search shows the lit level stays at or below `MUSHROOM_MAX_LIGHT`
+   (borders count as possibly lit from the neighbor column), so their random
+   tick removes nothing after loading
 8. winter surface (winter worlds only): snow layers, ice on exposed water
    except water touching gravel (Alpha's gravel beaches stay liquid)
 9. grass settle (always last): grass under a skylight blocker or a fluid becomes dirt, using the same rule as the grass random tick (`blocks::grass_survives_under`), so freshly generated terrain causes no random-tick edits after loading

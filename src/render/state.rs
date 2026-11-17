@@ -69,7 +69,7 @@ use crate::config::render::{
 use crate::config::sim::RANDOM_TICK_SPEED_DEFAULT;
 use crate::meshing::{
     CpuMeshData, FULLBRIGHT_LIGHT_PACKED, MeshLayerMask, Vertex, WorldVertex,
-    face_corner_ao_shades, face_shade, pack_uv,
+    face_corner_ao_shades, face_shade, inset_side_corner, pack_uv,
 };
 use super::lighting_budget::LightingFrameBudget;
 use super::mesh_dispatch::mesh_inflight_job_cap;
@@ -3576,7 +3576,11 @@ fn build_block_preview_mesh_3d(
                 );
             }
         }
-        BlockModel::Cube | BlockModel::Liquid { .. } => {
+        model @ (BlockModel::Cube | BlockModel::Liquid { .. } | BlockModel::InsetSides { .. }) => {
+            let inset = match model {
+                BlockModel::InsetSides { inset_px } => inset_px as f32 / 16.0,
+                _ => 0.0,
+            };
             let faces = [
                 (Face::South, [[0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]]),
                 (Face::North, [[1, 0, 0], [0, 0, 0], [0, 1, 0], [1, 1, 0]]),
@@ -3586,8 +3590,10 @@ fn build_block_preview_mesh_3d(
                 (Face::Down, [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]]),
             ];
             for (face, corners) in faces {
-                let corners_f32 =
-                    corners.map(|p| [p[0] as f32 - 0.5, p[1] as f32 - 0.5, p[2] as f32 - 0.5]);
+                let corners_f32 = corners.map(|p| {
+                    let p = inset_side_corner(face, p, inset);
+                    [p[0] - 0.5, p[1] - 0.5, p[2] - 0.5]
+                });
                 let quad_uvs = preview_face_uvs_for_quad(face, corners);
                 append_preview_textured_quad(
                     &mut vertices,
@@ -15564,6 +15570,7 @@ impl State {
             BlockModel::Cube
             | BlockModel::SlabBottom
             | BlockModel::LayerBottom { .. }
+            | BlockModel::InsetSides { .. }
             | BlockModel::Liquid { .. } => self.mesh_layer_mask_for_block(block),
             BlockModel::CrossPlant => MeshLayerMask::NONE,
         }
@@ -15667,6 +15674,11 @@ impl State {
             BlockModel::Cube => self.cube_face_mesh_visible(current, neighbor, face),
             BlockModel::SlabBottom => self.slab_face_mesh_visible(current, neighbor, face),
             BlockModel::LayerBottom { .. } => self.slab_face_mesh_visible(current, neighbor, face),
+            // Inset sides are always drawn; only the caps meet the neighbors.
+            BlockModel::InsetSides { .. } => match face {
+                Face::Up | Face::Down => self.cube_face_mesh_visible(current, neighbor, face),
+                Face::North | Face::South | Face::East | Face::West => true,
+            },
             BlockModel::Liquid { .. } => {
                 self.liquid_face_mesh_visible(current.id, neighbor.id, face)
             }

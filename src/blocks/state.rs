@@ -308,6 +308,11 @@ pub(crate) const FLUID_PROPERTIES: [PropertySpec; 4] = [
     FLUID_STATIC.spec(),
 ];
 
+/// Random ticks a sugar cane or cactus block has counted toward the next block
+/// on top (Vanilla `age`, 0..=15).
+pub(crate) const PLANT_AGE: Property<u8> = views::age(0, 15);
+pub(crate) const PLANT_AGE_PROPERTIES: [PropertySpec; 1] = [PLANT_AGE.spec()];
+
 /// Which half of its cell a slab fills. Bottom is raw 0, so slabs saved before
 /// block states load as bottom slabs.
 pub(crate) const SLAB_HALF: Property<views::Half> = views::half(0);

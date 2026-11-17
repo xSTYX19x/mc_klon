@@ -228,8 +228,9 @@ nächsten billiger macht:
   aufgeht — die dort offene Frage "teilt Geometrie-State die 8 Bit von
   `block_data`?" ist unter "Block-States" beantwortet: ja)
   - *Ist:* **Kein Rendering-Fix, sondern ein Content-Feature mit
-    Voraussetzung.** Geometrie ist ein geschlossenes Enum mit 8 Varianten
-    (`BlockModelSpec`, `blocks/mod.rs:413-449`); Texturen unterscheiden nur
+    Voraussetzung.** Geometrie ist ein geschlossenes Enum mit 9 Varianten
+    (`BlockModelSpec`; seit 2026-11-17 auch `InsetSidesTopSideBottom` für den
+    Kaktus, gemesht im Teilblock-Pass `append_partial_blocks_in_chunk`); Texturen unterscheiden nur
     oben/Seite/unten (`BlockDef.textures: [TextureKey; 6]`, `:1807`). Es gibt
     keine Cuboid-Elemente, keine Per-Face-UVs, kein `cullface`, keine Rotation,
     keine Multipart-Modelle. Shapes sind **genau eine AABB** pro Block in
@@ -507,7 +508,7 @@ nächsten billiger macht:
 Quelle: `docs/planning/feature-reference-a1.0.17_04.md`. Aufgenommen sind nur Punkte, die im Code **fehlen**
 oder gegenüber dem heutigen Stand **erweitert** werden müssen; alles bereits
 Implementierte (Chunk-/Region-Storage, Terrain+Carver+Erz-Pässe, Bäume, Blumen,
-Pilze, Winterwelten, Wasser/Lava-Fluid-Sim, Tag/Nacht, Third-Person-Modell,
+Pilze, Zuckerrohr, Kaktus, Winterwelten, Wasser/Lava-Fluid-Sim, Tag/Nacht, Third-Person-Modell,
 Niederschlag, Screenshots, Menüs/Options/Settings, Ticking-Areas) steht nicht
 mehr hier. Multiplayer/SMP (Abschnitt 8 der Featureliste) ist explizit
 ausgeklammert.
@@ -535,7 +536,7 @@ Waterlogging, Grenze von 256 Blocktypen.
 
 Die Datenschicht, an der ca. 60 % der Liste unten hängen (Treppen, Zaun, Tür,
 Leiter, Fackel, Schiene, Hebel, Knopf, Druckplatte, Redstone-Staub, Schild,
-Kaktus/Zuckerrohr-/Weizen-Alter, Schneehöhe), steht seit 2026-11-16; diese
+Weizen-Alter, Schneehöhe), steht seit 2026-11-16; diese
 Blöcke warten jetzt auf ihre Formen unter "Rendering / Blockmodelle und
 Voxel-Shapes". Hier bleibt die Speicher- und Contract-Seite.
 
@@ -549,8 +550,8 @@ Voxel-Shapes". Hier bleibt die Speicher- und Contract-Seite.
   (`with_properties`): heute der Setzling (`stage`, Bit 0), die vier
   Fluid-Blöcke (`level` 0x0F, `static` 0x20, `source` 0x40, `falling` 0x80;
   Bit 0x10 frei), über deren Sichten auch die `fluid_data_*`-Helfer laufen,
-  seit 2026-11-17 die Stufe (`half`, Bit 0) und beide Öfen (`facing`, Bits
-  0-1). `StateForm` (`with_shape_half`, `with_front_facing`) sagt Shapes und
+  seit 2026-11-17 die Stufe (`half`, Bit 0), beide Öfen (`facing`, Bits
+  0-1) sowie Zuckerrohr und Kaktus (`age` 0-15, Bits 0-3). `StateForm` (`with_shape_half`, `with_front_facing`) sagt Shapes und
   Mesher, welche Properties Form oder Modell ändern; der Mesher liest sie aus
   einer eigenen Tabelle in `BlockTextureLookup`, weil ein weiteres Feld
   `BlockTextureInfo` über 64 Byte hob und den Greedy-Pass ~12 % kostete.
@@ -640,8 +641,7 @@ Planken bzw. Stein — beim Modellbau bewusst so umsetzen.
   `CollisionShape::Aabb` höher als der Voxel, prüfen ob
   `move_with_collisions` das trägt), Leiter, Holz-/Eisentür (2 Blöcke hoch,
   `Half`+`Facing4`+`Open`), Schild (Boden/Wand + Textinhalt → Block-Entity),
-  Kaktus (Kontaktschaden, nur auf Sand, keine direkten Nachbarblöcke),
-  Zuckerrohr, Schneedecke mit Höhenstufen 1-8, Ackerboden und Weizenpflanze
+  Schneedecke mit Höhenstufen 1-8, Ackerboden und Weizenpflanze
   mit Wachstumsstufen (Random-Tick; beides fehlt heute ganz).
 - **Feuer** (neu 2026-11-17; in der Vorlage enthalten, fehlt heute ganz)
   - *Ist:* Es gibt keinen Feuer-Block, keine Brennbarkeit in `BlockSpec` und
@@ -1037,8 +1037,11 @@ schon genau richtig gebaut und muss nur gefüllt werden: `App::break_held` +
   selbst ist nicht Teil dieser Liste.
 - **Ersticken**: Kopfzelle solide → Schaden. `aabb_collides`
   (`player/mod.rs:135`) beantwortet das direkt.
-- **Kaktus**: Kontaktschaden über die AABB-Überlappung, sobald der Block
-  existiert (siehe "Blöcke").
+- **Kaktus**: Kontaktschaden bei Berührung. Den Block gibt es seit 2026-11-17
+  (`BlockId::Cactus`); seine Kollisionsbox ist die Auswahlbox (seitlich 1/16
+  eingerückt, volle Höhe), der Spieler überlappt sie also nie. Die Berührung
+  daher gegen die um ein Epsilon vergrößerte Box prüfen (Vanilla macht die
+  Kollisionsbox dafür 1/16 niedriger).
 - Alle Quellen laufen über **eine** Funktion `apply_damage(&mut Player, amount,
   DamageSource)` mit gemeinsamer Unverwundbarkeitszeit (Vorlage: 0.5 s), sonst
   addieren sich Lava und Feuer pro Tick doppelt.
@@ -1593,10 +1596,6 @@ Alles hier gehört in die dokumentierte Phasenreihenfolge aus
   `worldgen/ores.rs`). Kein neuer Nachbearbeitungspass, sondern dieselbe
   Technik. Blockiert zusätzlich durch Spawner (Block-Entity) und Truhen
   (Inhalt) — der Raum selbst kann aber vorher stehen
-- **Zuckerrohr** an Stränden, **Kaktus** auf Sand (beide max. 3 hoch).
-  Beides in die Foliage-Phase (7) neben Blumen/Pilze; `apply_flowers_to_column`
-  (`chunkgen_worker.rs:1474`) ist die direkte Vorlage inklusive
-  Untergrundprüfung und Patch-Radius. Beide brauchen erst die Blöcke
 - **Winterwelten als Welterstellungs-Option mit 25 % Chance**.
   `WorldEnvironment::Winter` und der Schnee-/Eis-Pass
   (`apply_winter_surface_to_column`, `chunkgen_worker.rs:1705`) existieren

@@ -9,6 +9,9 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, select};
 use glam::IVec3;
 
+use crate::blocks::plants::{
+    COLUMN_PLANT_MAX_HEIGHT, MUSHROOM_MAX_LIGHT, cactus_can_stay, sugar_cane_can_stay,
+};
 use crate::blocks::{BlockId, grass_survives_under};
 use crate::meshing::{CpuMeshData, FULLBRIGHT_LIGHT_PACKED, Vertex};
 use crate::perf::trace as perf_trace;
@@ -100,6 +103,16 @@ const MUSHROOM_PATCH_RADIUS: i32 = 4;
 const WINTER_MAX_SNOW_Y: i32 = WORLD_MAX_Y - 1;
 const MUSHROOM_PATCH_PLACEMENTS_MIN: i32 = 5;
 const MUSHROOM_PATCH_PLACEMENTS_MAX: i32 = 12;
+const SUGAR_CANE_SALT: u64 = 0x2C6E_D5A1;
+const SUGAR_CANE_PATCH_ATTEMPTS_PER_CHUNK: i32 = 10;
+const SUGAR_CANE_PATCH_RADIUS: i32 = 3;
+const SUGAR_CANE_PATCH_PLACEMENTS_MIN: i32 = 8;
+const SUGAR_CANE_PATCH_PLACEMENTS_MAX: i32 = 16;
+const CACTUS_SALT: u64 = 0x6B3F_19E7;
+const CACTUS_PATCH_ATTEMPTS_PER_CHUNK: i32 = 10;
+const CACTUS_PATCH_RADIUS: i32 = 3;
+const CACTUS_PATCH_PLACEMENTS_MIN: i32 = 4;
+const CACTUS_PATCH_PLACEMENTS_MAX: i32 = 10;
 const LOD_GRID_CELLS_PER_CHUNK: i32 = 4;
 const GENERATED_COLUMN_CACHE_MAX_ENTRIES: usize = 384;
 const GENERATED_COLUMN_HISTORY_MAX_ENTRIES: usize = 4096;
@@ -1772,9 +1785,79 @@ fn find_dark_mushroom_ground_y(
         if has_sky_access(column, local_x, candidate_y, local_z) {
             continue;
         }
+        if !mushroom_stays_dark_enough(column, local_x, candidate_y, local_z) {
+            continue;
+        }
         return Some(ground_y);
     }
     None
+}
+
+/// Whether the light engine, once this column is lit, keeps the cell at or
+/// below `MUSHROOM_MAX_LIGHT`, so the mushroom random tick never removes what
+/// worldgen placed. Mirrors the engine's rules (`World` light propagation):
+/// skylight is 15 in every cell with nothing skylight-blocking above it, keeps
+/// its level going down and loses one per step sideways or up; block light
+/// loses one per step in every direction. Searches back from the cell within
+/// the 2 steps that 15 can lose before reaching 13; moving up is free, which
+/// over-counts block light and so errs towards rejecting. Light from the
+/// neighboring columns, invisible here, can enter through a border cell at up
+/// to 14: leaving the column within the budget counts as too bright.
+fn mushroom_stays_dark_enough(column: &ColumnBuffer, local_x: i32, y: i32, local_z: i32) -> bool {
+    const BUDGET: u8 = 15 - (MUSHROOM_MAX_LIGHT + 1);
+    let too_bright = |emitted: u8, cost: u8| emitted.saturating_sub(cost) > MUSHROOM_MAX_LIGHT;
+    let start = IVec3::new(local_x, y, local_z);
+    let mut best_cost: HashMap<IVec3, u8> = HashMap::from([(start, 0)]);
+    let mut queue: VecDeque<(IVec3, u8)> = VecDeque::from([(start, 0)]);
+    while let Some((pos, cost)) = queue.pop_front() {
+        if best_cost.get(&pos).is_some_and(|&best| best < cost) {
+            continue;
+        }
+        if too_bright(column.get_block(pos.x, pos.y, pos.z).emitted_light(), cost) {
+            return false;
+        }
+        if pos.y >= WORLD_MAX_Y {
+            // Reached the top through cells that pass skylight: open sky.
+            return false;
+        }
+        for (dir, step) in [
+            (IVec3::Y, 0),
+            (IVec3::NEG_Y, 1),
+            (IVec3::X, 1),
+            (IVec3::NEG_X, 1),
+            (IVec3::Z, 1),
+            (IVec3::NEG_Z, 1),
+        ] {
+            let next_cost = cost + step;
+            if next_cost > BUDGET {
+                continue;
+            }
+            let next = pos + dir;
+            if next.y < 0 {
+                continue;
+            }
+            if !(0..CHUNK_SIZE).contains(&next.x) || !(0..CHUNK_SIZE).contains(&next.z) {
+                return false;
+            }
+            let block = column.get_block(next.x, next.y, next.z);
+            if block.blocks_skylight() {
+                if too_bright(block.emitted_light(), next_cost) {
+                    return false;
+                }
+                continue;
+            }
+            if best_cost.get(&next).is_some_and(|&best| best <= next_cost) {
+                continue;
+            }
+            best_cost.insert(next, next_cost);
+            if step == 0 {
+                queue.push_front((next, next_cost));
+            } else {
+                queue.push_back((next, next_cost));
+            }
+        }
+    }
+    true
 }
 
 fn collect_dark_mushroom_starts(
@@ -1878,6 +1961,170 @@ fn apply_mushrooms_to_column(
     }
 }
 
+/// The column as the plant rules see it, in column-local coordinates: cells
+/// in the neighboring columns count as stone, so a rule that needs one of them
+/// (water beside cane, air beside cactus) fails instead of guessing, and the
+/// result never depends on the neighbors.
+fn column_cell_or_stone(column: &ColumnBuffer, pos: IVec3) -> BlockId {
+    if (0..CHUNK_SIZE).contains(&pos.x) && (0..CHUNK_SIZE).contains(&pos.z) {
+        column.get_block(pos.x, pos.y, pos.z)
+    } else {
+        BlockId::Stone
+    }
+}
+
+/// The highest `ground` block with air above, scanning down from just above
+/// the terrain estimate like `find_flower_ground_y`.
+fn find_plant_ground_y(
+    column: &ColumnBuffer,
+    local_x: i32,
+    local_z: i32,
+    surface_y: i32,
+    ground: impl Fn(BlockId) -> bool,
+) -> Option<i32> {
+    let start_y = (surface_y + 2).clamp(1, WORLD_MAX_Y - 2);
+    let min_y = (start_y - FLOWER_SURFACE_SCAN_DEPTH).max(1);
+    (min_y..=start_y).rev().find(|&y| {
+        ground(column.get_block(local_x, y, local_z))
+            && column.get_block(local_x, y + 1, local_z) == BlockId::Air
+    })
+}
+
+/// Stacks up to `height` blocks from `y`, each only where the plant's own
+/// survival rule holds, so nothing generated breaks on its first update.
+fn place_column_plant(
+    column: &mut ColumnBuffer,
+    (local_x, y, local_z): (i32, i32, i32),
+    block: BlockId,
+    height: i32,
+    can_stay: impl Fn(&ColumnBuffer, IVec3) -> bool,
+) {
+    for dy in 0..height.min(COLUMN_PLANT_MAX_HEIGHT) {
+        let pos = IVec3::new(local_x, y + dy, local_z);
+        if !ColumnBuffer::in_bounds(pos.x, pos.y, pos.z)
+            || column.get_block(pos.x, pos.y, pos.z) != BlockId::Air
+            || !can_stay(column, pos)
+        {
+            break;
+        }
+        column_set_block(column, pos.x, pos.y, pos.z, block);
+    }
+}
+
+/// A patch scatter like `apply_flowers_to_column`: `try_place` gets the rng and
+/// a column position inside the chunk.
+fn scatter_patches(
+    rng: &mut SplitMix64,
+    attempts: i32,
+    radius: i32,
+    placements: (i32, i32),
+    mut try_place: impl FnMut(&mut SplitMix64, i32, i32),
+) {
+    for _ in 0..attempts {
+        let center_x = rng.range_i32(0, CHUNK_SIZE - 1);
+        let center_z = rng.range_i32(0, CHUNK_SIZE - 1);
+        let count = rng.range_i32(placements.0, placements.1);
+        for _ in 0..count {
+            let local_x = center_x + rng.range_i32(-radius, radius);
+            let local_z = center_z + rng.range_i32(-radius, radius);
+            if (0..CHUNK_SIZE).contains(&local_x) && (0..CHUNK_SIZE).contains(&local_z) {
+                try_place(rng, local_x, local_z);
+            }
+        }
+    }
+}
+
+/// Sugar cane at the water's edge (Vanilla `WorldGenReed`; 2-3 tall here, the
+/// growth cap): on grass, dirt or sand open to the sky, with water beside the
+/// ground block inside this column.
+fn apply_sugar_cane_to_column(
+    column: &mut ColumnBuffer,
+    world_cfg: &WorldConfig,
+    preset: WorldgenPreset,
+    chunk_x: i32,
+    chunk_z: i32,
+    terrain_sampler: &TerrainSampler,
+) {
+    let mut rng = lake_rng(world_cfg.seed, preset, chunk_x, chunk_z, SUGAR_CANE_SALT);
+    scatter_patches(
+        &mut rng,
+        SUGAR_CANE_PATCH_ATTEMPTS_PER_CHUNK,
+        SUGAR_CANE_PATCH_RADIUS,
+        (SUGAR_CANE_PATCH_PLACEMENTS_MIN, SUGAR_CANE_PATCH_PLACEMENTS_MAX),
+        |rng, local_x, local_z| {
+            let extra_max = rng.range_i32(0, 1);
+            let height = 2 + rng.range_i32(0, extra_max);
+            let world_x = chunk_x * CHUNK_SIZE + local_x;
+            let world_z = chunk_z * CHUNK_SIZE + local_z;
+            let surface_y = terrain_sampler.height_at(world_x, world_z, WORLD_MAX_Y);
+            let Some(ground_y) = find_plant_ground_y(column, local_x, local_z, surface_y, |b| {
+                matches!(b, BlockId::Grass | BlockId::Dirt | BlockId::Sand)
+            }) else {
+                return;
+            };
+            if !has_sky_access(column, local_x, ground_y + 1, local_z) {
+                return;
+            }
+            place_column_plant(
+                column,
+                (local_x, ground_y + 1, local_z),
+                BlockId::SugarCane,
+                height,
+                |column, pos| sugar_cane_can_stay(|p| column_cell_or_stone(column, p), pos),
+            );
+        },
+    );
+}
+
+/// Cacti on dry sand (Vanilla `WorldGenCactus`, 1-3 tall): sand at or above
+/// sea level, open to the sky, with no water beside it and nothing beside the
+/// cactus.
+fn apply_cacti_to_column(
+    column: &mut ColumnBuffer,
+    world_cfg: &WorldConfig,
+    preset: WorldgenPreset,
+    chunk_x: i32,
+    chunk_z: i32,
+    terrain_sampler: &TerrainSampler,
+) {
+    let mut rng = lake_rng(world_cfg.seed, preset, chunk_x, chunk_z, CACTUS_SALT);
+    scatter_patches(
+        &mut rng,
+        CACTUS_PATCH_ATTEMPTS_PER_CHUNK,
+        CACTUS_PATCH_RADIUS,
+        (CACTUS_PATCH_PLACEMENTS_MIN, CACTUS_PATCH_PLACEMENTS_MAX),
+        |rng, local_x, local_z| {
+            let extra_max = rng.range_i32(0, 2);
+            let height = 1 + rng.range_i32(0, extra_max);
+            let world_x = chunk_x * CHUNK_SIZE + local_x;
+            let world_z = chunk_z * CHUNK_SIZE + local_z;
+            let surface_y = terrain_sampler.height_at(world_x, world_z, WORLD_MAX_Y);
+            let Some(ground_y) = find_plant_ground_y(column, local_x, local_z, surface_y, |b| {
+                b == BlockId::Sand
+            }) else {
+                return;
+            };
+            let ground = IVec3::new(local_x, ground_y, local_z);
+            let wet = [IVec3::X, IVec3::NEG_X, IVec3::Z, IVec3::NEG_Z]
+                .into_iter()
+                .any(|dir| is_water_block(column_cell_or_stone(column, ground + dir)));
+            if ground_y < world_cfg.sea_level
+                || wet
+                || !has_sky_access(column, local_x, ground_y + 1, local_z)
+            {
+                return;
+            }
+            place_column_plant(
+                column,
+                (local_x, ground_y + 1, local_z),
+                BlockId::Cactus,
+                height,
+                |column, pos| cactus_can_stay(|p| column_cell_or_stone(column, p), pos),
+            );
+        },
+    );
+}
+
 fn apply_foliage_to_column(
     column: &mut ColumnBuffer,
     world_cfg: &WorldConfig,
@@ -1887,6 +2134,12 @@ fn apply_foliage_to_column(
     terrain_sampler: &TerrainSampler,
 ) {
     apply_flowers_to_column(column, world_cfg, preset, chunk_x, chunk_z, terrain_sampler);
+    // Winter freezes the shore water and snows the sand over: neither plant
+    // would keep its footing there.
+    if !world_cfg.environment().enables_winter_surface_rules() {
+        apply_sugar_cane_to_column(column, world_cfg, preset, chunk_x, chunk_z, terrain_sampler);
+        apply_cacti_to_column(column, world_cfg, preset, chunk_x, chunk_z, terrain_sampler);
+    }
     apply_mushrooms_to_column(column, world_cfg, preset, chunk_x, chunk_z, terrain_sampler);
 }
 
@@ -2073,7 +2326,7 @@ impl StreamingWorldColumnGenerator {
         apply_trees_to_column(out, &cfg, self.preset, cx, cz, terrain_sampler);
         stage_timings.trees = stage_started.elapsed();
         ctx.report_progress("Trees", 6, 7);
-        // 7) Foliage (flowers + mushrooms)
+        // 7) Foliage (flowers, sugar cane, cacti, mushrooms)
         let stage_started = Instant::now();
         apply_foliage_to_column(out, &cfg, self.preset, cx, cz, terrain_sampler);
         stage_timings.foliage = stage_started.elapsed();
@@ -2760,9 +3013,12 @@ mod tests {
         build_generated_section_snapshots, generate_streaming_column_buffer,
         generate_streaming_column_for_test,
     };
+    use super::mushroom_stays_dark_enough;
+    use crate::blocks::plants::{MUSHROOM_MAX_LIGHT, cactus_can_stay, sugar_cane_can_stay};
     use crate::blocks::{BlockId, grass_survives_under};
     use crate::world::fluids::{fluid_data_is_source_origin, fluid_data_is_worldgen_static};
-    use crate::world::{Chunk, WorldEnvironment};
+    use crate::world::{Chunk, ChunkCoord, World, WorldEnvironment};
+    use glam::IVec3;
     use crate::worldgen::ColumnBuffer;
     use crate::worldgen::WorldgenPreset;
 
@@ -3339,6 +3595,147 @@ mod tests {
     /// would settle it into: no grass under a skylight blocker or a fluid.
     /// Before the settle pass 16-26 % of all generated grass was buried, and
     /// every visited column got remeshed and saved once to settle it.
+    /// Hilly chunk columns within `radius` chunks whose heightmap crosses sea
+    /// level: coasts, where sugar cane grows.
+    fn hilly_coast_chunks(seed: u64, radius: i32) -> Vec<(i32, i32)> {
+        let sampler = TerrainSampler::new(WorldGenConfig::from_preset_with_sea_level(
+            worldgen_seed32(seed),
+            WorldgenPreset::Hilly,
+            SEA_LEVEL,
+        ));
+        let mut found = Vec::new();
+        for cz in -radius..=radius {
+            for cx in -radius..=radius {
+                let heights = (0..4).map(|i| {
+                    sampler.height_at(cx * 16 + (i % 2) * 8 + 4, cz * 16 + (i / 2) * 8 + 4, 255)
+                });
+                let (low, high) = heights.fold((i32::MAX, i32::MIN), |(lo, hi), h| {
+                    (lo.min(h), hi.max(h))
+                });
+                if low < SEA_LEVEL && high >= SEA_LEVEL {
+                    found.push((cx, cz));
+                }
+            }
+        }
+        found
+    }
+
+    fn count_blocks(column: &ColumnBuffer, block: BlockId) -> usize {
+        (0..=WORLD_MAX_Y)
+            .flat_map(|y| (0..CHUNK_SIZE).flat_map(move |z| (0..CHUNK_SIZE).map(move |x| (x, y, z))))
+            .filter(|&(x, y, z)| column.get_block(x, y, z) == block)
+            .count()
+    }
+
+    /// The columns as the game holds them after loading: sections in a
+    /// `World`, lit by the light engine.
+    fn lit_world(cfg: WorldConfig, preset: WorldgenPreset, columns: &[(i32, i32)]) -> World {
+        let mut world = World::new();
+        let mut coords = Vec::new();
+        for &(cx, cz) in columns {
+            let column = generate_streaming_column_for_test(cfg, preset, cx, cz);
+            for chunk_y in world.min_chunk_y()..=world.max_chunk_y() {
+                let chunk = column.extract_chunk(chunk_y);
+                if chunk.is_empty() {
+                    continue;
+                }
+                let coord = ChunkCoord {
+                    x: cx,
+                    y: chunk_y,
+                    z: cz,
+                };
+                world.chunks.insert(coord, chunk);
+                coords.push(coord);
+            }
+        }
+        world.lighting_on_chunks_added(&coords);
+        world
+    }
+
+    /// Worldgen places sugar cane, cacti and mushrooms only where they
+    /// survive. In a lit 3×3 block of columns around a coast with cane, every
+    /// plant of the middle column keeps its footing and every mushroom there
+    /// sits at light 12 or less, so its random tick changes nothing after
+    /// loading. The dark-enough check is also held against the engine for
+    /// every covered air cell.
+    #[test]
+    fn generated_plants_survive_once_lit() {
+        let (mut cane, mut dark_cells) = (0, 0);
+        for seed in SEA_SEEDS {
+            let cfg = WorldConfig {
+                seed,
+                ..WorldConfig::default()
+            };
+            let (cx, cz) = hilly_coast_chunks(seed, 96)
+                .into_iter()
+                .take(12)
+                .find(|&(cx, cz)| {
+                    let column =
+                        generate_streaming_column_for_test(cfg, WorldgenPreset::Hilly, cx, cz);
+                    count_blocks(&column, BlockId::SugarCane) > 0
+                })
+                .expect("no coast with sugar cane");
+            let columns: Vec<(i32, i32)> = (-1..=1)
+                .flat_map(|dz| (-1..=1).map(move |dx| (cx + dx, cz + dz)))
+                .collect();
+            let world = lit_world(cfg, WorldgenPreset::Hilly, &columns);
+            let column = generate_streaming_column_for_test(cfg, WorldgenPreset::Hilly, cx, cz);
+            let light_at = |pos: IVec3| {
+                let light = world.get_light(pos);
+                light.sky.max(light.block)
+            };
+            for z in 0..CHUNK_SIZE {
+                for x in 0..CHUNK_SIZE {
+                    let top_blocker = (0..=WORLD_MAX_Y)
+                        .rev()
+                        .find(|&y| column.get_block(x, y, z).blocks_skylight())
+                        .unwrap_or(0);
+                    for y in 1..WORLD_MAX_Y {
+                        let pos = IVec3::new(cx * CHUNK_SIZE + x, y, cz * CHUNK_SIZE + z);
+                        let block = world.get_block(pos);
+                        let at = format!("seed {seed}, ({}, {y}, {})", pos.x, pos.z);
+                        match block {
+                            BlockId::SugarCane => {
+                                cane += 1;
+                                assert!(sugar_cane_can_stay(|p| world.get_block(p), pos), "{at}");
+                            }
+                            BlockId::Cactus => {
+                                assert!(cactus_can_stay(|p| world.get_block(p), pos), "{at}");
+                            }
+                            BlockId::BrownMushroom | BlockId::RedMushroom => {
+                                assert!(light_at(pos) <= MUSHROOM_MAX_LIGHT, "{at}");
+                            }
+                            BlockId::Air
+                                if y < top_blocker && mushroom_stays_dark_enough(&column, x, y, z) =>
+                            {
+                                dark_cells += 1;
+                                assert!(light_at(pos) <= MUSHROOM_MAX_LIGHT, "{at}: dark cell lit");
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cane > 0, "no sugar cane on the beaches");
+        assert!(dark_cells > 0, "the dark-enough check accepted nothing");
+    }
+
+    #[test]
+    fn plants_are_deterministic_for_same_seed_and_column() {
+        for seed in SEA_SEEDS {
+            let cfg = WorldConfig {
+                seed,
+                ..WorldConfig::default()
+            };
+            let (cx, cz) = hilly_coast_chunks(seed, 96)[0];
+            let a = generate_streaming_column_for_test(cfg, WorldgenPreset::Hilly, cx, cz);
+            let b = generate_streaming_column_for_test(cfg, WorldgenPreset::Hilly, cx, cz);
+            assert_eq!(a.blocks, b.blocks);
+            assert_eq!(a.data, b.data);
+        }
+    }
+
     #[test]
     fn generated_grass_is_never_covered() {
         let presets = [
@@ -3945,4 +4342,3 @@ impl Drop for ChunkGenWorkerPool {
         }
     }
 }
-

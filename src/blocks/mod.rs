@@ -10,14 +10,19 @@ use crate::world::fluids::FluidKind;
 
 mod falling;
 pub(crate) mod placement;
+pub(crate) mod plants;
 pub(crate) mod state;
 
 use placement::{OnPlaceFn, front_toward_placer, slab_on_place};
+use plants::{
+    cactus_neighbor_changed, cactus_on_place, column_plant_random_tick, mushroom_random_tick,
+    sugar_cane_neighbor_changed, sugar_cane_on_place,
+};
 pub(crate) use state::BlockState;
 use state::views::{Facing4, Half};
 use state::{
-    FLUID_PROPERTIES, FURNACE_FACING, FURNACE_PROPERTIES, Property, PropertySpec,
-    SAPLING_PROPERTIES, SAPLING_STAGE, SLAB_HALF, SLAB_PROPERTIES, StateForm,
+    FLUID_PROPERTIES, FURNACE_FACING, FURNACE_PROPERTIES, PLANT_AGE_PROPERTIES, Property,
+    PropertySpec, SAPLING_PROPERTIES, SAPLING_STAGE, SLAB_HALF, SLAB_PROPERTIES, StateForm,
 };
 
 pub(crate) const TEX_STONE: &str = "minecraft:textures/block/stone.png";
@@ -91,6 +96,10 @@ pub(crate) const TEX_FURNACE_FRONT_ON: &str = "minecraft:textures/block/furnace_
 pub(crate) const TEX_JUKEBOX_TOP: &str = "minecraft:textures/block/jukebox_top.png";
 pub(crate) const TEX_JUKEBOX_SIDE: &str = "minecraft:textures/block/jukebox_side.png";
 pub(crate) const TEX_SPAWNER: &str = "minecraft:textures/block/spawner.png";
+pub(crate) const TEX_SUGAR_CANE: &str = "minecraft:textures/block/sugar_cane.png";
+pub(crate) const TEX_CACTUS_TOP: &str = "minecraft:textures/block/cactus_top.png";
+pub(crate) const TEX_CACTUS_SIDE: &str = "minecraft:textures/block/cactus_side.png";
+pub(crate) const TEX_CACTUS_BOTTOM: &str = "minecraft:textures/block/cactus_bottom.png";
 pub(crate) const CORE_FURNACE_STUB_BLOCK_ENTITY_KEY: &str = "core:furnace_stub";
 pub(crate) const CORE_MISSING_BLOCK_KEY: &str = "core:missing";
 
@@ -276,6 +285,9 @@ pub(crate) enum BlockModel {
     CrossPlant,
     SlabBottom,
     LayerBottom { height_px: u8 },
+    /// Full top and bottom faces; the four side faces sit `inset_px` inside
+    /// the cell (cactus).
+    InsetSides { inset_px: u8 },
     Liquid { kind: FluidKind },
 }
 
@@ -313,6 +325,10 @@ const FULL_CUBE_AABB: BlockAabb = BlockAabb::from_pixels([0, 0, 0], [16, 16, 16]
 const LOWER_SLAB_AABB: BlockAabb = BlockAabb::from_pixels([0, 0, 0], [16, 8, 16]);
 const UPPER_SLAB_AABB: BlockAabb = BlockAabb::from_pixels([0, 8, 0], [16, 16, 16]);
 const SNOW_LAYER_AABB: BlockAabb = BlockAabb::from_pixels([0, 0, 0], [16, 2, 16]);
+
+const fn inset_sides_aabb(inset_px: u8) -> BlockAabb {
+    BlockAabb::from_pixels([inset_px, 0, inset_px], [16 - inset_px, 16, 16 - inset_px])
+}
 // Shared plant selection box: slightly inset from the block edges and one pixel shy of full height.
 const CROSS_PLANT_SELECTION_AABB: BlockAabb = BlockAabb::from_pixels([1, 0, 1], [15, 15, 15]);
 
@@ -480,6 +496,13 @@ enum BlockModelSpec {
         south: TextureKey,
         east: TextureKey,
         west: TextureKey,
+    },
+    /// `BlockModel::InsetSides`; selected and collided as the inset box.
+    InsetSidesTopSideBottom {
+        inset_px: u8,
+        top: TextureKey,
+        side: TextureKey,
+        bottom: TextureKey,
     },
     LayerBottomTopSideBottom {
         height_px: u8,
@@ -765,6 +788,11 @@ impl BlockSpec {
         self
     }
 
+    const fn with_on_neighbor_changed(mut self, hook: NeighborFn) -> Self {
+        self.on_neighbor_changed = Some(hook);
+        self
+    }
+
     /// Unsupported, the block drops onto the first solid block below.
     const fn falls(mut self) -> Self {
         self.falls = true;
@@ -799,6 +827,9 @@ impl BlockSpec {
                 } else {
                     CollisionShape::Aabb(BlockAabb::from_pixels([0, 0, 0], [16, height_px, 16]))
                 }
+            }
+            BlockModelSpec::InsetSidesTopSideBottom { inset_px, .. } => {
+                CollisionShape::Aabb(inset_sides_aabb(inset_px))
             }
             _ => CollisionShape::FullCube,
         }
@@ -837,6 +868,9 @@ impl BlockSpec {
                 }
             }
             BlockModelSpec::PlantCross { .. } => CollisionShape::Aabb(CROSS_PLANT_SELECTION_AABB),
+            BlockModelSpec::InsetSidesTopSideBottom { inset_px, .. } => {
+                CollisionShape::Aabb(inset_sides_aabb(inset_px))
+            }
             _ => CollisionShape::FullCube,
         }
     }
@@ -914,6 +948,25 @@ impl BlockSpec {
                 cull_group,
             ),
             BlockModelSpec::PlantCross { texture } => BlockDef::plant_cross(texture),
+            BlockModelSpec::InsetSidesTopSideBottom {
+                inset_px,
+                top,
+                side,
+                bottom,
+            } => {
+                let mut def = BlockDef::cube_top_side_bottom(
+                    top,
+                    side,
+                    bottom,
+                    self.solid,
+                    self.breakable,
+                    self.face_occluding,
+                    self.render_layer,
+                    cull_group,
+                );
+                def.model = BlockModel::InsetSides { inset_px };
+                def
+            }
             BlockModelSpec::SlabBottomTopSideBottom { top, side, bottom } => {
                 BlockDef::slab_bottom_top_side_bottom(
                     top,
@@ -1150,10 +1203,12 @@ blocks! {
     BrownMushroom => BlockSpec::plant(
         "minecraft:brown_mushroom", "Brown Mushroom", TEX_BROWN_MUSHROOM, [0.52, 0.36, 0.25],
     )
+    .with_random_tick(mushroom_random_tick)
     .with_creative_order(14),
     RedMushroom => BlockSpec::plant(
         "minecraft:red_mushroom", "Red Mushroom", TEX_RED_MUSHROOM, [0.80, 0.23, 0.21],
     )
+    .with_random_tick(mushroom_random_tick)
     .with_creative_order(15),
     CoalOre => BlockSpec::cube("minecraft:coal_ore", "Coal Ore", TEX_COAL_ORE, [0.43, 0.43, 0.43])
         .with_creative_order(37),
@@ -1319,6 +1374,32 @@ blocks! {
     .with_cull(CullGroupSpec::None)
     .non_occluding()
     .with_creative_order(53),
+    SugarCane => BlockSpec::plant(
+        "minecraft:sugar_cane", "Sugar Cane", TEX_SUGAR_CANE, [0.58, 0.76, 0.39],
+    )
+    .with_random_tick(column_plant_random_tick)
+    .with_on_neighbor_changed(sugar_cane_neighbor_changed)
+    .with_on_place(sugar_cane_on_place)
+    .with_properties(&PLANT_AGE_PROPERTIES)
+    .with_creative_order(54),
+    Cactus => BlockSpec::new(
+        "minecraft:cactus", "Cactus",
+        BlockModelSpec::InsetSidesTopSideBottom {
+            inset_px: 1,
+            top: TEX_CACTUS_TOP,
+            side: TEX_CACTUS_SIDE,
+            bottom: TEX_CACTUS_BOTTOM,
+        },
+        [0.36, 0.53, 0.19],
+    )
+    .with_layer(RenderLayer::Cutout)
+    .with_cull(CullGroupSpec::None)
+    .non_occluding()
+    .with_random_tick(column_plant_random_tick)
+    .with_on_neighbor_changed(cactus_neighbor_changed)
+    .with_on_place(cactus_on_place)
+    .with_properties(&PLANT_AGE_PROPERTIES)
+    .with_creative_order(55),
 }
 
 #[inline(always)]
@@ -1587,6 +1668,7 @@ impl BlockDef {
             BlockModel::Cube
             | BlockModel::SlabBottom
             | BlockModel::LayerBottom { .. }
+            | BlockModel::InsetSides { .. }
             | BlockModel::Liquid { .. } => self.textures[face.as_usize()],
             BlockModel::CrossPlant => self
                 .plant_texture
@@ -1599,6 +1681,7 @@ impl BlockDef {
             BlockModel::Cube
             | BlockModel::SlabBottom
             | BlockModel::LayerBottom { .. }
+            | BlockModel::InsetSides { .. }
             | BlockModel::Liquid { .. } => self.face_tint_kinds[face.as_usize()],
             BlockModel::CrossPlant => TINT_NONE,
         }
@@ -1723,6 +1806,7 @@ impl BlockRegistry {
                 BlockModel::Cube
                 | BlockModel::SlabBottom
                 | BlockModel::LayerBottom { .. }
+                | BlockModel::InsetSides { .. }
                 | BlockModel::Liquid { .. } => {
                     for key in def.textures {
                         keys.insert(key.to_string());
@@ -1901,6 +1985,7 @@ impl BlockTextureLookup {
             BlockModel::Cube
             | BlockModel::SlabBottom
             | BlockModel::LayerBottom { .. }
+            | BlockModel::InsetSides { .. }
             | BlockModel::Liquid { .. } => info.cube_layers.layer_for_face(face),
             BlockModel::CrossPlant => info.plant_layer.unwrap_or(self.missing_layer),
         }
@@ -1912,6 +1997,7 @@ impl BlockTextureLookup {
             BlockModel::Cube
             | BlockModel::SlabBottom
             | BlockModel::LayerBottom { .. }
+            | BlockModel::InsetSides { .. }
             | BlockModel::Liquid { .. } => info.face_tint_kinds[face.as_usize()],
             BlockModel::CrossPlant => TINT_NONE,
         }
@@ -2609,7 +2695,7 @@ mod tests {
 
         let mut appended = opaque.to_vec();
         appended.push(spawner);
-        assert_eq!(&CLASSIC_PALETTE[43..], appended.as_slice());
+        assert_eq!(&CLASSIC_PALETTE[43..43 + appended.len()], appended.as_slice());
     }
 
     #[test]
@@ -2712,7 +2798,7 @@ mod tests {
 mod interaction_shape_tests {
     use super::{
         BlockAabb, BlockId, BlockModelSpec, BlockState, CROSS_PLANT_SELECTION_AABB, CollisionShape,
-        FULL_CUBE_AABB, LOWER_SLAB_AABB, SNOW_LAYER_AABB, block_spec_for,
+        FULL_CUBE_AABB, LOWER_SLAB_AABB, SNOW_LAYER_AABB, block_spec_for, inset_sides_aabb,
     };
 
     /// Whether a model fills its whole cell visually. Exhaustive on purpose:
@@ -2732,6 +2818,7 @@ mod interaction_shape_tests {
             | BlockModelSpec::LiquidTopSideBottom { .. } => true,
             BlockModelSpec::LayerBottomTopSideBottom { .. }
             | BlockModelSpec::PlantCross { .. }
+            | BlockModelSpec::InsetSidesTopSideBottom { .. }
             | BlockModelSpec::SlabBottomTopSideBottom { .. } => false,
         }
     }
@@ -2791,6 +2878,9 @@ mod interaction_shape_tests {
                     BlockAabb::from_pixels([0, 0, 0], [16, height_px, 16])
                 }),
                 BlockModelSpec::PlantCross { .. } => Some(CROSS_PLANT_SELECTION_AABB),
+                BlockModelSpec::InsetSidesTopSideBottom { inset_px, .. } => {
+                    Some(inset_sides_aabb(inset_px))
+                }
                 _ => Some(FULL_CUBE_AABB),
             };
             assert_eq!(
