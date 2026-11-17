@@ -36,17 +36,36 @@ impl BlockState {
     }
 
     pub(crate) fn collision_shape(self) -> CollisionShape {
-        block_spec_for(self.id).collision_shape()
+        let shape = block_spec_for(self.id).collision_shape();
+        if self.is_top_half() {
+            shape.moved_to_top_half()
+        } else {
+            shape
+        }
     }
 
     pub(crate) fn raycast_shape(self) -> CollisionShape {
-        block_spec_for(self.id).raycast_shape()
+        let shape = block_spec_for(self.id).raycast_shape();
+        if self.is_top_half() {
+            shape.moved_to_top_half()
+        } else {
+            shape
+        }
     }
 
     /// Visibility/AO occlusion shape. This is intentionally separate from
     /// collision, raycast selection, and render shape.
     pub(crate) fn occlusion_shape(self) -> OcclusionShape {
-        block_spec_for(self.id).occlusion_shape()
+        let shape = block_spec_for(self.id).occlusion_shape();
+        if self.is_top_half() {
+            shape.moved_to_top_half()
+        } else {
+            shape
+        }
+    }
+
+    fn is_top_half(self) -> bool {
+        block_spec_for(self.id).form.is_top(self.data)
     }
 }
 
@@ -289,10 +308,79 @@ pub(crate) const FLUID_PROPERTIES: [PropertySpec; 4] = [
     FLUID_STATIC.spec(),
 ];
 
-/// Typed views for the block forms still to come (stairs, slabs, doors,
-/// rails, redstone, crops, snow layers). Each form family picks the bit
-/// offsets for its blocks and declares them in `blocks!`; until the first one
-/// lands, only the tests use these.
+/// Which half of its cell a slab fills. Bottom is raw 0, so slabs saved before
+/// block states load as bottom slabs.
+pub(crate) const SLAB_HALF: Property<views::Half> = views::half(0);
+pub(crate) const SLAB_PROPERTIES: [PropertySpec; 1] = [SLAB_HALF.spec()];
+
+/// Where a furnace's front points.
+pub(crate) const FURNACE_FACING: Property<views::Facing4> = views::facing4(0);
+pub(crate) const FURNACE_PROPERTIES: [PropertySpec; 1] = [FURNACE_FACING.spec()];
+
+/// The properties that change a block's shape or model, kept as bare bit
+/// offsets so the mesher's per-block table (`BlockTextureInfo`) stays small.
+/// Declared in `blocks!` next to the schema; `form_properties_belong_to_the_schema`
+/// checks that each one is part of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StateForm {
+    /// A `Half`: `top` moves shape and model into the upper half of the cell.
+    half_shift: Option<u8>,
+    /// A `Facing4` the side faces turn with; the model's south face points
+    /// along it.
+    facing_shift: Option<u8>,
+}
+
+impl StateForm {
+    pub(crate) const FIXED: Self = Self {
+        half_shift: None,
+        facing_shift: None,
+    };
+
+    pub(crate) const fn with_half(mut self, half: Property<views::Half>) -> Self {
+        self.half_shift = Some(half.spec().shift);
+        self
+    }
+
+    pub(crate) const fn with_facing(mut self, facing: Property<views::Facing4>) -> Self {
+        self.facing_shift = Some(facing.spec().shift);
+        self
+    }
+
+    #[inline(always)]
+    pub(crate) const fn has_half(self) -> bool {
+        self.half_shift.is_some()
+    }
+
+    #[inline(always)]
+    pub(crate) const fn has_facing(self) -> bool {
+        self.facing_shift.is_some()
+    }
+
+    /// Whether the state with data byte `data` sits in the upper half of its
+    /// cell.
+    #[inline(always)]
+    pub(crate) fn is_top(self, data: u8) -> bool {
+        match self.half_shift {
+            Some(shift) => views::half(shift).get_data(data) == views::Half::Top,
+            None => false,
+        }
+    }
+
+    /// Quarter turns clockwise (seen from above) from the model as declared,
+    /// front south, to the facing in `data`; 0 for blocks without a facing.
+    #[inline(always)]
+    pub(crate) fn quarter_turns(self, data: u8) -> u8 {
+        match self.facing_shift {
+            Some(shift) => (views::facing4(shift).get_data(data) as u8 + 2) & 3,
+            None => 0,
+        }
+    }
+}
+
+/// Typed views for the block forms (stairs, slabs, doors, rails, redstone,
+/// crops, snow layers). Each form family picks the bit offsets for its blocks
+/// and declares them in `blocks!`; the families still to come are only used by
+/// the tests.
 #[allow(dead_code)]
 pub(crate) mod views {
     use super::{EnumProperty, Property};
@@ -303,6 +391,17 @@ pub(crate) mod views {
         East,
         South,
         West,
+    }
+
+    impl Facing4 {
+        pub(crate) const fn opposite(self) -> Self {
+            match self {
+                Self::North => Self::South,
+                Self::East => Self::West,
+                Self::South => Self::North,
+                Self::West => Self::East,
+            }
+        }
     }
 
     impl EnumProperty for Facing4 {
@@ -527,6 +626,57 @@ mod tests {
             assert_eq!(FLUID_SOURCE.get_data(data), data & 0x40 != 0);
             assert_eq!(FLUID_FALLING.get_data(data), data & 0x80 != 0);
         }
+    }
+
+    /// A form property the mesher and the shape queries read must be the same
+    /// bits the schema declares, or F3 and the saved byte would disagree with
+    /// what is drawn.
+    #[test]
+    fn form_properties_belong_to_the_schema() {
+        for spec in BLOCK_SPECS {
+            if let Some(shift) = spec.form.half_shift {
+                assert!(
+                    spec.properties.contains(&half(shift).spec()),
+                    "{}: shape half is not in the schema",
+                    spec.key
+                );
+            }
+            if let Some(shift) = spec.form.facing_shift {
+                assert!(
+                    spec.properties.contains(&facing4(shift).spec()),
+                    "{}: facing is not in the schema",
+                    spec.key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn slab_and_furnace_states_print_and_shape() {
+        let top = SLAB_HALF.with(BlockId::StoneSlab.into(), Half::Top);
+        assert_eq!(top.to_string(), "minecraft:stone_slab[half=top]");
+        assert_eq!(top.occlusion_shape(), OcclusionShape::SlabUpper);
+        assert_eq!(top.collision_shape(), CollisionShape::SlabTop);
+        assert_eq!(top.raycast_shape(), CollisionShape::SlabTop);
+        let bottom = BlockState::from(BlockId::StoneSlab);
+        assert_eq!(bottom.occlusion_shape(), OcclusionShape::SlabLower);
+        assert_eq!(bottom.collision_shape(), CollisionShape::SlabBottom);
+
+        let east = FURNACE_FACING.with(BlockId::Furnace.into(), Facing4::East);
+        assert_eq!(east.to_string(), "minecraft:furnace[facing=east]");
+        // Turning a cube changes no shape.
+        assert_eq!(east.occlusion_shape(), OcclusionShape::FullCube);
+    }
+
+    #[test]
+    fn quarter_turns_count_from_the_declared_south_front() {
+        let form = StateForm::FIXED.with_facing(FURNACE_FACING);
+        let turns = |facing| form.quarter_turns(FURNACE_FACING.with_data(0, facing));
+        assert_eq!(turns(Facing4::South), 0);
+        assert_eq!(turns(Facing4::West), 1);
+        assert_eq!(turns(Facing4::North), 2);
+        assert_eq!(turns(Facing4::East), 3);
+        assert_eq!(StateForm::FIXED.quarter_turns(0xFF), 0);
     }
 
     #[test]

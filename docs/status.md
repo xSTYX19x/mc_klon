@@ -43,7 +43,7 @@ That direction is now active in the code:
 ### Shapes / Interaction
 
 - separate block concepts for render shape, collision shape, selection/raycast shape, and occlusion shape
-- explicit occlusion coverage for full cubes, lower slabs, cross-plants, and decorative non-occluders
+- explicit occlusion coverage for full cubes, lower and upper slabs, cross-plants, and decorative non-occluders
 - plant-like decorative blocks use smaller centered selection boxes instead of full-block targeting
 - decorative cross-plants remain non-colliding and non-occluding
 
@@ -51,10 +51,11 @@ That direction is now active in the code:
 
 - every block is declared once in the `blocks!` macro (`src/blocks/mod.rs`), which generates `BlockId`, the spec table, and `BLOCK_COUNT`; runtime ids follow declaration order and only grow by appending
 - block specs are built from defaults (`BlockSpec::cube` / `cube_top_side_bottom` / `plant` plus `with_*` modifiers), so an ordinary new block is a single entry
-- full cubes can carry a texture per face (`CubeFaces`); the furnace keeps a fixed south front (`BlockSpec::cube_front`) until blocks have a facing state
+- full cubes can carry a texture per face (`CubeFaces`); a cube declared with a south front (`BlockSpec::cube_front`) turns with a `facing` property (`with_front_facing`), and the mesher keeps differently turned faces out of one greedy run
 - the creative palette is sorted from each block's `creative_order` at compile time
 - `BlockRegistry::get()` is a static view over the table; nothing is rebuilt per saved or loaded column
-- block states (`blocks/state.rs`): a `BlockState` is a block plus its data byte; each block declares its bit layout in `blocks!` (sapling `stage`, fluid `level`/`static`/`source`/`falling`) and code reads it through typed `Property` views; random-tick hooks, shape queries and `World::set_block_state` take states; F3 shows the targeted state as `name[prop=value]`; the save format is unchanged
+- block states (`blocks/state.rs`): a `BlockState` is a block plus its data byte; each block declares its bit layout in `blocks!` (sapling `stage`, fluid `level`/`static`/`source`/`falling`) and code reads it through typed `Property` views; random-tick hooks, shape queries and `World::set_block_state` take states; F3 shows the targeted state as `name[prop=value]`; the save format is unchanged. `StateForm` marks the properties that change shape or model (`with_shape_half`, `with_front_facing`): the stone slab's `half=top` moves collision, selection, occlusion and mesh into the upper half of the cell, and a data-only change to such a block is remeshed
+- placement hooks (`blocks/placement.rs`): the raycast reports its hit point, `PlaceContext` carries the clicked face, the hit point on the clicked block and the camera yaw, and a block's `on_place` picks its placed state or refuses; slabs pick their half from the click (bottom face or upper half of a side face → top), furnaces turn their front toward the player
 
 ### Startup / Streaming
 

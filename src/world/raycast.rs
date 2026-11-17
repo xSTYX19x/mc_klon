@@ -10,11 +10,14 @@ pub(crate) fn blocks_raycast_targeting(block: BlockId) -> bool {
     block.is_voxel_filled() && !super::fluids::is_water(block)
 }
 
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct RaycastHit {
     pub(crate) hit_block_pos: IVec3,
     pub(crate) hit_normal: IVec3,
     pub(crate) hit_bounds_min: Vec3,
     pub(crate) hit_bounds_max: Vec3,
+    /// Where the ray meets the block's selection box, in world space.
+    pub(crate) hit_point: Vec3,
 }
 
 impl RaycastHit {
@@ -206,6 +209,7 @@ pub(crate) fn raycast_world(
                             hit_normal: shape_hit_normal,
                             hit_bounds_min: shape_min,
                             hit_bounds_max: shape_max,
+                            hit_point: origin + dir * t_hit,
                         });
                     }
                 }
@@ -274,6 +278,7 @@ mod tests {
             .expect("expected slab top hit");
         assert_eq!(hit.hit_block_pos, slab_pos);
         assert_eq!(hit.hit_normal, IVec3::new(0, 1, 0));
+        assert!((hit.hit_point - Vec3::new(0.5, 10.5, 0.5)).length() < 1e-5);
     }
 
     #[test]

@@ -7,10 +7,16 @@ use crate::registry::NamespacedKey;
 use crate::world::World;
 use crate::world::fluids::FluidKind;
 
+pub(crate) mod placement;
 pub(crate) mod state;
 
+use placement::{OnPlaceFn, front_toward_placer, slab_on_place};
 pub(crate) use state::BlockState;
-use state::{FLUID_PROPERTIES, PropertySpec, SAPLING_PROPERTIES, SAPLING_STAGE};
+use state::views::{Facing4, Half};
+use state::{
+    FLUID_PROPERTIES, FURNACE_FACING, FURNACE_PROPERTIES, Property, PropertySpec,
+    SAPLING_PROPERTIES, SAPLING_STAGE, SLAB_HALF, SLAB_PROPERTIES, StateForm,
+};
 
 pub(crate) const TEX_STONE: &str = "minecraft:textures/block/stone.png";
 pub(crate) const TEX_COBBLESTONE: &str = "minecraft:textures/block/cobblestone.png";
@@ -214,6 +220,33 @@ impl Face {
             Face::West => Face::East,
         }
     }
+
+    /// The face a raycast normal points along.
+    pub(crate) const fn from_normal(normal: IVec3) -> Face {
+        match (normal.x, normal.y, normal.z) {
+            (1, _, _) => Face::East,
+            (-1, _, _) => Face::West,
+            (_, 1, _) => Face::Up,
+            (_, -1, _) => Face::Down,
+            (_, _, 1) => Face::South,
+            _ => Face::North,
+        }
+    }
+
+    /// Which face of a model, turned `quarter_turns` clockwise seen from
+    /// above, ends up on this side. Up and Down stay where they are.
+    #[inline(always)]
+    pub(crate) const fn model_face_after_turns(self, quarter_turns: u8) -> Face {
+        const RING: [Face; 4] = [Face::North, Face::East, Face::South, Face::West];
+        let index = match self {
+            Face::North => 0,
+            Face::East => 1,
+            Face::South => 2,
+            Face::West => 3,
+            Face::Up | Face::Down => return self,
+        };
+        RING[(index + 4 - (quarter_turns & 3) as usize) & 3]
+    }
 }
 
 /// Render shape only. This drives mesh generation and texture addressing, but not
@@ -259,6 +292,7 @@ impl BlockAabb {
 
 const FULL_CUBE_AABB: BlockAabb = BlockAabb::from_pixels([0, 0, 0], [16, 16, 16]);
 const LOWER_SLAB_AABB: BlockAabb = BlockAabb::from_pixels([0, 0, 0], [16, 8, 16]);
+const UPPER_SLAB_AABB: BlockAabb = BlockAabb::from_pixels([0, 8, 0], [16, 16, 16]);
 const SNOW_LAYER_AABB: BlockAabb = BlockAabb::from_pixels([0, 0, 0], [16, 2, 16]);
 // Shared plant selection box: slightly inset from the block edges and one pixel shy of full height.
 const CROSS_PLANT_SELECTION_AABB: BlockAabb = BlockAabb::from_pixels([1, 0, 1], [15, 15, 15]);
@@ -270,6 +304,7 @@ pub(crate) enum CollisionShape {
     Empty,
     FullCube,
     SlabBottom,
+    SlabTop,
     Aabb(BlockAabb),
 }
 
@@ -279,7 +314,17 @@ impl CollisionShape {
             CollisionShape::Empty => None,
             CollisionShape::FullCube => Some(FULL_CUBE_AABB),
             CollisionShape::SlabBottom => Some(LOWER_SLAB_AABB),
+            CollisionShape::SlabTop => Some(UPPER_SLAB_AABB),
             CollisionShape::Aabb(bounds) => Some(bounds),
+        }
+    }
+
+    /// The same shape in a block whose state puts it in the upper half of
+    /// the cell (`StateForm::is_top`).
+    pub(crate) const fn moved_to_top_half(self) -> Self {
+        match self {
+            CollisionShape::SlabBottom => CollisionShape::SlabTop,
+            other => other,
         }
     }
 
@@ -326,6 +371,15 @@ pub(crate) enum OcclusionShape {
 }
 
 impl OcclusionShape {
+    /// See `CollisionShape::moved_to_top_half`.
+    #[inline(always)]
+    pub(crate) const fn moved_to_top_half(self) -> Self {
+        match self {
+            OcclusionShape::SlabLower => OcclusionShape::SlabUpper,
+            other => other,
+        }
+    }
+
     #[inline(always)]
     pub(crate) const fn boundary_coverage(self, face: Face) -> FaceCoverage {
         match self {
@@ -499,11 +553,16 @@ struct BlockSpec {
     face_tint: FaceTintSpec,
     block_entity: Option<&'static str>,
     random_tick: Option<RandomTickFn>,
+    /// Picks the placed state from the click (`placement::placement_state`);
+    /// `None` places the default state.
+    on_place: Option<OnPlaceFn>,
     /// Position in the creative palette (`CLASSIC_PALETTE`); `None` keeps the
     /// block out of it.
     creative_order: Option<u16>,
     /// Which bits of the block's data byte mean what (`state::BlockState`).
     properties: &'static [PropertySpec],
+    /// Which of those properties change shape or model.
+    form: StateForm,
 }
 
 /// Builders for `blocks!` entries. `new` is the common case — a solid, opaque,
@@ -535,8 +594,10 @@ impl BlockSpec {
             face_tint: FaceTintSpec::None,
             block_entity: None,
             random_tick: None,
+            on_place: None,
             creative_order: None,
             properties: &[],
+            form: StateForm::FIXED,
         }
     }
 
@@ -562,8 +623,9 @@ impl BlockSpec {
         Self::new(key, display_name, model, particle_color)
     }
 
-    /// A cube with one `front` face. Blocks have no facing state yet, so the
-    /// front is fixed to south: the side face the inventory preview shows.
+    /// A cube with one `front` face, declared on the south side: the side
+    /// face the inventory preview shows. `with_front_facing` turns it in the
+    /// world.
     const fn cube_front(
         key: &'static str,
         display_name: &'static str,
@@ -667,6 +729,25 @@ impl BlockSpec {
 
     const fn with_properties(mut self, properties: &'static [PropertySpec]) -> Self {
         self.properties = properties;
+        self
+    }
+
+    const fn with_on_place(mut self, on_place: OnPlaceFn) -> Self {
+        self.on_place = Some(on_place);
+        self
+    }
+
+    /// `half=top` moves collision, selection, occlusion and model into the
+    /// upper half of the cell. The property must be in `with_properties`.
+    const fn with_shape_half(mut self, half: Property<Half>) -> Self {
+        self.form = self.form.with_half(half);
+        self
+    }
+
+    /// The side faces turn so the declared south face points along `facing`.
+    /// The property must be in `with_properties`.
+    const fn with_front_facing(mut self, facing: Property<Facing4>) -> Self {
+        self.form = self.form.with_facing(facing);
         self
     }
 }
@@ -1011,6 +1092,9 @@ blocks! {
         },
         [0.70, 0.70, 0.70],
     )
+    .with_properties(&SLAB_PROPERTIES)
+    .with_shape_half(SLAB_HALF)
+    .with_on_place(slab_on_place)
     .with_creative_order(9),
     MossyCobblestone => BlockSpec::cube(
         "minecraft:mossy_cobblestone", "Mossy Cobblestone", TEX_MOSSY_COBBLESTONE,
@@ -1174,12 +1258,18 @@ blocks! {
         "minecraft:furnace", "Furnace", TEX_FURNACE_TOP, TEX_FURNACE_TOP, TEX_FURNACE_SIDE,
         TEX_FURNACE_FRONT, [0.37, 0.37, 0.37],
     )
+    .with_properties(&FURNACE_PROPERTIES)
+    .with_front_facing(FURNACE_FACING)
+    .with_on_place(front_toward_placer)
     .with_creative_order(50),
     LitFurnace => BlockSpec::cube_front(
         "minecraft:lit_furnace", "Furnace (Lit)", TEX_FURNACE_TOP, TEX_FURNACE_TOP,
         TEX_FURNACE_SIDE, TEX_FURNACE_FRONT_ON, [0.37, 0.37, 0.37],
     )
     .with_light(13)
+    .with_properties(&FURNACE_PROPERTIES)
+    .with_front_facing(FURNACE_FACING)
+    .with_on_place(front_toward_placer)
     .with_creative_order(51),
     Jukebox => BlockSpec::cube_top_side_bottom(
         "minecraft:jukebox", "Jukebox", TEX_JUKEBOX_TOP, TEX_JUKEBOX_SIDE, TEX_JUKEBOX_SIDE,
@@ -1635,6 +1725,9 @@ pub(crate) struct BlockTextureInfo {
 
 pub(crate) struct BlockTextureLookup {
     by_block: [BlockTextureInfo; 256],
+    /// Kept apart from `by_block`: one more field pushed `BlockTextureInfo`
+    /// past 64 bytes and cost the greedy pass ~12 % (`greedy_ao_merge_report`).
+    forms: [StateForm; 256],
     missing_layer: u32,
 }
 
@@ -1666,6 +1759,7 @@ impl BlockTextureLookup {
             cull_group: CullGroup::None,
         };
         let mut by_block = std::array::from_fn(|_| missing_info);
+        let mut forms = [StateForm::FIXED; 256];
         for spec in block_registry.specs {
             let Some(textures) = spec.block_def() else {
                 continue;
@@ -1712,11 +1806,51 @@ impl BlockTextureLookup {
                 render_layer: textures.render_layer,
                 cull_group: textures.cull_group,
             };
+            forms[block.to_u8() as usize] = spec.form;
         }
 
         Self {
             by_block,
+            forms,
             missing_layer,
+        }
+    }
+
+    /// `block`'s occlusion shape in the state whose data byte `data` returns.
+    /// Only a shape with a top-half variant reads the form and calls `data`,
+    /// so every other block pays one compare on a byte already loaded.
+    #[inline(always)]
+    pub(crate) fn occlusion_shape_in(
+        &self,
+        block: BlockId,
+        info: BlockTextureInfo,
+        data: impl FnOnce() -> u8,
+    ) -> OcclusionShape {
+        let shape = info.occlusion_shape;
+        let top = shape.moved_to_top_half();
+        if top != shape && self.is_top_in(block, data) {
+            top
+        } else {
+            shape
+        }
+    }
+
+    /// Whether `block` sits in the upper half of its cell in that state.
+    #[inline(always)]
+    pub(crate) fn is_top_in(&self, block: BlockId, data: impl FnOnce() -> u8) -> bool {
+        let form = self.forms[block.to_u8() as usize];
+        form.has_half() && form.is_top(data())
+    }
+
+    /// Quarter turns of `block`'s side faces in that state
+    /// (`StateForm::quarter_turns`).
+    #[inline(always)]
+    pub(crate) fn quarter_turns_in(&self, block: BlockId, data: impl FnOnce() -> u8) -> u8 {
+        let form = self.forms[block.to_u8() as usize];
+        if form.has_facing() {
+            form.quarter_turns(data())
+        } else {
+            0
         }
     }
 
@@ -1747,6 +1881,28 @@ impl BlockTextureLookup {
         }
     }
 
+    /// `layer_for_info` for a block whose side faces are turned
+    /// `quarter_turns` (`quarter_turns_in`).
+    #[inline(always)]
+    pub(crate) fn layer_for_info_turned(
+        &self,
+        info: BlockTextureInfo,
+        face: Face,
+        quarter_turns: u8,
+    ) -> u32 {
+        self.layer_for_info(info, face.model_face_after_turns(quarter_turns))
+    }
+
+    #[inline(always)]
+    pub(crate) fn tint_kind_for_info_turned(
+        &self,
+        info: BlockTextureInfo,
+        face: Face,
+        quarter_turns: u8,
+    ) -> u32 {
+        self.tint_kind_for_info(info, face.model_face_after_turns(quarter_turns))
+    }
+
     pub(crate) fn layer_for(&self, block: BlockId, face: Face) -> u32 {
         self.layer_for_info(self.info_for(block), face)
     }
@@ -1771,10 +1927,6 @@ impl BlockTextureLookup {
         self.info_for(block).render_layer
     }
 
-    pub(crate) fn occlusion_shape_for(&self, block: BlockId) -> OcclusionShape {
-        self.info_for(block).occlusion_shape
-    }
-
     pub(crate) fn face_occluding_for(&self, block: BlockId) -> bool {
         self.info_for(block).face_occluding
     }
@@ -1792,6 +1944,12 @@ impl BlockId {
     /// Physische Solidität (Collision).
     pub(crate) fn is_solid(self) -> bool {
         block_spec_for(self).solid
+    }
+
+    /// Whether the data byte changes this block's shape or model (slab half,
+    /// furnace facing), so a data-only change needs a remesh.
+    pub(crate) fn data_changes_form(self) -> bool {
+        block_spec_for(self).form != StateForm::FIXED
     }
 
     /// Ob der Block als Voxel-Zelle vorhanden ist (Meshing/Raycast).

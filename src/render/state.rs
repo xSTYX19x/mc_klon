@@ -40,6 +40,7 @@ use super::texture_anim::{
     resize_rgba_nearest,
 };
 use crate::assets::AssetSource;
+use crate::blocks::placement::{PlaceContext, placement_state};
 use crate::blocks::state::FLUID_SOURCE;
 use crate::blocks::{
     BlockId, BlockModel, BlockRegistry, BlockState, BlockTextureLookup, CullGroup, Face,
@@ -68,7 +69,7 @@ use crate::config::render::{
 use crate::config::sim::RANDOM_TICK_SPEED_DEFAULT;
 use crate::meshing::{
     CpuMeshData, FULLBRIGHT_LIGHT_PACKED, MeshLayerMask, Vertex, WorldVertex,
-    face_corner_ao_shades, face_from_normal, face_shade, pack_uv,
+    face_corner_ao_shades, face_shade, pack_uv,
 };
 use super::lighting_budget::LightingFrameBudget;
 use super::mesh_dispatch::mesh_inflight_job_cap;
@@ -133,8 +134,8 @@ const WINTER_SURFACE_MAX_CHANGES_PER_TICK: usize = 2;
 #[derive(Clone, Copy, Debug)]
 struct PendingBlockEdit {
     pos: IVec3,
-    old: BlockId,
-    new: BlockId,
+    old: BlockState,
+    new: BlockState,
     /// Break particles belong to the player breaking a block, not to a random
     /// tick turning grass into dirt.
     spawn_particles: bool,
@@ -11015,7 +11016,7 @@ impl State {
                 coverage(Face::West),
             ),
         ];
-        let face = face_from_normal(hit.hit_normal);
+        let face = Face::from_normal(hit.hit_normal);
         lines.push(format!(
             "  selection {:.2}..{:.2} y, hit face {:?}",
             hit.hit_bounds_min.y - hit.hit_block_pos.y as f32,
@@ -15587,25 +15588,26 @@ impl State {
 
     fn neighbor_covers_boundary(
         &self,
-        neighbor: BlockId,
+        neighbor: BlockState,
         neighbor_face: Face,
         requested: FaceCoverage,
     ) -> bool {
-        self.block_texture_lookup
-            .occlusion_shape_for(neighbor)
+        let lookup = &self.block_texture_lookup;
+        lookup
+            .occlusion_shape_in(neighbor.id, lookup.info_for(neighbor.id), || neighbor.data)
             .boundary_coverage(neighbor_face)
             .covers(requested)
     }
 
-    fn cube_face_mesh_visible(&self, current: BlockId, neighbor: BlockId, face: Face) -> bool {
-        if !current.is_voxel_filled() {
+    fn cube_face_mesh_visible(&self, current: BlockState, neighbor: BlockState, face: Face) -> bool {
+        if !current.id.is_voxel_filled() {
             return false;
         }
-        if !neighbor.is_voxel_filled() {
+        if !neighbor.id.is_voxel_filled() {
             return true;
         }
-        let current_info = self.block_texture_lookup.info_for(current);
-        let neighbor_info = self.block_texture_lookup.info_for(neighbor);
+        let current_info = self.block_texture_lookup.info_for(current.id);
+        let neighbor_info = self.block_texture_lookup.info_for(neighbor.id);
         if current_info.cull_group != CullGroup::None
             && current_info.cull_group == neighbor_info.cull_group
             && self.neighbor_covers_boundary(neighbor, face.opposite(), FaceCoverage::Full)
@@ -15615,31 +15617,36 @@ impl State {
         !self.neighbor_covers_boundary(neighbor, face.opposite(), FaceCoverage::Full)
     }
 
-    fn slab_face_mesh_visible(&self, current: BlockId, neighbor: BlockId, face: Face) -> bool {
-        if !current.is_voxel_filled() {
+    /// Mirrors `meshing::greedy::should_emit_bottom_slab_face`.
+    fn slab_face_mesh_visible(&self, current: BlockState, neighbor: BlockState, face: Face) -> bool {
+        if !current.id.is_voxel_filled() {
             return false;
         }
-        if face == Face::Up {
+        let current_info = self.block_texture_lookup.info_for(current.id);
+        let top = self.block_texture_lookup.is_top_in(current.id, || current.data);
+        let (inner_face, side_coverage) = if top {
+            (Face::Down, FaceCoverage::UpperHalf)
+        } else {
+            (Face::Up, FaceCoverage::LowerHalf)
+        };
+        if face == inner_face {
             return true;
         }
-        if !neighbor.is_voxel_filled() {
+        if !neighbor.id.is_voxel_filled() {
             return true;
         }
-        if matches!(
-            self.block_texture_lookup.model_for(current),
-            BlockModel::LayerBottom { .. }
-        ) && current == neighbor
+        if matches!(current_info.model, BlockModel::LayerBottom { .. })
+            && current.id == neighbor.id
             && matches!(face, Face::North | Face::South | Face::East | Face::West)
         {
             return false;
         }
         let required = match face {
-            Face::Down => FaceCoverage::Full,
-            Face::North | Face::South | Face::East | Face::West => FaceCoverage::LowerHalf,
-            Face::Up => FaceCoverage::None,
+            Face::Up | Face::Down => FaceCoverage::Full,
+            Face::North | Face::South | Face::East | Face::West => side_coverage,
         };
-        let current_group = self.block_texture_lookup.cull_group_for(current);
-        let neighbor_group = self.block_texture_lookup.cull_group_for(neighbor);
+        let current_group = current_info.cull_group;
+        let neighbor_group = self.block_texture_lookup.cull_group_for(neighbor.id);
         if current_group != CullGroup::None
             && current_group == neighbor_group
             && self.neighbor_covers_boundary(neighbor, face.opposite(), required)
@@ -15664,23 +15671,30 @@ impl State {
         }
     }
 
-    fn block_face_mesh_visible(&self, current: BlockId, neighbor: BlockId, face: Face) -> bool {
-        if !current.is_voxel_filled() {
+    fn block_face_mesh_visible(
+        &self,
+        current: BlockState,
+        neighbor: BlockState,
+        face: Face,
+    ) -> bool {
+        if !current.id.is_voxel_filled() {
             return false;
         }
-        match self.block_texture_lookup.model_for(current) {
+        match self.block_texture_lookup.model_for(current.id) {
             BlockModel::Cube => self.cube_face_mesh_visible(current, neighbor, face),
             BlockModel::SlabBottom => self.slab_face_mesh_visible(current, neighbor, face),
             BlockModel::LayerBottom { .. } => self.slab_face_mesh_visible(current, neighbor, face),
-            BlockModel::Liquid { .. } => self.liquid_face_mesh_visible(current, neighbor, face),
+            BlockModel::Liquid { .. } => {
+                self.liquid_face_mesh_visible(current.id, neighbor.id, face)
+            }
             BlockModel::CrossPlant => false,
         }
     }
 
     fn boundary_face_mesh_signature(
         &self,
-        changed_block: BlockId,
-        neighbor: BlockId,
+        changed_block: BlockState,
+        neighbor: BlockState,
         face: Face,
     ) -> (bool, bool) {
         (
@@ -15692,12 +15706,13 @@ impl State {
     fn classify_block_edit_mesh_invalidation(
         &self,
         world_pos: IVec3,
-        old_block: BlockId,
-        new_block: BlockId,
+        old_state: BlockState,
+        new_state: BlockState,
     ) -> Vec<BlockEditMeshInvalidation> {
-        if old_block == new_block {
+        if old_state == new_state {
             return Vec::new();
         }
+        let (old_block, new_block) = (old_state.id, new_state.id);
 
         let center_coord = World::world_to_chunk_coord(world_pos);
         let local = World::world_to_local(world_pos);
@@ -15718,9 +15733,10 @@ impl State {
             if !World::in_bounds(neighbor_pos) {
                 continue;
             }
-            let neighbor_block = self.world.get_block(neighbor_pos);
-            let before = self.boundary_face_mesh_signature(old_block, neighbor_block, face);
-            let after = self.boundary_face_mesh_signature(new_block, neighbor_block, face);
+            let neighbor_state = self.world.get_block_state(neighbor_pos);
+            let neighbor_block = neighbor_state.id;
+            let before = self.boundary_face_mesh_signature(old_state, neighbor_state, face);
+            let after = self.boundary_face_mesh_signature(new_state, neighbor_state, face);
             if before == after {
                 continue;
             }
@@ -16479,11 +16495,11 @@ impl State {
     fn stage_block_edit_dirty_after_block_change(
         &mut self,
         world_pos: IVec3,
-        old_block: BlockId,
-        new_block: BlockId,
+        old_state: BlockState,
+        new_state: BlockState,
     ) -> usize {
         let invalidations =
-            self.classify_block_edit_mesh_invalidation(world_pos, old_block, new_block);
+            self.classify_block_edit_mesh_invalidation(world_pos, old_state, new_state);
         for invalidation in invalidations.iter().copied() {
             self.pending_block_edit_dirty_chunks
                 .entry(invalidation.coord)
@@ -17617,21 +17633,27 @@ impl State {
             return;
         }
         for change in changes {
-            if change.old == change.new {
+            if change.old == change.new && !change.new.data_changes_form() {
                 // Data-only (e.g. a sapling's growth stage): nothing to remesh
-                // or relight, but the column must still be saved.
+                // or relight, but the column must still be saved. A slab half
+                // or a furnace facing changes the mesh, so those go on.
                 self.mark_column_dirty_for_chunk(World::world_to_chunk_coord(change.pos));
                 continue;
             }
-            self.enqueue_pending_block_edit(change.pos, change.old, change.new, source);
+            self.enqueue_pending_block_edit(
+                change.pos,
+                BlockState::new(change.old, change.old_data),
+                BlockState::new(change.new, change.new_data),
+                source,
+            );
         }
     }
 
     fn enqueue_pending_block_edit(
         &mut self,
         pos: IVec3,
-        old: BlockId,
-        new: BlockId,
+        old: BlockState,
+        new: BlockState,
         source: BlockChangeSource,
     ) {
         let by_player = source == BlockChangeSource::Player;
@@ -17750,27 +17772,26 @@ impl State {
 
             edits_processed += 1;
             let _ = self.stage_block_edit_dirty_after_block_change(edit.pos, edit.old, edit.new);
-            let lighting_change = self
-                .world
-                .classify_block_change_lighting(edit.pos, edit.old, edit.new);
+            let (old, new) = (edit.old.id, edit.new.id);
+            let lighting_change = self.world.classify_block_change_lighting(edit.pos, old, new);
             if lighting_change.flags.is_geometry_only() {
                 lighting_geometry_only += 1;
             } else {
                 lighting_changes.push(lighting_change);
             }
 
-            self.notify_fluid_on_block_change(edit.pos, edit.old, edit.new);
+            self.notify_fluid_on_block_change(edit.pos, old, new);
             fluid_notifies += 1;
 
             self.enqueue_pending_sand_gravity_check(edit.pos);
 
             // Spawn particles only for block destruction by the player.
             if edit.spawn_particles
-                && edit.new == BlockId::Air
+                && new == BlockId::Air
                 && particles_spawned + PARTICLE_SPAWN_COUNT
                     <= BLOCK_EDIT_PARTICLES_MAX_SPAWN_PER_FRAME
             {
-                let spawned = self.spawn_block_particles(edit.pos, edit.old);
+                let spawned = self.spawn_block_particles(edit.pos, old);
                 if spawned > 0 {
                     particles_spawned += spawned;
                     particle_events += 1;
@@ -18065,7 +18086,8 @@ impl State {
             return false;
         }
 
-        let replaced = self.world.get_block(landing);
+        let replaced_state = self.world.get_block_state(landing);
+        let replaced = replaced_state.id;
         if self
             .world
             .set_block_and_data_loaded_only(pos, BlockId::Air, 0)
@@ -18097,9 +18119,10 @@ impl State {
             self.world
                 .classify_block_change_lighting(landing, replaced, BlockId::Sand);
         self.notify_fluid_on_block_change(pos, BlockId::Sand, BlockId::Air);
-        let _ = self.stage_block_edit_dirty_after_block_change(pos, BlockId::Sand, BlockId::Air);
+        let sand = BlockState::from(BlockId::Sand);
+        let _ = self.stage_block_edit_dirty_after_block_change(pos, sand, BlockId::Air.into());
         self.notify_fluid_on_block_change(landing, replaced, BlockId::Sand);
-        let _ = self.stage_block_edit_dirty_after_block_change(landing, replaced, BlockId::Sand);
+        let _ = self.stage_block_edit_dirty_after_block_change(landing, replaced_state, sand);
         self.enqueue_block_edit_lighting_repairs(&[source_lighting, landing_lighting]);
         true
     }
@@ -19479,7 +19502,8 @@ impl State {
             return;
         };
 
-        let place_pos = hit.place_pos();
+        let place_ctx = PlaceContext::from_hit(&hit, camera.yaw);
+        let place_pos = place_ctx.place_pos;
         slow_coord = Some(place_pos);
         let target_block = self.world.get_block(place_pos);
         let can_replace_target = matches!(
@@ -19495,15 +19519,21 @@ impl State {
             );
             return;
         }
-        // Placed blocks start in their default state; fluids as a still source.
+        // Fluids go in as a still source; every other block in the state its
+        // placement hook picks from the click, or refuses.
         let (place_state, deferred_kind) = if let Some(kind) = fluid_kind(selected_block) {
             let still = BlockState::default_of(make_still(kind));
             (FLUID_SOURCE.with(still, true), DeferredEditKind::PlaceFluid)
+        } else if let Some(state) = placement_state(&self.world, &place_ctx, selected_block) {
+            (state, DeferredEditKind::PlaceBlock)
         } else {
-            (
-                BlockState::default_of(selected_block),
-                DeferredEditKind::PlaceBlock,
-            )
+            maybe_log_slow_block_edit(
+                "place",
+                edit_started.elapsed().as_secs_f32() * 1000.0,
+                slow_coord,
+                timings,
+            );
+            return;
         };
         if Self::block_intersects_player_hitbox(place_pos, place_state, player_feet_pos) {
             maybe_log_slow_block_edit(

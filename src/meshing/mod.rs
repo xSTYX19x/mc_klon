@@ -13,7 +13,7 @@ pub(crate) mod pool;
 #[cfg(test)]
 mod pool_regression_test;
 
-pub(crate) use greedy::{face_corner_ao_shades, face_from_normal, face_shade};
+pub(crate) use greedy::{face_corner_ao_shades, face_shade};
 pub(crate) use liquids::{fluid_kind_at_point, liquid_height_at_point};
 pub(crate) use neighborhood::{ChunkSnapshot, MeshingNeighborhoodScratch, NeighborhoodSnapshot};
 

@@ -187,6 +187,9 @@ fn should_emit_cube_face(
     }
 
     let neighbor_info = texture_lookup.info_for(neighbor);
+    let neighbor_shape = texture_lookup.occlusion_shape_in(neighbor, neighbor_info, || {
+        world.get_block_data(neighbor_pos)
+    });
     let current_group = texture_lookup.cull_group_for(current);
     let neighbor_group = neighbor_info.cull_group;
     if current_group != CullGroup::None && current_group == neighbor_group {
@@ -197,22 +200,17 @@ fn should_emit_cube_face(
                 return h_neighbor + 1e-6 < h_current;
             }
         }
-        if neighbor_covers_boundary(
-            neighbor_info.occlusion_shape,
-            face.opposite(),
-            FaceCoverage::Full,
-        ) {
+        if neighbor_covers_boundary(neighbor_shape, face.opposite(), FaceCoverage::Full) {
             return false;
         }
     }
 
-    !neighbor_covers_boundary(
-        neighbor_info.occlusion_shape,
-        face.opposite(),
-        FaceCoverage::Full,
-    )
+    !neighbor_covers_boundary(neighbor_shape, face.opposite(), FaceCoverage::Full)
 }
 
+/// Face test for slabs and layers. `top` is a slab in the upper half of its
+/// cell: everything mirrors, so its inner face is the bottom one and its sides
+/// need the neighbor's upper half covered.
 #[inline]
 fn should_emit_bottom_slab_face(
     world: &impl BlockAccess,
@@ -220,8 +218,14 @@ fn should_emit_bottom_slab_face(
     current_pos: IVec3,
     current: BlockId,
     face: Face,
+    top: bool,
 ) -> bool {
-    if face == Face::Up {
+    let (inner_face, side_coverage) = if top {
+        (Face::Down, FaceCoverage::UpperHalf)
+    } else {
+        (Face::Up, FaceCoverage::LowerHalf)
+    };
+    if face == inner_face {
         return true;
     }
 
@@ -241,20 +245,22 @@ fn should_emit_bottom_slab_face(
     }
 
     let neighbor_info = texture_lookup.info_for(neighbor);
+    let neighbor_shape = texture_lookup.occlusion_shape_in(neighbor, neighbor_info, || {
+        world.get_block_data(neighbor_pos)
+    });
     let required = match face {
-        Face::Down => FaceCoverage::Full,
-        Face::North | Face::South | Face::East | Face::West => FaceCoverage::LowerHalf,
-        Face::Up => FaceCoverage::None,
+        Face::Up | Face::Down => FaceCoverage::Full,
+        Face::North | Face::South | Face::East | Face::West => side_coverage,
     };
     let current_group = texture_lookup.cull_group_for(current);
     if current_group != CullGroup::None
         && current_group == neighbor_info.cull_group
-        && neighbor_covers_boundary(neighbor_info.occlusion_shape, face.opposite(), required)
+        && neighbor_covers_boundary(neighbor_shape, face.opposite(), required)
     {
         return false;
     }
 
-    !neighbor_covers_boundary(neighbor_info.occlusion_shape, face.opposite(), required)
+    !neighbor_covers_boundary(neighbor_shape, face.opposite(), required)
 }
 
 fn append_bottom_slabs_in_chunk(
@@ -279,7 +285,8 @@ fn append_bottom_slabs_in_chunk(
         for z in 0..CHUNK_SIZE {
             for x in 0..CHUNK_SIZE {
                 let id = chunk.get(x, y, z);
-                let layer_height = match texture_lookup.model_for(id) {
+                let info = texture_lookup.info_for(id);
+                let layer_height = match info.model {
                     BlockModel::SlabBottom => 8u8,
                     BlockModel::LayerBottom { height_px } => height_px,
                     _ => continue,
@@ -287,16 +294,29 @@ fn append_bottom_slabs_in_chunk(
                 if !id.is_voxel_filled() {
                     continue;
                 }
-                let render_layer = texture_lookup.render_layer_for(id);
+                let render_layer = info.render_layer;
                 if !requested_layers.contains_render_layer(render_layer) {
                     continue;
                 }
+                let top = texture_lookup.is_top_in(id, || chunk.get_data(x, y, z));
                 let layer_height_f = layer_height as f32 / 16.0;
-                let render_bounds = RenderBounds::bottom_layer(layer_height_f);
+                let render_bounds = if top {
+                    RenderBounds::top_layer(layer_height_f)
+                } else {
+                    RenderBounds::bottom_layer(layer_height_f)
+                };
+                let base_y = render_bounds.min[1];
 
                 let world_pos = chunk_origin + IVec3::new(x, y, z);
                 for (face, quad) in faces {
-                    if !should_emit_bottom_slab_face(world, texture_lookup, world_pos, id, face) {
+                    if !should_emit_bottom_slab_face(
+                        world,
+                        texture_lookup,
+                        world_pos,
+                        id,
+                        face,
+                        top,
+                    ) {
                         continue;
                     }
 
@@ -312,7 +332,11 @@ fn append_bottom_slabs_in_chunk(
                     }
 
                     for (corner_index, p) in quad.iter().enumerate() {
-                        let vertex_local = [p[0] as f32, p[1] as f32 * layer_height_f, p[2] as f32];
+                        let vertex_local = [
+                            p[0] as f32,
+                            base_y + p[1] as f32 * layer_height_f,
+                            p[2] as f32,
+                        ];
                         let (shade, light_packed) = face_vertex_shade_and_light(
                             world,
                             world_pos,
@@ -382,6 +406,15 @@ impl RenderBounds {
         Self {
             min: [0.0, 0.0, 0.0],
             max: [1.0, height.clamp(0.0, 1.0), 1.0],
+        }
+    }
+
+    /// A layer hanging from the top of the cell (`half=top` slabs).
+    #[inline(always)]
+    fn top_layer(height: f32) -> Self {
+        Self {
+            min: [0.0, 1.0 - height.clamp(0.0, 1.0), 0.0],
+            max: [1.0, 1.0, 1.0],
         }
     }
 
@@ -534,18 +567,6 @@ fn averaged_vertex_light_from_samples(raw_lights: [u8; 4], occluded: [bool; 4]) 
     pack_vertex_light(((sky_sum + 2) / 4) as u8, ((blk_sum + 2) / 4) as u8)
 }
 
-/// The face a raycast normal points along.
-pub(crate) fn face_from_normal(normal: IVec3) -> Face {
-    match (normal.x, normal.y, normal.z) {
-        (1, _, _) => Face::East,
-        (-1, _, _) => Face::West,
-        (_, 1, _) => Face::Up,
-        (_, -1, _) => Face::Down,
-        (_, _, 1) => Face::South,
-        _ => Face::North,
-    }
-}
-
 /// Baked AO shade at a cube face's four corners, sampled the same way the
 /// mesher does. Debug-overlay only — the mesher uses the padded fast path.
 pub(crate) fn face_corner_ao_shades(
@@ -618,6 +639,19 @@ fn cube_face_vertex_shade_and_light(
     )
 }
 
+/// Occlusion shape of the padded cell at `index`, in its state.
+#[inline(always)]
+fn occlusion_at_index(
+    neighborhood: &MeshingNeighborhood<'_>,
+    texture_lookup: &BlockTextureLookup,
+    index: usize,
+) -> OcclusionShape {
+    let block = neighborhood.block_at_index(index);
+    texture_lookup.occlusion_shape_in(block, texture_lookup.info_for(block), || {
+        neighborhood.block_data_at_index(index)
+    })
+}
+
 #[inline]
 fn face_vertex_shade_and_light_local_fast(
     neighborhood: &MeshingNeighborhood<'_>,
@@ -640,17 +674,11 @@ fn face_vertex_shade_and_light_local_fast(
     let side1_offset = outer_offset + axis_vec(u_axis, su);
     let side2_offset = outer_offset + axis_vec(v_axis, sv);
     let corner_offset = side1_offset + axis_vec(v_axis, sv);
-    let side1_occ = texture_lookup
-        .info_for(neighborhood.block_at_index(side1))
-        .occlusion_shape
+    let side1_occ = occlusion_at_index(neighborhood, texture_lookup, side1)
         .occludes_ao_sample(sample_local_point(vertex_local, side1_offset));
-    let side2_occ = texture_lookup
-        .info_for(neighborhood.block_at_index(side2))
-        .occlusion_shape
+    let side2_occ = occlusion_at_index(neighborhood, texture_lookup, side2)
         .occludes_ao_sample(sample_local_point(vertex_local, side2_offset));
-    let corner_occ = texture_lookup
-        .info_for(neighborhood.block_at_index(corner))
-        .occlusion_shape
+    let corner_occ = occlusion_at_index(neighborhood, texture_lookup, corner)
         .occludes_ao_sample(sample_local_point(vertex_local, corner_offset));
     let ao = if debug_disable_ao() {
         1.0
@@ -703,29 +731,24 @@ fn should_emit_cube_face_local_fast(
     current_index: usize,
     face: Face,
 ) -> bool {
-    let neighbor =
-        neighborhood.block_at_index(offset_index(current_index, face_normal_offset(face)));
+    let neighbor_index = offset_index(current_index, face_normal_offset(face));
+    let neighbor = neighborhood.block_at_index(neighbor_index);
     let neighbor_info = texture_lookup.info_for(neighbor);
     if !neighbor.is_voxel_filled() {
         return true;
     }
+    let neighbor_shape = texture_lookup.occlusion_shape_in(neighbor, neighbor_info, || {
+        neighborhood.block_data_at_index(neighbor_index)
+    });
 
     if current_info.cull_group != CullGroup::None
         && current_info.cull_group == neighbor_info.cull_group
-        && neighbor_covers_boundary(
-            neighbor_info.occlusion_shape,
-            face.opposite(),
-            FaceCoverage::Full,
-        )
+        && neighbor_covers_boundary(neighbor_shape, face.opposite(), FaceCoverage::Full)
     {
         return false;
     }
 
-    !neighbor_covers_boundary(
-        neighbor_info.occlusion_shape,
-        face.opposite(),
-        FaceCoverage::Full,
-    )
+    !neighbor_covers_boundary(neighbor_shape, face.opposite(), FaceCoverage::Full)
 }
 
 /// Packed shade+light of a single face's four corners.
@@ -881,6 +904,8 @@ fn build_chunk_mesh_layered_naive_dense_internal(
 
                 let local_pos = [x, y, z];
                 let local_index = MeshingNeighborhood::local_padded_index(x, y, z);
+                let turns = texture_lookup
+                    .quarter_turns_in(id, || neighborhood.block_data_at_index(local_index));
                 for (face, quad) in faces {
                     stats.cube_faces_considered = stats.cube_faces_considered.saturating_add(1);
                     if !should_emit_cube_face_local_fast(
@@ -897,8 +922,8 @@ fn build_chunk_mesh_layered_naive_dense_internal(
                     let render_layer = info.render_layer;
                     let mesh = layered.mesh_mut(render_layer);
                     let base_index = mesh.vertices.len() as u32;
-                    let tex_layer = texture_lookup.layer_for_info(info, face);
-                    let tint_kind = texture_lookup.tint_kind_for_info(info, face);
+                    let tex_layer = texture_lookup.layer_for_info_turned(info, face, turns);
+                    let tint_kind = texture_lookup.tint_kind_for_info_turned(info, face, turns);
                     let quad_world = [
                         [x + quad[0][0], y + quad[0][1], z + quad[0][2]],
                         [x + quad[1][0], y + quad[1][1], z + quad[1][2]],
@@ -1106,10 +1131,13 @@ fn build_chunk_mesh_greedy_layered_dense_internal(
                         )
                     } {
                         stats.cube_faces_emitted = stats.cube_faces_emitted.saturating_add(1);
-                        Some(MaskCell {
-                            block: a,
-                            normal_positive: true,
-                        })
+                        let a_index = a_index.expect("a index should exist");
+                        Some(MaskCell::new(
+                            a,
+                            true,
+                            texture_lookup
+                                .quarter_turns_in(a, || neighborhood.block_data_at_index(a_index)),
+                        ))
                     } else if b_cube && {
                         stats.cube_faces_considered = stats.cube_faces_considered.saturating_add(1);
                         should_emit_cube_face_local_fast(
@@ -1121,10 +1149,13 @@ fn build_chunk_mesh_greedy_layered_dense_internal(
                         )
                     } {
                         stats.cube_faces_emitted = stats.cube_faces_emitted.saturating_add(1);
-                        Some(MaskCell {
-                            block: b,
-                            normal_positive: false,
-                        })
+                        let b_index = b_index.expect("b index should exist");
+                        Some(MaskCell::new(
+                            b,
+                            false,
+                            texture_lookup
+                                .quarter_turns_in(b, || neighborhood.block_data_at_index(b_index)),
+                        ))
                     } else {
                         None
                     };
@@ -1139,12 +1170,12 @@ fn build_chunk_mesh_greedy_layered_dense_internal(
                                 d,
                                 u,
                                 v,
-                                if cell.normal_positive {
+                                if cell.normal_positive() {
                                     face_positive
                                 } else {
                                     face_negative
                                 },
-                                cell.normal_positive,
+                                cell.normal_positive(),
                             )
                         }
                         _ => 0,
@@ -1215,7 +1246,7 @@ fn build_chunk_mesh_greedy_layered_dense_internal(
                     ];
                     let p3 = [o[0] + dv[0], o[1] + dv[1], o[2] + dv[2]];
 
-                    let face = match (d, cell.normal_positive) {
+                    let face = match (d, cell.normal_positive()) {
                         (0, true) => Face::East,
                         (0, false) => Face::West,
                         (1, true) => Face::Up,
@@ -1228,15 +1259,20 @@ fn build_chunk_mesh_greedy_layered_dense_internal(
                     let render_layer = cell_info.render_layer;
                     let mesh = layered.mesh_mut(render_layer);
                     let base = mesh.vertices.len() as u32;
-                    let tex_layer = texture_lookup.layer_for_info(cell_info, face);
-                    let tint_kind = texture_lookup.tint_kind_for_info(cell_info, face);
+                    let tex_layer =
+                        texture_lookup.layer_for_info_turned(cell_info, face, cell.quarter_turns());
+                    let tint_kind = texture_lookup.tint_kind_for_info_turned(
+                        cell_info,
+                        face,
+                        cell.quarter_turns(),
+                    );
                     let quad_uvs = face_uvs_for_quad(face, [p0, p1, p2, p3]);
 
                     let uv0 = quad_uvs[0];
                     let uv1 = quad_uvs[1];
                     let uv2 = quad_uvs[2];
                     let uv3 = quad_uvs[3];
-                    let quad = if cell.normal_positive {
+                    let quad = if cell.normal_positive() {
                         [(p0, uv0), (p1, uv1), (p2, uv2), (p3, uv3)]
                     } else {
                         [(p0, uv0), (p3, uv3), (p2, uv2), (p1, uv1)]
@@ -1254,7 +1290,7 @@ fn build_chunk_mesh_greedy_layered_dense_internal(
                             v,
                             w,
                             h,
-                            cell.normal_positive,
+                            cell.normal_positive(),
                         );
                         let block_local_arr = [block_local.x, block_local.y, block_local.z];
                         let block_index = MeshingNeighborhood::local_padded_index(
@@ -1409,9 +1445,11 @@ fn build_chunk_mesh_layered_naive_internal(
                 if !id.is_voxel_filled() {
                     continue;
                 }
-                if texture_lookup.model_for(id) != BlockModel::Cube {
+                let info = texture_lookup.info_for(id);
+                if info.model != BlockModel::Cube {
                     continue;
                 }
+                let turns = texture_lookup.quarter_turns_in(id, || chunk.get_data(x, y, z));
 
                 for (face, quad) in faces {
                     let world_pos = chunk_origin + IVec3::new(x, y, z);
@@ -1419,11 +1457,11 @@ fn build_chunk_mesh_layered_naive_internal(
                         continue;
                     }
 
-                    let render_layer = texture_lookup.render_layer_for(id);
+                    let render_layer = info.render_layer;
                     let mesh = layered.mesh_mut(render_layer);
                     let base_index = mesh.vertices.len() as u32;
-                    let tex_layer = texture_lookup.layer_for(id, face);
-                    let tint_kind = texture_lookup.tint_kind_for(id, face);
+                    let tex_layer = texture_lookup.layer_for_info_turned(info, face, turns);
+                    let tint_kind = texture_lookup.tint_kind_for_info_turned(info, face, turns);
                     let quad_world = [
                         [x + quad[0][0], y + quad[0][1], z + quad[0][2]],
                         [x + quad[1][0], y + quad[1][1], z + quad[1][2]],
@@ -1503,7 +1541,32 @@ fn build_chunk_mesh_layered_naive_internal(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MaskCell {
     pub(crate) block: BlockId,
-    pub(crate) normal_positive: bool,
+    /// Bit 0: the face points along +axis. Bits 1-2: quarter turns of a turned
+    /// block (furnace facing), so it only merges with the same turn; 0 for
+    /// everything else, so plain cubes merge as before. Packed into one byte
+    /// because a third field made `Option<MaskCell>` three bytes and the
+    /// greedy pass measurably slower.
+    bits: u8,
+}
+
+impl MaskCell {
+    #[inline(always)]
+    fn new(block: BlockId, normal_positive: bool, quarter_turns: u8) -> Self {
+        Self {
+            block,
+            bits: normal_positive as u8 | (quarter_turns << 1),
+        }
+    }
+
+    #[inline(always)]
+    fn normal_positive(self) -> bool {
+        self.bits & 1 != 0
+    }
+
+    #[inline(always)]
+    fn quarter_turns(self) -> u8 {
+        self.bits >> 1
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1626,17 +1689,19 @@ fn build_chunk_mesh_greedy_layered_internal(
                     mask[n] = if a_cube
                         && should_emit_cube_face(world, texture_lookup, a_pos, a, face_positive)
                     {
-                        Some(MaskCell {
-                            block: a,
-                            normal_positive: true,
-                        })
+                        Some(MaskCell::new(
+                            a,
+                            true,
+                            texture_lookup.quarter_turns_in(a, || world.get_block_data(a_pos)),
+                        ))
                     } else if b_cube
                         && should_emit_cube_face(world, texture_lookup, b_pos, b, face_negative)
                     {
-                        Some(MaskCell {
-                            block: b,
-                            normal_positive: false,
-                        })
+                        Some(MaskCell::new(
+                            b,
+                            false,
+                            texture_lookup.quarter_turns_in(b, || world.get_block_data(b_pos)),
+                        ))
                     } else {
                         None
                     };
@@ -1706,7 +1771,7 @@ fn build_chunk_mesh_greedy_layered_internal(
                     ];
                     let p3 = [o[0] + dv[0], o[1] + dv[1], o[2] + dv[2]];
 
-                    let face = match (d, cell.normal_positive) {
+                    let face = match (d, cell.normal_positive()) {
                         (0, true) => Face::East,
                         (0, false) => Face::West,
                         (1, true) => Face::Up,
@@ -1715,11 +1780,17 @@ fn build_chunk_mesh_greedy_layered_internal(
                         (2, false) => Face::North,
                         _ => Face::Up,
                     };
-                    let render_layer = texture_lookup.render_layer_for(cell.block);
+                    let cell_info = texture_lookup.info_for(cell.block);
+                    let render_layer = cell_info.render_layer;
                     let mesh = layered.mesh_mut(render_layer);
                     let base = mesh.vertices.len() as u32;
-                    let tex_layer = texture_lookup.layer_for(cell.block, face);
-                    let tint_kind = texture_lookup.tint_kind_for(cell.block, face);
+                    let tex_layer =
+                        texture_lookup.layer_for_info_turned(cell_info, face, cell.quarter_turns());
+                    let tint_kind = texture_lookup.tint_kind_for_info_turned(
+                        cell_info,
+                        face,
+                        cell.quarter_turns(),
+                    );
                     let quad_uvs = face_uvs_for_quad(face, [p0, p1, p2, p3]);
 
                     // UV-Tiling für gemergte Faces:
@@ -1734,7 +1805,7 @@ fn build_chunk_mesh_greedy_layered_internal(
                     // CCW-Winding:
                     // +Normal: p0,p1,p2,p3
                     // -Normal: p0,p3,p2,p1 (invertiert, damit FrontFace::Ccw konsistent bleibt)
-                    let quad = if cell.normal_positive {
+                    let quad = if cell.normal_positive() {
                         [(p0, uv0), (p1, uv1), (p2, uv2), (p3, uv3)]
                     } else {
                         [(p0, uv0), (p3, uv3), (p2, uv2), (p1, uv1)]
@@ -1755,7 +1826,7 @@ fn build_chunk_mesh_greedy_layered_internal(
                             v,
                             w,
                             h,
-                            cell.normal_positive,
+                            cell.normal_positive(),
                         );
                         let (shade, light_packed) = cube_face_vertex_shade_and_light(
                             world,
@@ -2454,6 +2525,161 @@ mod simd_uv_tests {
             assert_eq!(plant_quads, 2, "{path}: expected the two cross-plant quads");
         }
     }
+
+    /// Chunk (0, 0, 0) meshed by the production (dense) and the world path.
+    fn mesh_both_paths(world: &World) -> [(&'static str, LayeredChunkGeometry); 2] {
+        let texture_lookup = test_texture_lookup();
+        let coord = ChunkCoord { x: 0, y: 0, z: 0 };
+        let mut scratch = MeshingNeighborhoodScratch::new();
+        let (neighborhood, _) = scratch.build(coord, snapshot_for(world, coord));
+        let mut pool = crate::meshing::pool::MeshingPool::new();
+        let (dense, _) = build_chunk_mesh_greedy_layered_dense_pooled(
+            &neighborhood,
+            coord,
+            &texture_lookup,
+            &mut pool,
+            MeshLayerMask::ALL,
+        );
+        let world_path = build_chunk_mesh_greedy_layered(world, coord, &texture_lookup);
+        [("dense", dense), ("world", world_path)]
+    }
+
+    /// Texture layer and lowest x of every opaque quad lying flat in the plane
+    /// `axis = value`, sorted by x.
+    fn quads_in_plane(layered: &LayeredChunkGeometry, axis: usize, value: f32) -> Vec<(u32, f32)> {
+        let mut quads: Vec<(u32, f32)> = layered
+            .opaque
+            .vertices
+            .chunks_exact(4)
+            .filter(|quad| quad.iter().all(|v| (v.position[axis] - value).abs() < 1e-4))
+            .map(|quad| {
+                let min_x = quad.iter().map(|v| v.position[0]).fold(f32::MAX, f32::min);
+                (quad[0].tex_layer, min_x)
+            })
+            .collect();
+        quads.sort_by(|a, b| a.1.total_cmp(&b.1));
+        quads
+    }
+
+    #[test]
+    fn mesher_turns_the_furnace_front_with_its_facing() {
+        use crate::blocks::BlockId;
+        use crate::blocks::state::FURNACE_FACING;
+        use crate::blocks::state::views::Facing4;
+
+        let texture_lookup = test_texture_lookup();
+        let front = texture_lookup.layer_for(BlockId::Furnace, Face::South);
+        let side = texture_lookup.layer_for(BlockId::Furnace, Face::North);
+        assert_ne!(front, side);
+        let pos = IVec3::new(4, 4, 4);
+        // (face, axis, plane) for the four sides of the cell at `pos`.
+        let sides = [
+            (Face::North, 2, pos.z as f32),
+            (Face::South, 2, pos.z as f32 + 1.0),
+            (Face::West, 0, pos.x as f32),
+            (Face::East, 0, pos.x as f32 + 1.0),
+        ];
+        for (facing, front_face) in [
+            (Facing4::North, Face::North),
+            (Facing4::East, Face::East),
+            (Facing4::South, Face::South),
+            (Facing4::West, Face::West),
+        ] {
+            let mut world = World::new();
+            world
+                .set_block_state(pos, FURNACE_FACING.with(BlockId::Furnace.into(), facing))
+                .unwrap();
+            for (path, layered) in mesh_both_paths(&world) {
+                for (face, axis, plane) in sides {
+                    let expected = if face == front_face { front } else { side };
+                    let layers: Vec<u32> = quads_in_plane(&layered, axis, plane)
+                        .into_iter()
+                        .map(|(layer, _)| layer)
+                        .collect();
+                    assert_eq!(layers, [expected], "{path}: {facing:?} furnace, {face:?} side");
+                }
+            }
+        }
+    }
+
+    /// Greedy merging must not run one texture across furnaces that face
+    /// different ways.
+    #[test]
+    fn differently_turned_furnaces_do_not_merge() {
+        use crate::blocks::BlockId;
+        use crate::blocks::state::FURNACE_FACING;
+        use crate::blocks::state::views::Facing4;
+
+        let texture_lookup = test_texture_lookup();
+        let front = texture_lookup.layer_for(BlockId::Furnace, Face::South);
+        let side = texture_lookup.layer_for(BlockId::Furnace, Face::North);
+        let mut world = World::new();
+        let state = |facing| FURNACE_FACING.with(BlockId::Furnace.into(), facing);
+        world.set_block_state(IVec3::new(4, 4, 4), state(Facing4::South)).unwrap();
+        world.set_block_state(IVec3::new(5, 4, 4), state(Facing4::North)).unwrap();
+        for (path, layered) in mesh_both_paths(&world) {
+            assert_eq!(
+                quads_in_plane(&layered, 2, 5.0),
+                [(front, 4.0), (side, 5.0)],
+                "{path}: south side of the pair"
+            );
+            assert_eq!(
+                quads_in_plane(&layered, 2, 4.0),
+                [(side, 4.0), (front, 5.0)],
+                "{path}: north side of the pair"
+            );
+        }
+    }
+
+    #[test]
+    fn top_slab_meshes_in_the_upper_half_and_hides_the_face_above() {
+        use crate::blocks::BlockId;
+        use crate::blocks::state::SLAB_HALF;
+        use crate::blocks::state::views::Half;
+
+        let mut world = World::new();
+        let slab = IVec3::new(4, 4, 4);
+        world
+            .set_block_state(slab, SLAB_HALF.with(BlockId::StoneSlab.into(), Half::Top))
+            .unwrap();
+        world.set_block(slab + IVec3::Y, BlockId::Stone).unwrap();
+        world.set_block(slab - IVec3::Y, BlockId::Stone).unwrap();
+        let in_column = |v: &WorldVertex| {
+            (4.0 - 1e-4..=5.0 + 1e-4).contains(&v.position[0])
+                && (4.0 - 1e-4..=5.0 + 1e-4).contains(&v.position[2])
+        };
+        for (path, layered) in mesh_both_paths(&world) {
+            let quads: Vec<&[WorldVertex]> = layered
+                .opaque
+                .vertices
+                .chunks_exact(4)
+                .filter(|quad| quad.iter().all(in_column))
+                .collect();
+            let all_at = |quad: &[WorldVertex], y: f32| {
+                quad.iter().all(|v| (v.position[1] - y).abs() < 1e-4)
+            };
+            let slab_quads = quads
+                .iter()
+                .filter(|quad| {
+                    quad.iter().all(|v| (4.5 - 1e-4..=5.0 + 1e-4).contains(&v.position[1]))
+                        && !all_at(quad, 5.0)
+                })
+                .count();
+            assert_eq!(slab_quads, 5, "{path}: four sides and the bottom at y 4.5");
+            assert!(
+                quads.iter().any(|quad| all_at(quad, 4.5)),
+                "{path}: the slab's bottom face sits mid-cell"
+            );
+            assert!(
+                !quads.iter().any(|quad| all_at(quad, 5.0)),
+                "{path}: slab top and the stone's bottom face are both hidden"
+            );
+            assert!(
+                quads.iter().any(|quad| all_at(quad, 4.0)),
+                "{path}: the stone below stays visible under the empty lower half"
+            );
+        }
+    }
 }
 
 /// Measures what stopping greedy merges at AO/light edges costs.
@@ -2464,7 +2690,7 @@ mod simd_uv_tests {
 /// `cargo test --release meshing::greedy::greedy_ao_merge_report -- --nocapture --test-threads=1`.
 #[cfg(test)]
 mod face_debug_tests {
-    use super::{face_corner_ao_shades, face_from_normal};
+    use super::face_corner_ao_shades;
     use crate::blocks::{BlockId, Face};
     use crate::world::World;
     use glam::IVec3;
@@ -2479,7 +2705,7 @@ mod face_debug_tests {
             (IVec3::Z, Face::South),
             (IVec3::NEG_Z, Face::North),
         ] {
-            assert_eq!(face_from_normal(normal), face, "normal {normal:?}");
+            assert_eq!(Face::from_normal(normal), face, "normal {normal:?}");
         }
     }
 

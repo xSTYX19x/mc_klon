@@ -272,16 +272,16 @@ nächsten billiger macht:
     keine Multipart-Modelle. Shapes sind **genau eine AABB** pro Block in
     1/16-Pixeln (`BlockAabb`, `:253-257`; `CollisionShape`, `:290-296`).
     Raycast-/Outline-Shape (`raycast_shape`, `:556-570`; Outline
-    `render/state.rs:19762-19783`) und `OcclusionShape` (`:341-348`;
-    `SlabUpper` wird nie erzeugt, Compiler-Warnung `never constructed`) sind
-    schon getrennt — der Contract steht, nur die Datenform ist zu schmal.
+    `render/state.rs:19762-19783`) und `OcclusionShape` (`:341-348`; seit
+    2026-11-17 hängen sie am State: `half=top` der Stufe ergibt `SlabUpper`
+    bzw. `CollisionShape::SlabTop`, siehe `StateForm`) sind schon getrennt —
+    der Contract steht, nur die Datenform ist zu schmal.
     Treppen brauchen 2 Boxen, Zäune eine 1,5 Blöcke hohe Kollision, Scheiben
     und Zäune Verbindungen zu Nachbarn. Kollision prüft nur Zellen, die die
     Spieler-AABB überlappt (`aabb_collides`, `player/mod.rs:143-145`) — eine
     Box, die aus dem Block darunter herausragt (Zaun), würde übersehen. Der
-    Raycast testet schon pro AABB (`world/raycast.rs:192-212`), gibt aber den
-    Trefferpunkt nicht zurück (`t_hit` wird bei `:197` berechnet und
-    verworfen). Einen Nicht-Greedy-Pfad gibt es nur für Kreuzpflanzen
+    Raycast testet schon pro AABB (`world/raycast.rs`) und liefert seit
+    2026-11-17 den Trefferpunkt (`RaycastHit::hit_point`). Einen Nicht-Greedy-Pfad gibt es nur für Kreuzpflanzen
     (`meshing/plants.rs`). Der Contract ist bewacht:
     `blocks::interaction_shape_tests::every_model_states_its_raycast_shape`
     (`blocks/mod.rs:2962`) matcht erschöpfend auf `BlockModelSpec`.
@@ -300,19 +300,18 @@ nächsten billiger macht:
   - *Vorgehen:* 1) Shapes verbreitern: `CollisionShape::Boxes(&'static
     [BlockAabb])`, `BlockAabb` mit `i8`-Koordinaten (−16…32) für Überstände;
     `aabb_collides` prüft zusätzlich die Zellreihe unter der AABB.
-    2) `RaycastHit` um Trefferpunkt und Fläche erweitern (für den
-    Platzier-Kontext, siehe "Interaktion"). 3) Modellformat + Loader über den
+    2) Modellformat + Loader über den
     `assets.rs`-Pfad, damit Resourcepacks Modelle überschreiben können, und ein
     Bake-Schritt Modell × State → Quad-Liste mit `cullface`, gecacht pro State.
-    4) `meshing/plants.rs` zu `meshing/models.rs` verallgemeinern statt es zu
+    3) `meshing/plants.rs` zu `meshing/models.rs` verallgemeinern statt es zu
     kopieren (pro Voxel, gebackene Quads, Culling per `cullface` gegen die
     Occlusion-Maske des Nachbarn); der Greedy-Merger sieht nur Vollwürfel,
-    sonst verschmelzen unterschiedliche Orientierungen. 5) Multipart/Connected:
+    sonst verschmelzen unterschiedliche Orientierungen. 4) Multipart/Connected:
     Verbindungsbits beim Meshen aus den Nachbarn **ableiten** statt speichern
-    (Zaun, Scheibe, Redstone-Seiten) — spart State-Bits. 6) AO für Modell-Quads
-    nur auf Flächen, die bündig auf der Blockgrenze liegen. 7) Pro Formfamilie
-    Textur, Platzierlogik und Inventareintrag der Blöcke aus "Blöcke (Inhalt)"
-    nachziehen.
+    (Zaun, Scheibe, Redstone-Seiten) — spart State-Bits. 5) AO für Modell-Quads
+    nur auf Flächen, die bündig auf der Blockgrenze liegen. 6) Pro Formfamilie
+    Textur, Platzierlogik (`on_place`, siehe "Interaktion") und
+    Inventareintrag der Blöcke aus "Blöcke (Inhalt)" nachziehen.
   - *Dateien:* `blocks/mod.rs`, neue `blocks/model.rs` und `blocks/shape.rs`,
     `meshing/plants.rs` → `meshing/models.rs`, `meshing/greedy.rs`
     (`should_emit_cube_face_local_fast`, `:698-729`), `player/mod.rs`,
@@ -584,19 +583,27 @@ Voxel-Shapes". Hier bleibt die Speicher- und Contract-Seite.
   nackten Datenbyte, dazu das Vokabular `views::{facing4, facing6, half, open,
   powered, rail_shape, redstone_power, age, snow_layers}` für die kommenden
   Formfamilien. Jeder Block deklariert sein Schema in `blocks!`
-  (`with_properties`): heute der Setzling (`stage`, Bit 0) und die vier
+  (`with_properties`): heute der Setzling (`stage`, Bit 0), die vier
   Fluid-Blöcke (`level` 0x0F, `static` 0x20, `source` 0x40, `falling` 0x80;
-  Bit 0x10 frei), über deren Sichten auch die `fluid_data_*`-Helfer laufen.
+  Bit 0x10 frei), über deren Sichten auch die `fluid_data_*`-Helfer laufen,
+  seit 2026-11-17 die Stufe (`half`, Bit 0) und beide Öfen (`facing`, Bits
+  0-1). `StateForm` (`with_shape_half`, `with_front_facing`) sagt Shapes und
+  Mesher, welche Properties Form oder Modell ändern; der Mesher liest sie aus
+  einer eigenen Tabelle in `BlockTextureLookup`, weil ein weiteres Feld
+  `BlockTextureInfo` über 64 Byte hob und den Greedy-Pass ~12 % kostete.
   `every_schema_fits_its_data_byte` erzwingt disjunkte Bits im Byte und Rohwert
   0 als Default. `RandomTickFn` bekommt einen `BlockState`, die Shape-Abfragen
   (`collision_shape`, `raycast_shape`, `occlusion_shape`) hängen an
   `BlockState`, und `World::set_block_state`/`get_block_state` schreiben bzw.
   lesen über das Änderungsjournal; `set_block` ist die Kurzform mit dem
-  Default-State, Platzieren setzt den Default-State. Das Speicherformat bleibt
-  v2 (Blockname + Datenbyte). Offen: Waterlogging (in der Vorlage a1.0.17 nicht
-  enthalten) und die Formfamilien; außerdem markiert der Edit-Pfad
-  Daten-only-Änderungen nur als ungespeichert (`enqueue_world_block_changes`,
-  `render/state.rs`), ohne Remesh oder Relight.
+  Default-State, Platzieren fragt den `on_place`-Hook (siehe "Interaktion").
+  Das Speicherformat bleibt v2 (Blockname + Datenbyte). Offen: Waterlogging
+  (in der Vorlage a1.0.17 nicht enthalten) und die Formfamilien. Daten-only-
+  Änderungen an Blöcken mit `StateForm` (`BlockId::data_changes_form`) gehen
+  durch den Edit-Pfad und werden neu gemesht, alle anderen nur als
+  ungespeichert markiert (`enqueue_world_block_changes`, `render/state.rs`).
+  Relight gibt es dafür nicht, weil Licht und Opazität heute nur an der
+  `BlockId` hängen — eine Property, die das ändert, braucht ihn.
 - *Ziel:* Jeder Block deklariert seine Properties einmal; alle Systeme
   (Mesher, Shapes, Interaktion, Speicher, Debug-Anzeige) lesen sie über einen
   typisierten `BlockState`-Wert. Die Speicherform (heute `BlockId` + Byte)
@@ -622,9 +629,7 @@ Voxel-Shapes". Hier bleibt die Speicher- und Contract-Seite.
   2. Neue `BlockModelSpec`-Varianten (`Stairs`, `Fence`, `Torch`, `Ladder`,
      `Door`, `Rail`, `FlatOnFloor`, `Sign`) entstehen pro Formfamilie unter
      "Rendering / Blockmodelle und Voxel-Shapes"; Nicht-Würfel laufen dort über
-     den Modell-Pfad, den der Greedy-Merger nie sieht. Mit der ersten Property,
-     die Modell oder Form ändert, muss der Edit-Pfad Daten-only-Änderungen wie
-     einen Blocktausch remeshen und relighten. Palette-Namen der Form
+     den Modell-Pfad, den der Greedy-Merger nie sieht. Palette-Namen der Form
      `name[prop=wert,…]` im Speicher nur, wenn ein späterer Umbau das erzwingt
      (siehe "Storage: Versionierung & Migrationskette").
 - *Dateien:* `blocks/state.rs`, `blocks/mod.rs`, `world/fluids.rs`
@@ -633,8 +638,9 @@ Voxel-Shapes". Hier bleibt die Speicher- und Contract-Seite.
 - *Priorität/Aufwand/Impact:* **P2**; pro Formfamilie S, Waterlogging S-M;
   Impact sehr hoch.
 - *Akzeptanz:* Ein Block mit `waterlogged` hält stilles Wasser, das der
-  Fluid-Pfad als Quelle liest; eine Daten-only-Änderung an einer
-  formrelevanten Property wird neu gemesht und beleuchtet.
+  Fluid-Pfad als Quelle liest; ein Test ohne GPU zeigt, dass eine
+  Daten-only-Änderung an einer formrelevanten Property neu gemesht wird
+  (heute ungetestet, weil der Edit-Pfad an `State` hängt).
 
 Jede Formfamilie ist ein isolierter, kleiner Change auf der Datenschicht.
 
@@ -664,9 +670,7 @@ Planken bzw. Stein — beim Modellbau bewusst so umsetzen.
 - Fackel (Wand/Boden, `emitted_light: 14`) — der wichtigste Einzelblock der
   Liste, weil ohne ihn Beleuchtung reines Skylight bleibt und der komplette
   Block-Light-Pfad im Spiel nie benutzt wird.
-- Treppe (Bruchstein/Holz), Stufe oben/unten (`SlabUpper` ist in
-  `OcclusionShape` bereits vorgesehen, `blocks/mod.rs:363` — es fehlt nur der
-  Block dazu), Zaun (4 Verbindungsbits; in der Vorlage verbindet er sich nicht
+- Treppe (Bruchstein/Holz), Zaun (4 Verbindungsbits; in der Vorlage verbindet er sich nicht
   mit festen Blöcken, steht nur auf festem Untergrund, und auf ihm lässt sich
   nichts platzieren. Die spätere Kollisionshöhe von 1.5 Blöcken ist für
   a1.0.17 nicht belegt; falls übernommen, braucht sie eine
@@ -826,10 +830,10 @@ Inhalt danach, in der Reihenfolge der Abhängigkeit:
   *Korrektur 2026-09-28:* der Stub hängt heute testweise an **Obsidian**
   (`blocks/mod.rs:979`) und zählt nur einen Zähler hoch
   (`world/block_entity_types.rs:58-89`); beim Anlegen des Ofens umhängen.
-  Den Block gibt es seit 2026-11-16 als `Furnace` und `LitFurnace` (Licht 13)
-  mit fester Front nach Süden (`BlockSpec::cube_front`); dazu gehören das
-  Umschalten zwischen beiden beim Brennen und, mit `Facing4` aus der
-  Block-State-Schicht, die Ausrichtung zum Spieler beim Platzieren.
+  Den Block gibt es seit 2026-11-16 als `Furnace` und `LitFurnace` (Licht 13);
+  seit 2026-11-17 zeigt die Front beim Platzieren zum Spieler
+  (`FURNACE_FACING`, `front_toward_placer`). Offen ist das Umschalten zwischen
+  beiden beim Brennen, das den State samt `facing` übernehmen muss.
 - Rüstung (Leder/Eisen/Gold/Diamant, 4 Slots), Bogen + Pfeile.
 - Nahrung: Apfel, Goldapfel, Brot, rohes/gebratenes Schwein, Pilzsuppe. In dieser Ära heilt
   Essen **sofort** und es gibt keine Hungerleiste. `Player::food_level`
@@ -1074,51 +1078,52 @@ Sneak überspringt) bleibt, ergänzt um Platzier-Kontext und Abbau-Hooks.
 Weltseitige Reaktionen (Nachbar-Updates, geplante Ticks) stehen unter
 "Architektur / Block-Verhalten".
 
-- *Ist:* Es gibt nur Abbauen und Platzieren. Rechtsklick platziert immer
-  (`app/mod.rs:3714-3726`, `:4027-4038` → `place_block_at_camera_ray`,
-  `render/state.rs:19233`). Der Platzierpfad bekommt Kamera, gewählten Block
-  und Fußposition, aber **keinen** Kontext: kein `player_mode`, keinen
-  Trefferpunkt, keine getroffene Fläche außer implizit über `hit.place_pos()`
-  (`:19281`), keine Blickrichtung; `block_data` ist für Nicht-Fluids immer 0
-  (`:19316-19325`). `RaycastHit` enthält Position, Normale und Box
-  (`world/raycast.rs:13-18`), aber nicht den Trefferpunkt (`t_hit` wird bei
-  `:197` berechnet und verworfen). Abbauen kennt nur `breakable: bool`
-  (`blocks/mod.rs:509`) und die Bedrock-Sonderregel
-  (`render/state.rs:19138-19142`). Kein `on_use`, kein `hardness` (Suche leer).
+- *Ist:* Seit 2026-11-17 steht der Platzier-Kontext: `RaycastHit::hit_point`
+  (Treffer in Weltkoordinaten), `blocks/placement.rs` mit `PlaceContext {
+  place_pos, face, hit_point_local, yaw }` (`PlaceContext::from_hit`) und
+  `on_place: Option<OnPlaceFn>` in `BlockSpec` (`with_on_place`, Signatur
+  `fn(&World, &PlaceContext, BlockId) -> Option<BlockState>`, `None` lehnt
+  ab). `placement_state` wird aus `place_block_at_camera_ray`
+  (`render/state.rs`) aufgerufen; ohne Hook gilt der Default-State. Nutzer:
+  die Stufe (`slab_on_place`: Unterseite oder obere Hälfte einer Seitenfläche
+  → `half=top`; Stufe auf Stufe bleibt eine untere Stufe in der Zelle
+  darüber, Doppelstufen gibt es nicht) und beide Öfen (`front_toward_placer`,
+  Front zum Spieler). `sneaking` und `player_mode` fehlen im Kontext noch;
+  sie kommen mit `on_use`, das sie als Erstes liest. Sonst unverändert:
+  Rechtsklick platziert immer (`app/mod.rs`, Klickpfad →
+  `place_block_at_camera_ray`), Abbauen kennt nur `breakable: bool` und die
+  Bedrock-Sonderregel (`destroy_block_at_camera_ray`). Kein `on_use`, kein
+  `hardness` (Suche leer).
 - *Ziel:* Türen, Kisten, Werkbank, Ofen, Jukebox, Hebel und Knopf reagieren auf
   einen echten Rechtsklick-Handler pro Block, der *vor* dem Platzieren greift;
-  orientierte Blöcke (Treppe, Stufe oben/unten, Wandfackel, Tür-Scharnier,
-  Leiter) wählen ihren State aus dem Platzier-Kontext; Blöcke können beim
-  Entfernen reagieren (zweite Tür-Hälfte, Kiste droppt Inhalt).
+  orientierte Blöcke (Treppe, Wandfackel, Tür-Scharnier, Leiter) wählen ihren
+  State aus dem Platzier-Kontext; Blöcke können beim Entfernen reagieren
+  (zweite Tür-Hälfte, Kiste droppt Inhalt).
 - *Vorbild:* Vanilla `Block.use`, `getStateForPlacement(BlockPlaceContext)`
   (Klickfläche, Trefferpunkt, Blickrichtung, Sneak), `playerWillDestroy`/
   `onRemove`. Übertragung: Funktionszeiger in `BlockSpec` — dieselbe Bauform wie
-  das vorhandene `random_tick: Option<RandomTickFn>` (`blocks/mod.rs:514`,
-  `with_random_tick` `:2007`), damit die Dispatch-Tabelle einheitlich bleibt;
-  kein Trait-Objekt pro Block.
+  `random_tick: Option<RandomTickFn>` und `on_place: Option<OnPlaceFn>`, damit
+  die Dispatch-Tabelle einheitlich bleibt; kein Trait-Objekt pro Block.
 - *Vorgehen:*
-  1. `RaycastHit` um `hit_point: Vec3` erweitern.
-  2. `struct PlaceContext { hit, face, hit_point_local, look_dir, yaw,
-     sneaking, player_mode }` und `on_place: Option<fn(&World, &PlaceContext,
-     BlockId) -> Option<BlockState>>` (liefert den State oder lehnt ab).
-  3. `on_use: Option<UseFn>`: Der Rechtsklick-Pfad fragt zuerst `on_use` des
+  1. `on_use: Option<UseFn>`: Der Rechtsklick-Pfad fragt zuerst `on_use` des
      getroffenen Blocks; nur wenn das `None` liefert oder ablehnt, wird
      platziert. Sneak-Halten überspringt `on_use` (Vorlage-Verhalten für "auf
-     eine Kiste bauen").
-  4. `on_removed: Option<RemovedFn>` für Mehrblock-Strukturen und
+     eine Kiste bauen"). Dafür `PlaceContext` (oder ein gemeinsamer
+     Klick-Kontext) um `sneaking` und `player_mode` ergänzen.
+  2. `on_removed: Option<RemovedFn>` für Mehrblock-Strukturen und
      Block-Entities mit Inhalt.
-  5. Die Hooks werden aus dem GPU-freien Gameplay-Modul aufgerufen (siehe
+  3. Die Hooks werden aus dem GPU-freien Gameplay-Modul aufgerufen (siehe
      "Architektur / Spiellogik aus State lösen"), nicht aus `render/state.rs`.
-- *Dateien:* `blocks/mod.rs`, `world/raycast.rs`, `render/state.rs`
-  (`:19103-19410`), `app/mod.rs` (Klickpfad).
-- *Abhängigkeiten:* Block-States (State als Rückgabewert),
-  Welt-Änderungsjournal; Kisten und Ofen zusätzlich Item-System und Storage v3.
+- *Dateien:* `blocks/mod.rs`, `blocks/placement.rs`, `render/state.rs`
+  (`place_block_at_camera_ray`, `destroy_block_at_camera_ray`), `app/mod.rs`
+  (Klickpfad).
+- *Abhängigkeiten:* Welt-Änderungsjournal; Kisten und Ofen zusätzlich
+  Item-System und Storage v3.
 - *Priorität/Aufwand/Impact:* **P2**, M, hoch (Voraussetzung für alle
   interaktiven Blöcke).
-- *Akzeptanz:* Test ohne GPU: eine Stufe, auf die obere Hälfte einer
-  Seitenfläche geklickt, bekommt `half=top`; eine Tür öffnet und schließt per
-  Rechtsklick, aber nicht beim Sneak-Klick; eine Fackel an der Wand übernimmt
-  die Flächenrichtung.
+- *Akzeptanz:* Test ohne GPU: eine Tür öffnet und schließt per Rechtsklick,
+  aber nicht beim Sneak-Klick; eine Fackel an der Wand übernimmt die
+  Flächenrichtung.
 
 #### Reiten
 

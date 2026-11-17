@@ -335,6 +335,11 @@ impl<'a> MeshingNeighborhood<'a> {
     }
 
     #[inline(always)]
+    pub(crate) fn block_data_at_index(&self, index: usize) -> u8 {
+        self.block_data[index]
+    }
+
+    #[inline(always)]
     pub(crate) fn light_local(&self, local_x: i32, local_y: i32, local_z: i32) -> u8 {
         self.light[padded_index(local_x, local_y, local_z)]
     }
